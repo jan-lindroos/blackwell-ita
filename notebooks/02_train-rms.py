@@ -62,8 +62,8 @@ def _():
 def _(mo):
     dataset_picker = mo.ui.dropdown(
         options={
-            "helpsteer2": "janlindroos/helpsteer2-human-prefs",
-            "community-alignment": "janlindroos/community-alignment-human-prefs",
+            "helpsteer2": "jan-lindroos/helpsteer2-human-prefs",
+            "community-alignment": "jan-lindroos/community-alignment-human-prefs",
         },
         value="helpsteer2",
         label="Dataset",

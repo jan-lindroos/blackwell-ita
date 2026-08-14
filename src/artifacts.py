@@ -4,8 +4,8 @@ from pathlib import Path
 
 from huggingface_hub import HfApi, hf_hub_download
 
-RMS_REPO = "janlindroos/blackwell-ita-rms"
-ARTIFACTS_REPO = "janlindroos/blackwell-ita-artifacts"
+RMS_REPO = "jan-lindroos/blackwell-ita-rms"
+ARTIFACTS_REPO = "jan-lindroos/blackwell-ita-artifacts"
 
 HEADLINE_METHODS = [
     "base",
