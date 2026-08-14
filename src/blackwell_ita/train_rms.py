@@ -1,6 +1,7 @@
 """Training and persistence of multi-head reward models on preference pairs."""
 
 from collections.abc import Iterable
+from itertools import islice
 from pathlib import Path
 from typing import TypedDict
 
@@ -103,6 +104,10 @@ class MultiHeadEncoder(torch.nn.Module):
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
         self.head = torch.nn.Linear(self.encoder.config.hidden_size, head_count)
+        # Zero-init keeps encoder gradients exactly zero until the head grows,
+        # so the untrained head's noise never distorts the pretrained features
+        torch.nn.init.zeros_(self.head.weight)
+        torch.nn.init.zeros_(self.head.bias)
 
     def forward(self, tokenized: dict[str, torch.Tensor]) -> torch.Tensor:
         """Score tokenized inputs from the last non-padding token's hidden state."""
@@ -365,11 +370,13 @@ def train_reward_model(
 ) -> tuple[RewardModelBase, float]:
     """Train one reward model; returns it on the CPU with its validation loss.
 
-    The train/validation split is deterministic in ``seed``, so successive
-    calls on the same dataframe train against identical splits. The model is
-    moved off the device before returning, freeing the GPU for the next call:
-    a 95 GiB GPU cannot train a 3B model beside a finished one still holding
-    its weights and gradients.
+    Training opens with a head-only half-epoch (epoch 0) over a frozen
+    encoder, so full fine-tuning starts from a settled head rather than the
+    zero-initialised one. The train/validation split is deterministic in
+    ``seed``, so successive calls on the same dataframe train against
+    identical splits. The model is moved off the device before returning,
+    freeing the GPU for the next call: a 95 GiB GPU cannot train a 3B model
+    beside a finished one still holding its weights and gradients.
     """
     if device is None:
         device = default_device()
@@ -387,6 +394,24 @@ def train_reward_model(
         max_tokens,
         len(criterion_columns),
     )
+    model.to(device)
+    # The frozen encoder keeps epoch 0 cheap: no gradients flow through it,
+    # so its forward pass runs without a backward. A lone linear head can
+    # take a far higher learning rate than the encoder fine-tuning
+    model.scorer.encoder.requires_grad_(False)
+    head_optimizer = torch.optim.AdamW(model.scorer.head.parameters(), lr=1e-3)
+    head_steps = max(1, len(train_loader) // 2)
+    model.train()
+    for batch in tqdm(
+        islice(iter(train_loader), head_steps),
+        total=head_steps,
+        desc="epoch 0",
+        leave=False,
+    ):
+        head_optimizer.zero_grad()
+        model.compute_loss(batch, device).backward()
+        head_optimizer.step()
+    model.scorer.encoder.requires_grad_(True)
     validation_loss = train_until_no_improvement(
         model, train_loader, validation_loader, learning_rate, warmup_steps, device
     )
