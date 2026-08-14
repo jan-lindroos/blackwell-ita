@@ -48,7 +48,7 @@ def _(mo):
 
 @app.cell
 def _():
-    helpsteer_repo_id = "janlindroos/helpsteer2-human-prefs"
+    helpsteer_repo_id = "jan-lindroos/helpsteer2-human-prefs"
     return (helpsteer_repo_id,)
 
 
@@ -83,11 +83,10 @@ def _(helpsteer2_pairs, preferences_dataframe, responses_dataframe):
 
 
 @app.cell
-def _(helpsteer_pairs_dataframe, mo):
-    mo.md(
-        "Overall preference matched for "
-        f"{helpsteer_pairs_dataframe['overall'].notna().mean():.1%} of pairs."
-    )
+def _(mo):
+    mo.md("""
+    Next step requires running `hf auth login`.
+    """)
     return
 
 
@@ -124,7 +123,7 @@ def _(mo):
 @app.cell
 def _():
     language = "en"
-    community_repo_id = "janlindroos/community-alignment-human-prefs"
+    community_repo_id = "jan-lindroos/community-alignment-human-prefs"
     return community_repo_id, language
 
 
