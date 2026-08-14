@@ -7,6 +7,10 @@
 #     "huggingface_hub",
 #     "pandas",
 #     "torch",
+#     # molab's base image leaks a torchvision built against a different
+#     # torch; install a matching one so transformers doesn't import the
+#     # broken system copy
+#     "torchvision",
 #     "transformers",
 # ]
 # ///
