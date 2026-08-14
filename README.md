@@ -10,7 +10,7 @@ A principled approach to multi-preference, inference-time alignment, built on th
 - **Community Alignment** (English subset) the annotator pool spans the US and India, so groups = country × age, k = 4: {US, India} × {18–34, 35+}. Each annotation is a bare choice, so per-annotation targets are binary and a pair's target is the mean over its annotators — annotator disagreement survives as fractional targets.
 
 ### Methods
-Compared over a pool of N base-policy samples (N swept in powers of two): base policy, Bradley–Terry best-of-N, mean- and worst-criterion best-of-N, Best-of-Nash (the k = 1 Blackwell winner), and the Blackwell winner. The two extra baselines isolate what mixing over candidates adds (worst-criterion best-of-N vs Blackwell) and what per-criterion information adds (Best-of-Nash vs Blackwell).
+Compared over a pool of N base-policy samples (N swept in powers of two): base policy, Bradley–Terry best-of-N, mean- and worst-criterion best-of-N, Best-of-Nash (the k = 1 Blackwell winner), and the Blackwell winner. The two extra baselines isolate what mixing over candidates adds (worst-criterion best-of-N vs Blackwell) and what per-criterion information adds (Best-of-Nash vs Blackwell). BT variants of the mean- and worst-criterion baselines repeat the aggregation on the Bradley–Terry criterion heads, mapped to win probabilities via the sigmoid of within-head reward gaps (which cancels the per-head offset BT rewards are only identified up to), isolating what the pairwise model adds over BT.
 
 ### Policites
 - **Base policy** RLHFlow LLaMA3-SFT 8B. 

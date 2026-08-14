@@ -44,6 +44,7 @@ def _():
         best_of_nash,
         blackwell_winner,
         bt_best_of_n,
+        bt_preference_tensor,
         expected_scores,
         mean_criterion_best_of_n,
         policy_support,
@@ -56,6 +57,7 @@ def _():
         best_of_nash,
         blackwell_winner,
         bt_best_of_n,
+        bt_preference_tensor,
         expected_scores,
         mean_criterion_best_of_n,
         outcomes,
@@ -165,6 +167,7 @@ def _(
     best_of_nash,
     blackwell_winner,
     bt_best_of_n,
+    bt_preference_tensor,
     candidates_dataframe,
     criteria_indices,
     dataset,
@@ -193,7 +196,8 @@ def _(
         base_anchor = responses[samples_per_prompt]
         responses = responses[:samples_per_prompt]
         tensor = model_scores[f"tensor_{prompt_index}"]
-        rewards = model_scores[f"rewards_{prompt_index}"][:, overall_index]
+        full_rewards = model_scores[f"rewards_{prompt_index}"]
+        rewards = full_rewards[:, overall_index]
         # Each policy is persisted as its support atoms; every score downstream
         # is the weight-averaged candidate score, never a sampled draw
         rows = [
@@ -202,6 +206,9 @@ def _(
         ]
         for n in n_values:
             criteria_tensor = tensor[criteria_indices][:, :n, :n]
+            bt_criteria_tensor = bt_preference_tensor(
+                full_rewards[:n][:, criteria_indices]
+            )
             policies = {
                 "bt_best_of_n": bt_best_of_n(rewards[:n]),
                 "best_of_nash": best_of_nash(tensor[overall_index, :n, :n]),
@@ -210,6 +217,12 @@ def _(
                     criteria_tensor
                 ),
                 "blackwell": blackwell_winner(criteria_tensor),
+                "bt_mean_criterion_best_of_n": mean_criterion_best_of_n(
+                    bt_criteria_tensor
+                ),
+                "bt_worst_criterion_best_of_n": worst_criterion_best_of_n(
+                    bt_criteria_tensor
+                ),
             }
             rows.extend(
                 {

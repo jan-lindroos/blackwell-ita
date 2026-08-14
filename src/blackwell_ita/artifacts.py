@@ -14,6 +14,8 @@ HEADLINE_METHODS = [
     "mean_criterion_best_of_n",
     "worst_criterion_best_of_n",
     "blackwell",
+    "bt_mean_criterion_best_of_n",
+    "bt_worst_criterion_best_of_n",
 ]
 
 

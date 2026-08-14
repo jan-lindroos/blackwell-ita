@@ -54,6 +54,12 @@ def preference_tensor(
     return (tensor + 1.0 - tensor.transpose(0, 2, 1)) / 2.0
 
 
+def bt_preference_tensor(rewards: np.ndarray) -> np.ndarray:
+    """BT-implied win probabilities, shape (head, response, response)."""
+    gaps = rewards.T[:, :, None] - rewards.T[:, None, :]
+    return 1.0 / (1.0 + np.exp(-gaps))
+
+
 def blackwell_winner(preference_tensor: np.ndarray) -> np.ndarray:
     """Blackwell winner policy minimising the worst per-criterion shortfall."""
     # Data-oblivious target set S = {z : z >= 1/2}: minimise the worst clipped

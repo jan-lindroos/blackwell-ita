@@ -63,10 +63,19 @@ def _(artifact_path, dataset_picker, pd):
 
 @app.cell
 def _(HEADLINE_METHODS):
-    # Categorical palette slots 1-6 in fixed order (see dataviz palette reference);
+    # Categorical palette slots 1-8 in fixed order (see dataviz palette reference);
     # colour follows the method across every figure. The slot order is the
     # validated adjacency order, so new methods append rather than reorder
-    palette = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
+    palette = [
+        "#2a78d6",
+        "#eb6834",
+        "#1baf7a",
+        "#eda100",
+        "#e87ba4",
+        "#008300",
+        "#4a3aa7",
+        "#e34948",
+    ]
     method_colours = dict(zip(HEADLINE_METHODS, palette, strict=True))
     method_labels = {
         "base": "Base policy",
@@ -75,6 +84,8 @@ def _(HEADLINE_METHODS):
         "blackwell": "Blackwell",
         "mean_criterion_best_of_n": "Mean-criterion best-of-N",
         "worst_criterion_best_of_n": "Worst-criterion best-of-N",
+        "bt_mean_criterion_best_of_n": "BT mean-criterion best-of-N",
+        "bt_worst_criterion_best_of_n": "BT worst-criterion best-of-N",
     }
     headline_methods = HEADLINE_METHODS
     return headline_methods, method_colours, method_labels

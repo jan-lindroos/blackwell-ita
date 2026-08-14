@@ -10,6 +10,7 @@ from blackwell_ita.winners import (
     best_of_nash,
     blackwell_winner,
     bt_best_of_n,
+    bt_preference_tensor,
     expected_scores,
     mean_criterion_best_of_n,
     mean_win_rates,
@@ -234,6 +235,35 @@ def test_preference_tensor_batching_matches_single_batch():
     batched = preference_tensor(model, "prompt", responses, "cpu", batch_size=2)
     single = preference_tensor(model, "prompt", responses, "cpu", batch_size=64)
     np.testing.assert_allclose(batched, single)
+
+
+def test_bt_preference_tensor_is_skew_symmetric():
+    """The BT-implied tensor is skew-symmetric with 0.5 diagonals."""
+    rng = np.random.default_rng(1810)
+    rewards = rng.uniform(-3.0, 3.0, size=(4, 2))
+    tensor = bt_preference_tensor(rewards)
+    assert tensor.shape == (2, 4, 4)
+    np.testing.assert_allclose(tensor + tensor.transpose(0, 2, 1), 1.0, atol=1e-12)
+    np.testing.assert_allclose(np.diagonal(tensor, axis1=1, axis2=2), 0.5)
+
+
+def test_bt_preference_tensor_is_invariant_to_per_head_offsets():
+    """Shifting one head's rewards by a constant leaves its tensor unchanged."""
+    rng = np.random.default_rng(1810)
+    rewards = rng.uniform(-3.0, 3.0, size=(4, 2))
+    shifted = rewards.copy()
+    shifted[:, 1] += 17.0
+    np.testing.assert_allclose(
+        bt_preference_tensor(shifted), bt_preference_tensor(rewards), atol=1e-12
+    )
+
+
+def test_bt_preference_tensor_preserves_single_head_argmax():
+    """The mean-win-rate argmax matches the raw reward argmax per head."""
+    rng = np.random.default_rng(1810)
+    rewards = rng.uniform(-3.0, 3.0, size=(5, 1))
+    win_rates = mean_win_rates(bt_preference_tensor(rewards))
+    assert int(np.argmax(win_rates[0])) == int(np.argmax(rewards[:, 0]))
 
 
 class StubRewardModel:
