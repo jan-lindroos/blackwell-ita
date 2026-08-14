@@ -2,8 +2,8 @@
 
 import pytest
 
-import utils.tokens
-from utils.tokens import max_response_tokens
+import blackwell_ita.utils.tokens as tokens_module
+from blackwell_ita.utils.tokens import max_response_tokens
 
 
 class LengthTokenizer:
@@ -28,7 +28,7 @@ def test_small_collections_are_not_sampled():
 def test_sampling_limits_responses_considered(monkeypatch):
     """Sampling restricts the maximum to the sampled responses."""
     monkeypatch.setattr(
-        utils.tokens.random, "sample", lambda population, k: population[:k]
+        tokens_module.random, "sample", lambda population, k: population[:k]
     )
     responses = ["x" * length for length in range(1, 101)]
     assert max_response_tokens(responses, LengthTokenizer(), sample_size=10) == 10

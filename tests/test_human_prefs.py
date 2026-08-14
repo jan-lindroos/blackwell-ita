@@ -3,7 +3,7 @@
 import pandas as pd
 import pytest
 
-from human_prefs import (
+from blackwell_ita.human_prefs import (
     annotator_group,
     community_alignment_anchors,
     community_alignment_pairs,

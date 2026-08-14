@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 from scipy.optimize import linprog
 
-from train_rms import bt_text, pairwise_text
+from blackwell_ita.train_rms import bt_text, pairwise_text
 
 
 def reward_scores(

@@ -11,6 +11,10 @@ dependencies = [
     "transformers",
 ]
 
+[build-system]
+requires = ["uv_build>=0.8,<1"]
+build-backend = "uv_build"
+
 [dependency-groups]
 dev = [
     "basedpyright>=1.39.10",

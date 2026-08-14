@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 import torch
 
-from train_rms import (
+from blackwell_ita.train_rms import (
     Batch,
     PreferencePairDataset,
     RewardModelBase,

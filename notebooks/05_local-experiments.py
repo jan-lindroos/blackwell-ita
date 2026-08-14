@@ -2,6 +2,7 @@
 # requires-python = ">=3.13"
 # dependencies = [
 #     "marimo>=0.23.16",
+#     "blackwell-ita @ git+https://github.com/jan-lindroos/blackwell-ita",
 #     "huggingface_hub",
 #     "numpy",
 #     "pandas",
@@ -28,13 +29,14 @@ def _():
 
 
 @app.cell
-def _(mo):
-    import sys
-
-    sys.path.insert(0, str(mo.notebook_dir().parent / "src"))
-    from artifacts import HEADLINE_METHODS, artifact_path, upload_artifact
-    from judge import outcomes
-    from winners import (
+def _():
+    from blackwell_ita.artifacts import (
+        HEADLINE_METHODS,
+        artifact_path,
+        upload_artifact,
+    )
+    from blackwell_ita.judge import outcomes
+    from blackwell_ita.winners import (
         best_of_nash,
         blackwell_winner,
         bt_best_of_n,

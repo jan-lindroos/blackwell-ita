@@ -6,7 +6,7 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 
-from train_rms import (
+from blackwell_ita.train_rms import (
     Batch,
     BradleyTerryModel,
     PairwisePreferenceModel,
@@ -14,7 +14,12 @@ from train_rms import (
     load_reward_model,
     save_reward_model,
 )
-from winners import best_of_nash, blackwell_winner, preference_tensor, reward_scores
+from blackwell_ita.winners import (
+    best_of_nash,
+    blackwell_winner,
+    preference_tensor,
+    reward_scores,
+)
 
 TINY_ENCODER = "yujiepan/qwen2.5-tiny-random"
 CRITERION_COLUMNS = ["first_criterion", "second_criterion", "overall"]

@@ -2,6 +2,7 @@
 # requires-python = ">=3.13"
 # dependencies = [
 #     "marimo>=0.23.16",
+#     "blackwell-ita @ git+https://github.com/jan-lindroos/blackwell-ita",
 #     "datasets",
 #     "pandas",
 # ]
@@ -21,11 +22,11 @@ def _():
 
 
 @app.cell
-def _(mo):
-    import sys
-
-    sys.path.insert(0, str(mo.notebook_dir().parent / "src"))
-    from human_prefs import community_alignment_pairs, helpsteer2_pairs
+def _():
+    from blackwell_ita.human_prefs import (
+        community_alignment_pairs,
+        helpsteer2_pairs,
+    )
 
     return community_alignment_pairs, helpsteer2_pairs
 

@@ -4,7 +4,7 @@ import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from train_rms import default_device
+from blackwell_ita.train_rms import default_device
 
 
 def generate_candidates(

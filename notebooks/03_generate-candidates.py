@@ -2,6 +2,7 @@
 # requires-python = ">=3.13"
 # dependencies = [
 #     "marimo>=0.23.16",
+#     "blackwell-ita @ git+https://github.com/jan-lindroos/blackwell-ita",
 #     "datasets",
 #     "huggingface_hub",
 #     "pandas",
@@ -25,13 +26,10 @@ def _():
 
 
 @app.cell
-def _(mo):
-    import sys
-
-    sys.path.insert(0, str(mo.notebook_dir().parent / "src"))
-    from artifacts import model_path, upload_artifact
-    from generate import generate_candidates
-    from human_prefs import (
+def _():
+    from blackwell_ita.artifacts import model_path, upload_artifact
+    from blackwell_ita.generate import generate_candidates
+    from blackwell_ita.human_prefs import (
         community_alignment_anchors,
         helpsteer2_anchors,
         prompt_splits,

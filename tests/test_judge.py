@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import judge
+from blackwell_ita import judge
 
 
 def order_sensitive_pick(preferred: str):

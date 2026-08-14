@@ -2,6 +2,7 @@
 # requires-python = ">=3.13"
 # dependencies = [
 #     "marimo>=0.23.16",
+#     "blackwell-ita @ git+https://github.com/jan-lindroos/blackwell-ita",
 #     "huggingface_hub",
 #     "matplotlib",
 #     "numpy",
@@ -24,11 +25,8 @@ def _():
 
 
 @app.cell
-def _(mo):
-    import sys
-
-    sys.path.insert(0, str(mo.notebook_dir().parent / "src"))
-    from artifacts import HEADLINE_METHODS, artifact_path
+def _():
+    from blackwell_ita.artifacts import HEADLINE_METHODS, artifact_path
 
     return HEADLINE_METHODS, artifact_path
 

@@ -2,6 +2,7 @@
 # requires-python = ">=3.13"
 # dependencies = [
 #     "marimo>=0.23.16",
+#     "blackwell-ita @ git+https://github.com/jan-lindroos/blackwell-ita",
 #     "huggingface_hub",
 #     "numpy",
 #     "pandas",
@@ -26,13 +27,14 @@ def _():
 
 
 @app.cell
-def _(mo):
-    import sys
-
-    sys.path.insert(0, str(mo.notebook_dir().parent / "src"))
-    from artifacts import artifact_path, model_path, upload_artifact
-    from train_rms import default_device, load_reward_model, pairwise_text
-    from winners import preference_tensor, reward_scores
+def _():
+    from blackwell_ita.artifacts import artifact_path, model_path, upload_artifact
+    from blackwell_ita.train_rms import (
+        default_device,
+        load_reward_model,
+        pairwise_text,
+    )
+    from blackwell_ita.winners import preference_tensor, reward_scores
 
     return (
         artifact_path,

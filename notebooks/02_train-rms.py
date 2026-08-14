@@ -2,6 +2,7 @@
 # requires-python = ">=3.13"
 # dependencies = [
 #     "marimo>=0.23.16",
+#     "blackwell-ita @ git+https://github.com/jan-lindroos/blackwell-ita",
 #     "datasets",
 #     "huggingface_hub",
 #     "pandas",
@@ -24,18 +25,15 @@ def _():
 
 
 @app.cell
-def _(mo):
-    import sys
-
-    sys.path.insert(0, str(mo.notebook_dir().parent / "src"))
-    from artifacts import upload_model
-    from human_prefs import prompt_splits
-    from train_rms import (
+def _():
+    from blackwell_ita.artifacts import upload_model
+    from blackwell_ita.human_prefs import prompt_splits
+    from blackwell_ita.train_rms import (
         save_reward_model,
         train_pairwise_model,
         train_reward_models,
     )
-    from utils.tokens import max_response_tokens
+    from blackwell_ita.utils.tokens import max_response_tokens
 
     return (
         max_response_tokens,

@@ -6,7 +6,7 @@ import pytest
 import torch
 from scipy.optimize import linprog
 
-from winners import (
+from blackwell_ita.winners import (
     best_of_nash,
     blackwell_winner,
     bt_best_of_n,
