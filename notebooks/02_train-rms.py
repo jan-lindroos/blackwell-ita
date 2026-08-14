@@ -45,6 +45,7 @@ def _():
             ],
             check=True,
         )
+        importlib.invalidate_caches()
 
     from blackwell_ita.artifacts import upload_model
     from blackwell_ita.human_prefs import prompt_splits
