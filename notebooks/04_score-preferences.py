@@ -28,6 +28,26 @@ def _():
 
 @app.cell
 def _():
+    import importlib.util
+
+    # molab can build the sandbox before the header's git dep is seen, and
+    # marimo's auto-installer would then retry the bare (unregistered) name
+    if importlib.util.find_spec("blackwell_ita") is None:
+        import subprocess
+        import sys
+
+        subprocess.run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                sys.executable,
+                "blackwell-ita @ git+https://github.com/jan-lindroos/blackwell-ita",
+            ],
+            check=True,
+        )
+
     from blackwell_ita.artifacts import artifact_path, model_path, upload_artifact
     from blackwell_ita.train_rms import (
         default_device,
