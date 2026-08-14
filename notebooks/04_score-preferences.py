@@ -47,7 +47,6 @@ def _():
             ],
             check=True,
         )
-        importlib.invalidate_caches()
 
     from blackwell_ita.artifacts import artifact_path, model_path, upload_artifact
     from blackwell_ita.train_rms import (

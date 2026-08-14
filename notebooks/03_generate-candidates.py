@@ -46,7 +46,6 @@ def _():
             ],
             check=True,
         )
-        importlib.invalidate_caches()
 
     from blackwell_ita.artifacts import model_path, upload_artifact
     from blackwell_ita.generate import generate_candidates
