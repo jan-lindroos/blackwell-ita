@@ -18,7 +18,7 @@ Compared over a pool of N base-policy samples (N swept in powers of two): base p
 
 ### Metrics 
 - **Primary** worst-criterion / worst-group win rate from the held-out evaluation model
-- **Secondary** overall expected win rate (win + draw/2) judged by Claude (`claude-sonnet-5`, order-swap debiased) against two anchors: the dataset reference answer and a reserved base-policy sample.
+- **Secondary** overall expected win rate (win + draw/2) judged by Claude (`claude-sonnet-5`, order-swap debiased) against the dataset reference answer, at N ∈ {1, 4, 16, 64}.
 
 Policies are scored in expectation over their support atoms (no sampling).
 

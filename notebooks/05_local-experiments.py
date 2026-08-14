@@ -95,8 +95,15 @@ def _():
     evaluation_prompt_count = 100
     samples_per_prompt = 64
     n_values = [1, 2, 4, 8, 16, 32, 64]
+    judge_n_values = [1, 4, 16, 64]
     judge_model = "claude-sonnet-5"
-    return evaluation_prompt_count, judge_model, n_values, samples_per_prompt
+    return (
+        evaluation_prompt_count,
+        judge_model,
+        judge_n_values,
+        n_values,
+        samples_per_prompt,
+    )
 
 
 @app.cell(hide_code=True)
@@ -255,73 +262,58 @@ def _(mo):
 
 @app.cell
 def _(
-    HEADLINE_METHODS,
     Path,
     anchors,
-    candidates_dataframe,
     dataset,
     expected_scores,
     judge_button,
     judge_model,
+    judge_n_values,
     mo,
     outcomes,
     pd,
-    samples_per_prompt,
     selections_dataframe,
     tempfile,
     upload_artifact,
 ):
     mo.stop(not judge_button.value)
-    base_sample_rows = candidates_dataframe[
-        candidates_dataframe["sample_index"] == samples_per_prompt
+    judged_selections = selections_dataframe[
+        (selections_dataframe["method"] != "base_anchor")
+        & selections_dataframe["n"].isin(judge_n_values)
     ]
-    base_anchors = dict(
-        zip(base_sample_rows["prompt"], base_sample_rows["response"], strict=True)
-    )
-    headline = selections_dataframe["method"].isin(HEADLINE_METHODS) & (
-        (selections_dataframe["n"] == samples_per_prompt)
-        | (selections_dataframe["method"] == "base")
-    )
-    sweep = ~headline & (selections_dataframe["method"] != "base_anchor")
-    # Expectation scoring: judge each distinct support atom once per anchor,
-    # then average atom scores under each policy's weights. Shared atom
-    # scores pin all methods to the same value at N = 1 and make sweep
-    # curves move only where the policies actually differ
-    judgement_frames = []
+    # Expectation scoring: judge each distinct support atom once against the
+    # reference anchor, then average atom scores under each policy's
+    # weights. Shared atom scores pin all methods to the same value at
+    # N = 1 and make sweep curves move only where the policies actually
+    # differ
+    atoms = judged_selections[["prompt", "response"]].drop_duplicates()
+    comparisons = [
+        {
+            "instruction": atom["prompt"],
+            "response": atom["response"],
+            "anchor": anchors[atom["prompt"]],
+        }
+        for _, atom in atoms.iterrows()
+    ]
+    atom_scores = {}
     atom_rows = []
-    for anchor_name, anchor_lookup, subset in [
-        ("reference", anchors, selections_dataframe[headline | sweep]),
-        ("base_sample", base_anchors, selections_dataframe[headline]),
-    ]:
-        atoms = subset[["prompt", "response"]].drop_duplicates()
-        comparisons = [
-            {
-                "instruction": atom["prompt"],
-                "response": atom["response"],
-                "anchor": anchor_lookup[atom["prompt"]],
-            }
-            for _, atom in atoms.iterrows()
+    for (_, judged_atom), judgement in zip(
+        atoms.iterrows(), outcomes(comparisons, model=judge_model), strict=True
+    ):
+        atom_scores[(judged_atom["prompt"], judged_atom["response"])] = judgement[
+            "score"
         ]
-        atom_scores = {}
-        for (_, judged_atom), judgement in zip(
-            atoms.iterrows(), outcomes(comparisons, model=judge_model), strict=True
-        ):
-            atom_scores[(judged_atom["prompt"], judged_atom["response"])] = judgement[
-                "score"
-            ]
-            atom_rows.append(
-                {
-                    "prompt": judged_atom["prompt"],
-                    "response": judged_atom["response"],
-                    "anchor": anchor_name,
-                    "judge_model": judge_model,
-                    **judgement,
-                }
-            )
-        anchor_judgements = expected_scores(subset, atom_scores)
-        anchor_judgements["anchor"] = anchor_name
-        judgement_frames.append(anchor_judgements)
-    judgements_dataframe = pd.concat(judgement_frames, ignore_index=True)
+        atom_rows.append(
+            {
+                "prompt": judged_atom["prompt"],
+                "response": judged_atom["response"],
+                "anchor": "reference",
+                "judge_model": judge_model,
+                **judgement,
+            }
+        )
+    judgements_dataframe = expected_scores(judged_selections, atom_scores)
+    judgements_dataframe["anchor"] = "reference"
     judgements_dataframe["criterion"] = "overall"
     judgements_dataframe["judge_model"] = judge_model
     judgements_dataframe = judgements_dataframe[

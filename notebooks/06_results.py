@@ -98,7 +98,8 @@ def _(mo):
 
     The Blackwell winner optimises the worst per-criterion (HelpSteer2 attributes)
     or per-group (Community Alignment country-age) win rate; the overall expected
-    win rate (EWR = win + draw/2) against both anchors shows what that costs.
+    win rate (EWR = win + draw/2) against the reference anchor shows what that
+    costs.
     """)
     return
 
@@ -116,14 +117,11 @@ def _(criterion_scores, headline_methods, judgements, pd):
     headline_table = pd.DataFrame(
         {
             "worst criterion": per_criterion.min(axis=1),
-            **{
-                f"EWR vs {anchor}": headline_judgements[
-                    headline_judgements["anchor"] == anchor
-                ]
-                .groupby("method")["score"]
-                .mean()
-                for anchor in ("reference", "base_sample")
-            },
+            "EWR vs reference": headline_judgements[
+                headline_judgements["anchor"] == "reference"
+            ]
+            .groupby("method")["score"]
+            .mean(),
         }
     ).reindex(headline_methods)
     headline_table.round(3)
