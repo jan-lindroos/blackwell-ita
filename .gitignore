@@ -1,0 +1,9 @@
+__pycache__/
+.venv/
+__marimo__/
+.DS_Store
+# Legacy local artifact folders; everything now lives on the HF Hub
+models/
+results/
+.ruff_cache/
+.pytest_cache/

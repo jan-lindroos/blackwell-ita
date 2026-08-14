@@ -1,0 +1,60 @@
+[project]
+name = "blackwell-ita"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "huggingface-hub",
+    "numpy",
+    "pandas",
+    "scipy",
+    "torch",
+    "transformers",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.39.10",
+    # datasets is imported only by notebooks (which carry their own inline
+    # deps); the dev install keeps it available for local notebook editing
+    "datasets",
+    "marimo>=0.23.16",
+    "matplotlib",
+    "pytest",
+    "ruff",
+]
+
+[tool.uv.sources]
+# CI runs on linux; resolve torch there from the CPU-only index so the runner
+# never downloads CUDA wheels. The macOS resolution is unaffected (marker),
+# and the molab GPU notebooks run in marimo's sandbox from their inline deps,
+# so CUDA there is unaffected too
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.basedpyright]
+typeCheckingMode = "standard"
+extraPaths = ["src"]
+# Setting exclude replaces pyright's defaults, so restate them or .venv gets scanned
+exclude = ["**/node_modules", "**/__pycache__", "**/.*"]
+
+[[tool.basedpyright.executionEnvironments]]
+# A marimo cell's trailing bare expression is its rendered output
+root = "notebooks"
+reportUnusedExpression = "none"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+markers = ["slow: downloads models"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "D", "I", "RUF"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"notebooks/*" = ["B018", "D", "RUF059"]
