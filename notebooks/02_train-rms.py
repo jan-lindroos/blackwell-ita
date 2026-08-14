@@ -43,18 +43,20 @@ def _():
     from blackwell_ita.artifacts import upload_model
     from blackwell_ita.human_prefs import prompt_splits
     from blackwell_ita.train_rms import (
+        BradleyTerryModel,
+        PairwisePreferenceModel,
         save_reward_model,
-        train_pairwise_model,
-        train_reward_models,
+        train_reward_model,
     )
     from blackwell_ita.utils.tokens import max_response_tokens
 
     return (
+        BradleyTerryModel,
+        PairwisePreferenceModel,
         max_response_tokens,
         prompt_splits,
         save_reward_model,
-        train_pairwise_model,
-        train_reward_models,
+        train_reward_model,
         upload_model,
     )
 
@@ -200,91 +202,143 @@ def _(mo):
 
 @app.cell
 def _(
+    Path,
+    criterion_columns,
+    dataset_picker,
+    encoder_name,
+    save_reward_model,
+    tempfile,
+    upload_model,
+):
+    def save_and_upload(model, checkpoint_name):
+        with tempfile.TemporaryDirectory() as temp_name:
+            checkpoint_path = Path(temp_name) / checkpoint_name
+            save_reward_model(
+                model, criterion_columns, encoder_name, checkpoint_path
+            )
+            upload_model(dataset_picker.selected_key, checkpoint_path)
+
+    return (save_and_upload,)
+
+
+@app.cell
+def _(
+    BradleyTerryModel,
     batch_size,
     bradley_terry_max_tokens,
+    criterion_columns,
+    encoder_name,
+    learning_rate,
+    mo,
+    optimisation_frame,
+    save_and_upload,
+    train_button,
+    train_reward_model,
+    warmup_steps,
+):
+    mo.stop(not train_button.value)
+    bradley_terry_model, bradley_terry_loss = train_reward_model(
+        optimisation_frame,
+        criterion_columns,
+        BradleyTerryModel,
+        bradley_terry_max_tokens,
+        encoder_name=encoder_name,
+        learning_rate=learning_rate,
+        batch_size=batch_size,
+        warmup_steps=warmup_steps,
+    )
+    save_and_upload(bradley_terry_model, "bradley_terry.pt")
+    mo.md(f"Uploaded bradley_terry.pt (validation loss {bradley_terry_loss:.4f}).")
+    return (bradley_terry_loss,)
+
+
+@app.cell
+def _(
+    PairwisePreferenceModel,
+    batch_size,
+    bradley_terry_loss,
+    criterion_columns,
+    encoder_name,
+    learning_rate,
+    mo,
+    optimisation_frame,
+    pairwise_max_tokens,
+    save_and_upload,
+    train_reward_model,
+    warmup_steps,
+):
+    # bradley_terry_loss is referenced so this cell runs after the Bradley-Terry
+    # upload; the GPU only fits one model's training state at a time
+    _ = bradley_terry_loss
+    pairwise_model, pairwise_loss = train_reward_model(
+        optimisation_frame,
+        criterion_columns,
+        PairwisePreferenceModel,
+        pairwise_max_tokens,
+        encoder_name=encoder_name,
+        learning_rate=learning_rate,
+        batch_size=batch_size,
+        warmup_steps=warmup_steps,
+    )
+    save_and_upload(pairwise_model, "pairwise.pt")
+    mo.md(f"Uploaded pairwise.pt (validation loss {pairwise_loss:.4f}).")
+    return (pairwise_loss,)
+
+
+@app.cell
+def _(
+    PairwisePreferenceModel,
+    batch_size,
     criterion_columns,
     encoder_name,
     evaluation_frame,
     learning_rate,
     mo,
-    optimisation_frame,
+    pairwise_loss,
     pairwise_max_tokens,
-    train_button,
-    train_pairwise_model,
-    train_reward_models,
+    save_and_upload,
+    train_reward_model,
     warmup_steps,
 ):
-    mo.stop(not train_button.value)
-    bradley_terry_model, pairwise_model, validation_losses = train_reward_models(
-        optimisation_frame,
-        criterion_columns,
-        encoder_name=encoder_name,
-        learning_rate=learning_rate,
-        batch_size=batch_size,
-        bradley_terry_max_tokens=bradley_terry_max_tokens,
-        pairwise_max_tokens=pairwise_max_tokens,
-        warmup_steps=warmup_steps,
-    )
-    evaluation_pairwise_model, evaluation_validation_loss = train_pairwise_model(
+    _ = pairwise_loss
+    evaluation_pairwise_model, evaluation_pairwise_loss = train_reward_model(
         evaluation_frame,
         criterion_columns,
+        PairwisePreferenceModel,
+        pairwise_max_tokens,
         encoder_name=encoder_name,
         learning_rate=learning_rate,
         batch_size=batch_size,
-        pairwise_max_tokens=pairwise_max_tokens,
         warmup_steps=warmup_steps,
     )
-    {**validation_losses, "evaluation_pairwise": evaluation_validation_loss}
-    return bradley_terry_model, evaluation_pairwise_model, pairwise_model
+    save_and_upload(evaluation_pairwise_model, "evaluation_pairwise.pt")
+    mo.md(
+        f"Uploaded evaluation_pairwise.pt "
+        f"(validation loss {evaluation_pairwise_loss:.4f})."
+    )
+    return (evaluation_pairwise_loss,)
 
 
 @app.cell
 def _(
     Path,
-    bradley_terry_model,
-    criterion_columns,
+    bradley_terry_loss,
     dataset_picker,
-    encoder_name,
-    evaluation_pairwise_model,
+    evaluation_pairwise_loss,
     evaluation_prompts,
     held_out_prompts,
     json,
-    mo,
     optimisation_prompts,
-    pairwise_model,
-    save_reward_model,
+    pairwise_loss,
     tempfile,
     upload_model,
 ):
-    checkpoint_files = [
-        "bradley_terry.pt",
-        "pairwise.pt",
-        "evaluation_pairwise.pt",
-        "prompt_split.json",
-    ]
-    with tempfile.TemporaryDirectory() as temp_name:
-        temp_directory = Path(temp_name)
-        save_reward_model(
-            bradley_terry_model,
-            criterion_columns,
-            encoder_name,
-            temp_directory / "bradley_terry.pt",
-        )
-        save_reward_model(
-            pairwise_model,
-            criterion_columns,
-            encoder_name,
-            temp_directory / "pairwise.pt",
-        )
-        save_reward_model(
-            evaluation_pairwise_model,
-            criterion_columns,
-            encoder_name,
-            temp_directory / "evaluation_pairwise.pt",
-        )
-        # Recorded so 03_generate-candidates.py can verify the held-out evaluation
-        # prompts still match what these checkpoints were trained without
-        (temp_directory / "prompt_split.json").write_text(
+    # Recorded so 03_generate-candidates.py can verify the held-out evaluation
+    # prompts still match what these checkpoints were trained without; uploaded
+    # last so its presence marks a complete, consistent checkpoint set
+    with tempfile.TemporaryDirectory() as split_temp_name:
+        split_path = Path(split_temp_name) / "prompt_split.json"
+        split_path.write_text(
             json.dumps(
                 {
                     "held_out": held_out_prompts,
@@ -293,9 +347,12 @@ def _(
                 }
             )
         )
-        for checkpoint_file in checkpoint_files:
-            upload_model(dataset_picker.selected_key, temp_directory / checkpoint_file)
-    mo.md(f"Uploaded {', '.join(checkpoint_files)} for {dataset_picker.selected_key}.")
+        upload_model(dataset_picker.selected_key, split_path)
+    {
+        "bradley_terry": bradley_terry_loss,
+        "pairwise": pairwise_loss,
+        "evaluation_pairwise": evaluation_pairwise_loss,
+    }
     return
 
 

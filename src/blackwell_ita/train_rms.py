@@ -349,71 +349,28 @@ def build_loaders(
     )
 
 
-def train_reward_models(
+def train_reward_model(
     dataframe: pd.DataFrame,
     criterion_columns: list[str],
+    model_class: type[RewardModelBase],
+    max_tokens: int,
     encoder_name: str = "Qwen/Qwen2.5-3B",
     learning_rate: float = 1e-5,
     batch_size: int = 16,
-    bradley_terry_max_tokens: int = 2000,
-    # e.g. HelpSteer2 pairwise inputs truncate at a ~3-5% rate at 2000 tokens
-    pairwise_max_tokens: int = 4000,
     warmup_steps: int = 100,
     validation_fraction: float = 0.1,
     augment_presentation_order: bool = True,
     seed: int = 1810,
     device: str | None = None,
-) -> tuple[BradleyTerryModel, PairwisePreferenceModel, dict[str, float]]:
-    """Train both reward model variants; returns them with validation losses."""
-    if device is None:
-        device = default_device()
-    tokenizer = AutoTokenizer.from_pretrained(encoder_name)
-    train_loader, validation_loader = build_loaders(
-        dataframe,
-        criterion_columns,
-        batch_size,
-        validation_fraction,
-        augment_presentation_order,
-        seed,
-    )
-    head_count = len(criterion_columns)
-    bradley_terry_model = BradleyTerryModel(
-        encoder_name, tokenizer, bradley_terry_max_tokens, head_count
-    )
-    pairwise_model = PairwisePreferenceModel(
-        encoder_name, tokenizer, pairwise_max_tokens, head_count
-    )
-    results: dict[str, float] = {}
-    for model_label, model in [
-        ("bradley_terry", bradley_terry_model),
-        ("pairwise", pairwise_model),
-    ]:
-        print(f"training {model_label}")
-        results[model_label] = train_until_no_improvement(
-            model,
-            train_loader,
-            validation_loader,
-            learning_rate,
-            warmup_steps,
-            device,
-        )
-    return bradley_terry_model, pairwise_model, results
+) -> tuple[RewardModelBase, float]:
+    """Train one reward model; returns it on the CPU with its validation loss.
 
-
-def train_pairwise_model(
-    dataframe: pd.DataFrame,
-    criterion_columns: list[str],
-    encoder_name: str = "Qwen/Qwen2.5-3B",
-    learning_rate: float = 1e-5,
-    batch_size: int = 16,
-    pairwise_max_tokens: int = 4000,
-    warmup_steps: int = 100,
-    validation_fraction: float = 0.1,
-    augment_presentation_order: bool = True,
-    seed: int = 1810,
-    device: str | None = None,
-) -> tuple[PairwisePreferenceModel, float]:
-    """Train a pairwise model alone; returns it with its validation loss."""
+    The train/validation split is deterministic in ``seed``, so successive
+    calls on the same dataframe train against identical splits. The model is
+    moved off the device before returning, freeing the GPU for the next call:
+    a 95 GiB GPU cannot train a 3B model beside a finished one still holding
+    its weights and gradients.
+    """
     if device is None:
         device = default_device()
     train_loader, validation_loader = build_loaders(
@@ -424,13 +381,17 @@ def train_pairwise_model(
         augment_presentation_order,
         seed,
     )
-    model = PairwisePreferenceModel(
+    model = model_class(
         encoder_name,
         AutoTokenizer.from_pretrained(encoder_name),
-        pairwise_max_tokens,
+        max_tokens,
         len(criterion_columns),
     )
     validation_loss = train_until_no_improvement(
         model, train_loader, validation_loader, learning_rate, warmup_steps, device
     )
+    model.to("cpu")
+    model.zero_grad(set_to_none=True)
+    if device == "cuda":
+        torch.cuda.empty_cache()
     return model, validation_loss
