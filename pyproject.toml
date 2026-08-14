@@ -27,18 +27,6 @@ dev = [
     "ruff",
 ]
 
-[tool.uv.sources]
-# CI runs on linux; resolve torch there from the CPU-only index so the runner
-# never downloads CUDA wheels. The macOS resolution is unaffected (marker),
-# and the molab GPU notebooks run in marimo's sandbox from their inline deps,
-# so CUDA there is unaffected too
-torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
 [tool.basedpyright]
 typeCheckingMode = "standard"
 extraPaths = ["src"]
