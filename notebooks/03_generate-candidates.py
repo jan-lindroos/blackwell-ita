@@ -67,8 +67,17 @@ def _():
 
     import datasets
     import pandas as pd
+    from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
 
-    return Path, datasets, json, pd, tempfile
+    return (
+        EntryNotFoundError,
+        Path,
+        RepositoryNotFoundError,
+        datasets,
+        json,
+        pd,
+        tempfile,
+    )
 
 
 @app.cell
@@ -114,6 +123,8 @@ def _(mo):
 
 @app.cell
 def _(
+    EntryNotFoundError,
+    RepositoryNotFoundError,
     community_alignment_anchors,
     dataset_picker,
     datasets,
@@ -149,11 +160,16 @@ def _(
         )
         # The split is a function of hub-dataset row order; if the pairs dataset
         # were re-pushed, checkpoints would silently be evaluated on prompts
-        # from their own training half. 02_train-rms.py records the lists
-        prompt_split = json.loads(
-            model_path(dataset_picker.selected_key, "prompt_split.json").read_text()
-        )
-        assert held_out_prompts == prompt_split["held_out"]
+        # from their own training half. 02_train-rms.py records the lists; the
+        # split is deterministic, so before that upload exists the local one
+        # is the same one 02 will record
+        try:
+            prompt_split = json.loads(
+                model_path(dataset_picker.selected_key, "prompt_split.json").read_text()
+            )
+            assert held_out_prompts == prompt_split["held_out"]
+        except (EntryNotFoundError, RepositoryNotFoundError):
+            pass
         anchors = community_alignment_anchors(pairs_dataframe, held_out_prompts)
     evaluation_prompts = list(anchors)
     len(evaluation_prompts)
