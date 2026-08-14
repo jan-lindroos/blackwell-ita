@@ -96,6 +96,11 @@ class MultiHeadEncoder(torch.nn.Module):
         # Parameters stay fp32: AdamW updates at lr=1e-5 underflow pure-bf16
         # weights, leaving them bit-identical after "training"
         self.encoder = AutoModel.from_pretrained(encoder_name, dtype=torch.float32)
+        # Without checkpointing, the two live activation graphs of a 16-pair
+        # batch at 2000+ tokens need well over the 95 GiB a single GPU offers
+        self.encoder.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
         self.head = torch.nn.Linear(self.encoder.config.hidden_size, head_count)
 
     def forward(self, tokenized: dict[str, torch.Tensor]) -> torch.Tensor:
