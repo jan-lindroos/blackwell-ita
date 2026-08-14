@@ -19,6 +19,16 @@ __generated_with = "0.23.16"
 app = marimo.App()
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(
+        r"""
+        Before running, switch to GPU. Then sign in with `hf auth login` (open terminal available via command menu) and add `blackwell-ita @ git+https://github.com/jan-lindroos/blackwell-ita` to dependencies via uv (in the sidebar, in dependencies).
+        """
+    )
+    return
+
+
 @app.cell
 def _():
     import marimo as mo

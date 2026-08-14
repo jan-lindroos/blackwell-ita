@@ -14,6 +14,16 @@ __generated_with = "0.23.16"
 app = marimo.App()
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(
+        r"""
+        Before running, sign in with `hf auth login` (open terminal available via command menu).
+        """
+    )
+    return
+
+
 @app.cell
 def _():
     import marimo as mo
@@ -81,14 +91,6 @@ def _(helpsteer2_pairs, preferences_dataframe, responses_dataframe):
     )
     helpsteer_pairs_dataframe
     return (helpsteer_pairs_dataframe,)
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    Next step requires running `hf auth login`.
-    """)
-    return
 
 
 @app.cell
