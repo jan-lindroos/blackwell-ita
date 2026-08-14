@@ -7,6 +7,7 @@ from typing import TypedDict
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerBase
 
 
@@ -285,11 +286,14 @@ def train_until_no_improvement(
     epoch = 0
     while True:
         model.train()
-        for batch in train_loader:
+        progress = tqdm(train_loader, desc=f"epoch {epoch + 1}", leave=False)
+        for batch in progress:
             optimizer.zero_grad()
-            model.compute_loss(batch, device).backward()
+            loss = model.compute_loss(batch, device)
+            loss.backward()
             optimizer.step()
             scheduler.step()
+            progress.set_postfix(loss=f"{loss.item():.4f}")
         validation_loss = evaluate_loss(model, validation_loader, device)
         epoch += 1
         print(f"epoch {epoch}: validation_loss={validation_loss:.4f}")

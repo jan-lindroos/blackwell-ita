@@ -166,6 +166,7 @@ dependencies = [
     { name = "pandas" },
     { name = "scipy" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "transformers" },
 ]
 
@@ -186,6 +187,7 @@ requires-dist = [
     { name = "pandas" },
     { name = "scipy" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "transformers" },
 ]
 
