@@ -80,8 +80,6 @@ def blackwell_winner(preference_tensor: np.ndarray) -> np.ndarray:
         b_eq=[1.0],
         bounds=[(0.0, None)] * count + [(0.0, None)],
     )
-    # A failed solve returns x=None; surfacing it here beats crashing later
-    # with a policy of None after thousands of preference-model queries
     if not result.success:
         raise RuntimeError(f"blackwell_winner linprog failed: {result.message}")
     return result.x[:count]
@@ -151,7 +149,5 @@ def expected_scores(
     grouped: pd.DataFrame = scored.groupby(["prompt", "method", "n"], as_index=False)[  # pyright: ignore[reportAssignmentType]
         ["weight", "score"]
     ].sum()
-    # Dividing by the summed weight keeps this an expectation even if a
-    # policy's atom weights do not sum exactly to one
     grouped["score"] = grouped["score"] / grouped["weight"]
     return grouped.drop(columns=["weight"])

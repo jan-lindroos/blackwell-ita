@@ -152,8 +152,6 @@ class RewardModelBase(torch.nn.Module):
             return_tensors="pt",
         )
         inputs = {key: value.to(device) for key, value in tokenized.items()}
-        # bf16 autocast recovers bf16 memory and speed on cuda while the fp32
-        # master weights keep the optimiser updates representable
         if device.startswith("cuda"):
             with torch.autocast("cuda", torch.bfloat16):
                 return self.scorer(inputs)
@@ -375,7 +373,6 @@ def train_until_no_improvement(
     )
 
     def cycling_batches() -> Iterator[Batch]:
-        # Each pass over a shuffling DataLoader draws a fresh order
         while True:
             yield from train_loader
 

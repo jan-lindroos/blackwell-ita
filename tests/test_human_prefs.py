@@ -61,7 +61,6 @@ def test_helpsteer2_pairs_graded_targets_and_overall_sign():
     assert row["helpfulness"] == 1.0
     assert row["correctness"] == 0.5
     assert row["coherence"] == 0.75
-    # Positive strength means response_2 preferred, so response_a loses
     assert row["overall"] == 0.0
 
 
@@ -104,8 +103,6 @@ def test_helpsteer2_anchors_require_strict_overall_winner():
             "preference_strength": [2, -1, 0],
         }
     )
-    # p2 has no annotation and p4 ties, so neither yields an anchor; positive
-    # strength picks the second response, negative the first
     assert helpsteer2_anchors(validation, preferences) == {"p1": "b", "p3": "e"}
     assert helpsteer2_anchors(validation, preferences, count=1) == {"p1": "b"}
 

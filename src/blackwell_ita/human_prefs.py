@@ -15,10 +15,6 @@ HELPSTEER2_ATTRIBUTES = [
 
 def graded_target(margin: float) -> float:
     """Map an ordinal rating margin to a graded win probability."""
-    # Ordinal margin -> win probability on a symmetric five-level grid
-    # {1, 0.75, 0.5, 0.25, 0}. Applied per annotation; pair-level targets are
-    # means over annotators, so multi-annotator pairs can fall off-grid — that
-    # is the disagreement signal, not noise
     if margin >= 2:
         return 1.0
     if margin >= 1:
@@ -35,9 +31,6 @@ def helpsteer2_response_pairs(
 ) -> Iterator[tuple[pd.Series, pd.Series]]:
     """Yield response row pairs, paired consecutively within each prompt group."""
     for prompt, group in responses.groupby("prompt", sort=False):
-        # Pairs sit consecutively within a prompt group (one train prompt
-        # carries two separate pairs, i.e. four rows); an odd group breaks the
-        # pairing assumption, so fail loudly instead of corrupting the pairs
         assert len(group) % 2 == 0, f"odd response group for prompt {prompt!r}"
         for start in range(0, len(group), 2):
             yield group.iloc[start], group.iloc[start + 1]
@@ -175,8 +168,6 @@ def community_alignment_anchors(
 ) -> dict[str, str]:
     """Anchor per held-out prompt: the response with the best win fraction."""
     held_out = pairs_dataframe[pairs_dataframe["prompt"].isin(held_out_prompts)]
-    # Each pair credits both responses: response_a with its win fraction and
-    # response_b with the complement; pooling is a mean over a response's pairs
     credits = list(
         zip(held_out["prompt"], held_out["response_a"], held_out["overall"], strict=True)
     ) + list(

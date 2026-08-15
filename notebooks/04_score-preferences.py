@@ -198,8 +198,6 @@ def _(
         score_arrays[f"rewards_{prompt_index}"] = reward_scores(
             bradley_terry_model, prompt, pool, device
         )
-        # Evaluation-model P(candidate beats reference anchor | criterion),
-        # averaged over both presentation orders
         for sample_index, response in enumerate(pool):
             forward_text = pairwise_text(prompt, response, anchor)
             backward_text = pairwise_text(prompt, anchor, response)

@@ -22,8 +22,6 @@ def order_sensitive_pick(preferred: str):
 
 def test_outcome_swaps_orders_and_maps_scores(monkeypatch):
     """A consistent winner scores 1 or 0 through the order-swapped prompts."""
-    # The stub inspects which slot holds the preferred text, so a missing or
-    # mislabelled order swap in outcome cannot pass
     monkeypatch.setattr(judge, "claude_pick", order_sensitive_pick("the response"))
     assert judge.outcome("instruction", "the response", "the anchor")["score"] == 1.0
     monkeypatch.setattr(judge, "claude_pick", order_sensitive_pick("the anchor"))

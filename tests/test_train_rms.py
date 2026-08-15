@@ -277,7 +277,6 @@ def test_train_until_no_improvement_cycles_loader_for_longer_rounds():
         steps_per_epoch=3,
     )
     assert best == 2.0
-    # Three rounds of three steps each, from a single-batch loader
     assert model.steps_trained == 9
     assert model.weight.item() == 3.0
 

@@ -42,8 +42,7 @@ def test_best_of_nash_dominant_object():
 def test_best_of_nash_non_uniform_mixture_with_dominated_object():
     """A known non-uniform equilibrium pins the payoff orientation."""
     # Weighted rock-paper-scissors plus a dominated fourth object: the unique
-    # equilibrium is (1/3, 1/2, 1/6, 0); a transposed payoff matrix instead
-    # concentrates on the dominated object, so this pins the orientation
+    # equilibrium is (1/3, 1/2, 1/6, 0)
     skew = np.array([[0.0, 0.1, -0.3], [-0.1, 0.0, 0.2], [0.3, -0.2, 0.0]])
     matrix = np.full((4, 4), 0.5)
     matrix[:3, :3] += skew
@@ -81,8 +80,6 @@ def blackwell_objective(policy: np.ndarray, tensor: np.ndarray) -> float:
 
 def test_blackwell_unique_minimiser_pins_transposes_and_clip():
     """A unique known minimiser guards against transpose and clipping bugs."""
-    # Unique minimiser (4/7, 3/7) with value 12/70; a transposed constraint
-    # matrix or an unclipped objective lands elsewhere
     tensor = np.stack(
         [
             np.array([[0.5, 0.9], [0.1, 0.5]]),

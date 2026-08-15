@@ -69,7 +69,6 @@ def claude_pick(prompt: str, model: str, attempts: int = 3) -> str | None:
                 return "SECOND"
             return None
         stderr = completed.stderr
-        # Transient CLI failures must not abort a judging run mid-flight
         if attempt < attempts - 1:
             time.sleep(2**attempt)
     raise RuntimeError(f"claude judge failed after {attempts} attempts: {stderr}")

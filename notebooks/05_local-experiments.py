@@ -201,8 +201,6 @@ def _(
         tensor = model_scores[f"tensor_{prompt_index}"]
         full_rewards = model_scores[f"rewards_{prompt_index}"]
         rewards = full_rewards[:, overall_index]
-        # Each policy is persisted as its support atoms. Every score downstream
-        # is the weight-averaged candidate score, never a sampled draw
         rows = [
             {"method": "base", "n": 1, "weight": 1.0, "response": responses[0]},
             {"method": "base_anchor", "n": 0, "weight": 1.0, "response": base_anchor},
@@ -311,7 +309,6 @@ def _(
         ["prompt", "method", "n", "anchor", "criterion", "judge_model", "score"]
     ]
     upload_dataframe(dataset, "judgements.parquet", judgements_dataframe)
-    # Raw per-atom verdicts kept for analysing draw and disagreement rates
     upload_dataframe(dataset, "atom_judgements.parquet", pd.DataFrame(atom_rows))
     judgements_dataframe
     return
@@ -348,8 +345,6 @@ def _(
             | (selections_dataframe["method"] == "base")
         )
     ]
-    # No model call and no Claude: the evaluation model's anchor scores are
-    # already cached per criterion, so this is pure pi-weighted aggregation
     criterion_frames = []
     for criterion in criterion_anchor_scores["criterion"].unique():
         criterion_subset = criterion_anchor_scores[
