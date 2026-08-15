@@ -41,13 +41,13 @@ def _():
 
 @app.cell
 def _():
-    from blackwell_ita.artifacts import model_path, upload_dataframe
     from blackwell_ita.generate import generate_candidates
     from blackwell_ita.human_prefs import (
         community_alignment_anchors,
         helpsteer2_anchors,
         prompt_splits,
     )
+    from blackwell_ita.utils.artifacts import model_path, upload_dataframe
 
     return (
         community_alignment_anchors,

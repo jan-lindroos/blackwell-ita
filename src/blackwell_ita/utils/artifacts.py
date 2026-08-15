@@ -1,7 +1,9 @@
 """Hub locations and transfer helpers for every pipeline artifact."""
 
+import tempfile
 from pathlib import Path
 
+import pandas as pd
 from huggingface_hub import HfApi, hf_hub_download
 
 RMS_REPO = "jan-lindroos/blackwell-ita-rms"
@@ -52,3 +54,11 @@ def upload_artifact(dataset: str, local_path: Path) -> None:
         repo_id=ARTIFACTS_REPO,
         repo_type="dataset",
     )
+
+
+def upload_dataframe(dataset: str, filename: str, dataframe: pd.DataFrame) -> None:
+    """Upload a dataframe to the artifacts repo as a parquet file."""
+    with tempfile.TemporaryDirectory() as temp_name:
+        path = Path(temp_name) / filename
+        dataframe.to_parquet(path)
+        upload_artifact(dataset, path)

@@ -26,7 +26,7 @@ def _():
 
 @app.cell
 def _():
-    from blackwell_ita.artifacts import HEADLINE_METHODS, artifact_path
+    from blackwell_ita.utils.artifacts import HEADLINE_METHODS, artifact_path
 
     return HEADLINE_METHODS, artifact_path
 

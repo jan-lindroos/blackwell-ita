@@ -42,12 +42,12 @@ def _():
 
 @app.cell
 def _():
-    from blackwell_ita.artifacts import artifact_path, model_path, upload_artifact
     from blackwell_ita.train_rms import (
         default_device,
         load_reward_model,
         pairwise_text,
     )
+    from blackwell_ita.utils.artifacts import artifact_path, model_path, upload_artifact
     from blackwell_ita.winners import preference_tensor, reward_scores
 
     return (

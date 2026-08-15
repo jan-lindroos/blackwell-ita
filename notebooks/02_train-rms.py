@@ -40,7 +40,6 @@ def _():
 
 @app.cell
 def _():
-    from blackwell_ita.artifacts import upload_model
     from blackwell_ita.human_prefs import prompt_splits
     from blackwell_ita.train_rms import (
         BradleyTerryModel,
@@ -50,6 +49,7 @@ def _():
         save_reward_model,
         train_reward_model,
     )
+    from blackwell_ita.utils.artifacts import upload_model
     from blackwell_ita.utils.tokens import token_lengths
 
     return (

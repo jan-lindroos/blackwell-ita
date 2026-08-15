@@ -34,12 +34,12 @@ def _():
 
 @app.cell
 def _():
-    from blackwell_ita.artifacts import (
+    from blackwell_ita.judge import JUDGE_MODEL, outcomes
+    from blackwell_ita.utils.artifacts import (
         HEADLINE_METHODS,
         artifact_path,
         upload_dataframe,
     )
-    from blackwell_ita.judge import JUDGE_MODEL, outcomes
     from blackwell_ita.winners import (
         best_of_nash,
         blackwell_winner,
