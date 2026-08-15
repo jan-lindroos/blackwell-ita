@@ -35,7 +35,7 @@ def generate_candidates(
         ).to(device)
         for start in range(0, samples_per_prompt, batch_size):
             outputs = model.generate(  # pyright: ignore[reportAttributeAccessIssue]
-                inputs,
+                **inputs,
                 do_sample=True,
                 temperature=temperature,
                 max_new_tokens=max_new_tokens,
@@ -46,7 +46,7 @@ def generate_candidates(
                 {
                     "prompt": prompt,
                     "response": tokenizer.decode(
-                        output[inputs.shape[1] :], skip_special_tokens=True
+                        output[inputs["input_ids"].shape[1] :], skip_special_tokens=True
                     ),
                 }
                 for output in outputs
