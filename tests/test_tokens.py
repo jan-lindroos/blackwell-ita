@@ -1,40 +1,21 @@
 """Tests for token-count helpers."""
 
-import pytest
-
-import blackwell_ita.utils.tokens as tokens_module
-from blackwell_ita.utils.tokens import max_response_tokens
+from blackwell_ita.utils.tokens import token_lengths
 
 
 class LengthTokenizer:
     """Tokenizer producing one token per character."""
 
-    def encode(self, text: str) -> list[int]:
-        """Return one token id per character."""
-        return [0] * len(text)
+    def __call__(self, texts: list[str]) -> dict[str, list[list[int]]]:
+        """Return one token id per character of each text."""
+        return {"input_ids": [[0] * len(text) for text in texts]}
 
 
-def test_max_over_all_responses_when_sampling_disabled():
-    """Without sampling, every response is considered."""
-    responses = ["a", "abcd", "ab"]
-    assert max_response_tokens(responses, LengthTokenizer(), sample_size=None) == 4
+def test_lengths_cover_every_text():
+    """Every text's tokenized length is returned, in order."""
+    assert token_lengths(["a", "abcd", "ab"], LengthTokenizer()) == [1, 4, 2]
 
 
-def test_small_collections_are_not_sampled():
-    """Collections below the sample size are used in full."""
-    assert max_response_tokens(["a", "abcd"], LengthTokenizer()) == 4
-
-
-def test_sampling_limits_responses_considered(monkeypatch):
-    """Sampling restricts the maximum to the sampled responses."""
-    monkeypatch.setattr(
-        tokens_module.random, "sample", lambda population, k: population[:k]
-    )
-    responses = ["x" * length for length in range(1, 101)]
-    assert max_response_tokens(responses, LengthTokenizer(), sample_size=10) == 10
-
-
-def test_empty_responses_raise():
-    """An empty collection raises rather than returning a default."""
-    with pytest.raises(ValueError):
-        max_response_tokens([], LengthTokenizer())
+def test_empty_texts_give_empty_lengths():
+    """An empty collection yields no lengths."""
+    assert token_lengths([], LengthTokenizer()) == []

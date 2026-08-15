@@ -45,17 +45,21 @@ def _():
     from blackwell_ita.train_rms import (
         BradleyTerryModel,
         PairwisePreferenceModel,
+        bt_text,
+        pairwise_text,
         save_reward_model,
         train_reward_model,
     )
-    from blackwell_ita.utils.tokens import max_response_tokens
+    from blackwell_ita.utils.tokens import token_lengths
 
     return (
         BradleyTerryModel,
         PairwisePreferenceModel,
-        max_response_tokens,
+        bt_text,
+        pairwise_text,
         prompt_splits,
         save_reward_model,
+        token_lengths,
         train_reward_model,
         upload_model,
     )
@@ -133,27 +137,55 @@ def _(dataset_picker):
 @app.cell
 def _(
     bradley_terry_max_tokens,
+    bt_text,
     encoder_name,
-    max_response_tokens,
     mo,
+    pairwise_max_tokens,
+    pairwise_text,
     preferences_dataframe,
+    token_lengths,
 ):
     from transformers import AutoTokenizer
 
     encoder_tokenizer = AutoTokenizer.from_pretrained(encoder_name)
-    longest_response_tokens = max(
-        max_response_tokens(preferences_dataframe["response_a"], encoder_tokenizer),
-        max_response_tokens(preferences_dataframe["response_b"], encoder_tokenizer),
+    prompt_response_triples = list(
+        zip(
+            preferences_dataframe["prompt"],
+            preferences_dataframe["response_a"],
+            preferences_dataframe["response_b"],
+            strict=True,
+        )
     )
+    bt_truncation_rate = sum(
+        length > bradley_terry_max_tokens
+        for length in token_lengths(
+            [
+                bt_text(prompt, response)
+                for prompt, first, second in prompt_response_triples
+                for response in (first, second)
+            ],
+            encoder_tokenizer,
+        )
+    ) / (2 * len(prompt_response_triples))
+    pairwise_truncation_rate = sum(
+        length > pairwise_max_tokens
+        for length in token_lengths(
+            [
+                pairwise_text(prompt, first, second)
+                for prompt, first, second in prompt_response_triples
+            ],
+            encoder_tokenizer,
+        )
+    ) / len(prompt_response_triples)
     response_token_check = (
         mo.callout(
-            f"Longest response is {longest_response_tokens} tokens, above "
-            f"bradley_terry_max_tokens={bradley_terry_max_tokens}; "
-            "model inputs will be truncated.",
+            f"{bt_truncation_rate:.1%} of Bradley-Terry inputs and "
+            f"{pairwise_truncation_rate:.1%} of pairwise inputs exceed their "
+            "token limits and will be truncated.",
             kind="warn",
         )
-        if longest_response_tokens > bradley_terry_max_tokens
-        else mo.md(f"Longest response: {longest_response_tokens} tokens.")
+        if bt_truncation_rate > 0 or pairwise_truncation_rate > 0
+        else mo.md("No inputs exceed their token limits.")
     )
     response_token_check
     return
@@ -227,6 +259,24 @@ def _(
 
 
 @app.cell
+def _():
+    def metrics_markdown(checkpoint_name, metrics):
+        criterion_lines = "\n".join(
+            f"- {criterion}: loss {values['loss']:.4f}, decisive accuracy "
+            f"{values['decisive_accuracy']:.1%} over "
+            f"{values['decisive_count']} entries"
+            for criterion, values in metrics["criteria"].items()
+        )
+        return (
+            f"Uploaded {checkpoint_name} "
+            f"(validation loss {metrics['validation_loss']:.4f}).\n\n"
+            f"{criterion_lines}"
+        )
+
+    return (metrics_markdown,)
+
+
+@app.cell
 def _(
     BradleyTerryModel,
     batch_size,
@@ -235,6 +285,7 @@ def _(
     criterion_columns,
     encoder_name,
     learning_rate,
+    metrics_markdown,
     mo,
     optimisation_frame,
     save_and_upload,
@@ -242,7 +293,7 @@ def _(
     warmup_steps,
 ):
     mo.stop(not bradley_terry_button.value)
-    bradley_terry_model, bradley_terry_loss = train_reward_model(
+    bradley_terry_model, bradley_terry_metrics = train_reward_model(
         optimisation_frame,
         criterion_columns,
         BradleyTerryModel,
@@ -251,10 +302,12 @@ def _(
         learning_rate=learning_rate,
         batch_size=batch_size,
         warmup_steps=warmup_steps,
+        # Order augmentation is a no-op for Bradley-Terry: BCE(-x, 1-t) = BCE(x, t)
+        augment_presentation_order=False,
     )
     save_and_upload(bradley_terry_model, "bradley_terry.pt")
-    mo.md(f"Uploaded bradley_terry.pt (validation loss {bradley_terry_loss:.4f}).")
-    return (bradley_terry_loss,)
+    mo.md(metrics_markdown("bradley_terry.pt", bradley_terry_metrics))
+    return (bradley_terry_metrics,)
 
 
 @app.cell
@@ -264,6 +317,7 @@ def _(
     criterion_columns,
     encoder_name,
     learning_rate,
+    metrics_markdown,
     mo,
     optimisation_frame,
     pairwise_button,
@@ -273,7 +327,7 @@ def _(
     warmup_steps,
 ):
     mo.stop(not pairwise_button.value)
-    pairwise_model, pairwise_loss = train_reward_model(
+    pairwise_model, pairwise_metrics = train_reward_model(
         optimisation_frame,
         criterion_columns,
         PairwisePreferenceModel,
@@ -284,8 +338,8 @@ def _(
         warmup_steps=warmup_steps,
     )
     save_and_upload(pairwise_model, "pairwise.pt")
-    mo.md(f"Uploaded pairwise.pt (validation loss {pairwise_loss:.4f}).")
-    return (pairwise_loss,)
+    mo.md(metrics_markdown("pairwise.pt", pairwise_metrics))
+    return (pairwise_metrics,)
 
 
 @app.cell
@@ -297,6 +351,7 @@ def _(
     evaluation_frame,
     evaluation_pairwise_button,
     learning_rate,
+    metrics_markdown,
     mo,
     pairwise_max_tokens,
     save_and_upload,
@@ -304,7 +359,7 @@ def _(
     warmup_steps,
 ):
     mo.stop(not evaluation_pairwise_button.value)
-    evaluation_pairwise_model, evaluation_pairwise_loss = train_reward_model(
+    evaluation_pairwise_model, evaluation_pairwise_metrics = train_reward_model(
         evaluation_frame,
         criterion_columns,
         PairwisePreferenceModel,
@@ -315,24 +370,21 @@ def _(
         warmup_steps=warmup_steps,
     )
     save_and_upload(evaluation_pairwise_model, "evaluation_pairwise.pt")
-    mo.md(
-        f"Uploaded evaluation_pairwise.pt "
-        f"(validation loss {evaluation_pairwise_loss:.4f})."
-    )
-    return (evaluation_pairwise_loss,)
+    mo.md(metrics_markdown("evaluation_pairwise.pt", evaluation_pairwise_metrics))
+    return (evaluation_pairwise_metrics,)
 
 
 @app.cell
 def _(
     Path,
-    bradley_terry_loss,
+    bradley_terry_metrics,
     dataset_picker,
-    evaluation_pairwise_loss,
+    evaluation_pairwise_metrics,
     evaluation_prompts,
     held_out_prompts,
     json,
     optimisation_prompts,
-    pairwise_loss,
+    pairwise_metrics,
     tempfile,
     upload_model,
 ):
@@ -352,9 +404,9 @@ def _(
         )
         upload_model(dataset_picker.selected_key, split_path)
     {
-        "bradley_terry": bradley_terry_loss,
-        "pairwise": pairwise_loss,
-        "evaluation_pairwise": evaluation_pairwise_loss,
+        "bradley_terry": bradley_terry_metrics,
+        "pairwise": pairwise_metrics,
+        "evaluation_pairwise": evaluation_pairwise_metrics,
     }
     return
 

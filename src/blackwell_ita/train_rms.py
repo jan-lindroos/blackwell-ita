@@ -132,9 +132,15 @@ class RewardModelBase(torch.nn.Module):
         self.tokenizer = tokenizer
         self.max_tokens = max_tokens
 
-    def compute_loss(self, batch: Batch, device: str) -> torch.Tensor:
-        """Loss for one batch; implemented by the subclasses."""
+    def batch_logits(self, batch: Batch, device: str) -> torch.Tensor:
+        """Per-criterion preference logits for one batch; implemented by subclasses."""
         raise NotImplementedError
+
+    def compute_loss(self, batch: Batch, device: str) -> torch.Tensor:
+        """Masked binary cross-entropy between the batch logits and targets."""
+        return masked_binary_cross_entropy(
+            self.batch_logits(batch, device), batch, device
+        )
 
     def score(self, texts: list[str], device: str) -> torch.Tensor:
         """Tokenize texts and return per-criterion logits."""
@@ -148,7 +154,7 @@ class RewardModelBase(torch.nn.Module):
         inputs = {key: value.to(device) for key, value in tokenized.items()}
         # bf16 autocast recovers bf16 memory and speed on cuda while the fp32
         # master weights keep the optimiser updates representable
-        if device == "cuda":
+        if device.startswith("cuda"):
             with torch.autocast("cuda", torch.bfloat16):
                 return self.scorer(inputs)
         return self.scorer(inputs)
@@ -162,29 +168,21 @@ def bt_text(prompt: str, response: str) -> str:
 class BradleyTerryModel(RewardModelBase):
     """Reward model scoring each response alone; preferences via reward gaps."""
 
-    def compute_loss(self, batch: Batch, device: str) -> torch.Tensor:
-        """Bradley-Terry loss on the reward difference between the responses."""
-        first_rewards = self.score(
-            [
-                bt_text(prompt, response)
-                for prompt, response in zip(
-                    batch["prompt"], batch["first_response"], strict=True
-                )
-            ],
-            device,
-        )
-        second_rewards = self.score(
-            [
-                bt_text(prompt, response)
-                for prompt, response in zip(
-                    batch["prompt"], batch["second_response"], strict=True
-                )
-            ],
-            device,
-        )
-        return masked_binary_cross_entropy(
-            first_rewards - second_rewards, batch, device
-        )
+    def batch_logits(self, batch: Batch, device: str) -> torch.Tensor:
+        """Reward difference between the first and second responses."""
+
+        def rewards(responses: list[str]) -> torch.Tensor:
+            return self.score(
+                [
+                    bt_text(prompt, response)
+                    for prompt, response in zip(
+                        batch["prompt"], responses, strict=True
+                    )
+                ],
+                device,
+            )
+
+        return rewards(batch["first_response"]) - rewards(batch["second_response"])
 
 
 def pairwise_text(prompt: str, first: str, second: str) -> str:
@@ -192,13 +190,48 @@ def pairwise_text(prompt: str, first: str, second: str) -> str:
     return f"{prompt}\n\n[RESPONSE 1]\n{first}\n\n[RESPONSE 2]\n{second}"
 
 
+def truncated_pairwise_text(
+    prompt: str,
+    first: str,
+    second: str,
+    tokenizer: PreTrainedTokenizerBase,
+    max_tokens: int,
+) -> str:
+    """Pairwise text whose responses are truncated to fit within ``max_tokens``.
+
+    The tokenizer's own right truncation would consume [RESPONSE 2]'s tail
+    first, biasing supervision towards [RESPONSE 1]. Instead the token budget
+    left after the full prompt and markers is split equally between the
+    responses, a response shorter than its half donating the surplus to the
+    other.
+    """
+    first_ids = tokenizer.encode(first)
+    second_ids = tokenizer.encode(second)
+    budget = max_tokens - len(tokenizer.encode(pairwise_text(prompt, "", "")))
+    if len(first_ids) + len(second_ids) <= budget:
+        return pairwise_text(prompt, first, second)
+    first_keep = max(
+        0, min(len(first_ids), max(budget // 2, budget - len(second_ids)))
+    )
+    second_keep = max(0, budget - first_keep)
+    return pairwise_text(
+        prompt,
+        tokenizer.decode(first_ids[:first_keep]),  # pyright: ignore[reportArgumentType]
+        tokenizer.decode(second_ids[:second_keep]),  # pyright: ignore[reportArgumentType]
+    )
+
+
 class PairwisePreferenceModel(RewardModelBase):
     """Preference model scoring both responses jointly in one input."""
 
-    def compute_loss(self, batch: Batch, device: str) -> torch.Tensor:
-        """Cross-entropy between the joint logits and the preference targets."""
+    def batch_logits(self, batch: Batch, device: str) -> torch.Tensor:
+        """Joint logits over both responses, truncated symmetrically if overlong."""
+        # score()'s truncation=True still backstops the token or two of drift
+        # a decode and re-encode round trip can introduce at merge boundaries
         joint_texts = [
-            pairwise_text(prompt, first, second)
+            truncated_pairwise_text(
+                prompt, first, second, self.tokenizer, self.max_tokens
+            )
             for prompt, first, second in zip(
                 batch["prompt"],
                 batch["first_response"],
@@ -206,9 +239,7 @@ class PairwisePreferenceModel(RewardModelBase):
                 strict=True,
             )
         ]
-        return masked_binary_cross_entropy(
-            self.score(joint_texts, device), batch, device
-        )
+        return self.score(joint_texts, device)
 
 
 def save_reward_model(
@@ -265,6 +296,61 @@ def evaluate_loss(
     return sum(losses) / len(losses)
 
 
+class CriterionMetrics(TypedDict):
+    """Validation diagnostics for one criterion."""
+
+    loss: float
+    decisive_accuracy: float
+    decisive_count: int
+
+
+class TrainingMetrics(TypedDict):
+    """Pooled validation loss with per-criterion diagnostics."""
+
+    validation_loss: float
+    criteria: dict[str, CriterionMetrics]
+
+
+def per_criterion_metrics(
+    model: RewardModelBase,
+    validation_loader: Iterable[Batch],
+    criterion_columns: list[str],
+    device: str,
+) -> dict[str, CriterionMetrics]:
+    """Per-criterion mean loss and decisive-pair accuracy on the validation set.
+
+    A pair is decisive for a criterion when its unmasked target is at most
+    0.25 or at least 0.75; accuracy thresholds the logit at zero against the
+    preferred side.
+    """
+    model.eval()
+    logit_batches, target_batches, mask_batches = [], [], []
+    with torch.no_grad():
+        for batch in validation_loader:
+            logit_batches.append(model.batch_logits(batch, device).cpu())
+            target_batches.append(batch["target"])
+            mask_batches.append(batch["mask"])
+    logits = torch.cat(logit_batches)
+    targets = torch.cat(target_batches)
+    mask = torch.cat(mask_batches).bool()
+    losses = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits, targets, reduction="none"
+    )
+    decisive = mask & ((targets <= 0.25) | (targets >= 0.75))
+    correct = (logits > 0) == (targets > 0.5)
+    return {
+        column: {
+            "loss": losses[:, index][mask[:, index]].mean().item(),
+            "decisive_accuracy": correct[:, index][decisive[:, index]]
+            .float()
+            .mean()
+            .item(),
+            "decisive_count": int(decisive[:, index].sum().item()),
+        }
+        for index, column in enumerate(criterion_columns)
+    }
+
+
 def train_until_no_improvement(
     model: RewardModelBase,
     train_loader: Iterable[Batch],
@@ -279,6 +365,8 @@ def train_until_no_improvement(
 
     Stops after ``patience`` rounds without a new best validation loss,
     restores the best-validation weights and returns the best validation loss.
+    Raises RuntimeError if no round ever produced a finite best loss, so a
+    diverged model is never handed back as if it had trained.
     """
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -329,8 +417,12 @@ def train_until_no_improvement(
             key: value.detach().to("cpu", copy=True)
             for key, value in model.state_dict().items()
         }
-    if best_state is not None:
-        model.load_state_dict(best_state)
+    if best_state is None:
+        raise RuntimeError(
+            "training produced no best state to restore; "
+            f"last validation loss was {validation_loss:.4f}"
+        )
+    model.load_state_dict(best_state)
     return best_validation_loss
 
 
@@ -383,17 +475,18 @@ def train_reward_model(
     augment_presentation_order: bool = True,
     seed: int = 1810,
     device: str | None = None,
-) -> tuple[RewardModelBase, float]:
-    """Train one reward model; returns it on the CPU with its validation loss.
+) -> tuple[RewardModelBase, TrainingMetrics]:
+    """Train one reward model; returns it on the CPU with validation metrics.
 
     Validation (and with it the early-stopping check) runs every third of a
     pass over the training pairs, so checkpoint selection can catch a peak
-    inside the first pass. The train/validation split is deterministic in
-    ``seed``, so successive
-    calls on the same dataframe train against identical splits. The model is
-    moved off the device before returning, freeing the GPU for the next call:
-    a 95 GiB GPU cannot train a 3B model beside a finished one still holding
-    its weights and gradients.
+    inside the first pass. Early stopping is driven by the pooled validation
+    loss; the per-criterion diagnostics are computed once from the restored
+    best weights. The train/validation split is deterministic in ``seed``, so
+    successive calls on the same dataframe train against identical splits.
+    The model is moved off the device before returning, freeing the GPU for
+    the next call: a 95 GiB GPU cannot train a 3B model beside a finished one
+    still holding its weights and gradients.
     """
     if device is None:
         device = default_device()
@@ -420,8 +513,11 @@ def train_reward_model(
         device,
         steps_per_epoch=max(1, len(train_loader) // 3),
     )
+    criterion_metrics = per_criterion_metrics(
+        model, validation_loader, criterion_columns, device
+    )
     model.to("cpu")
     model.zero_grad(set_to_none=True)
-    if device == "cuda":
+    if device.startswith("cuda"):
         torch.cuda.empty_cache()
-    return model, validation_loss
+    return model, {"validation_loss": validation_loss, "criteria": criterion_metrics}

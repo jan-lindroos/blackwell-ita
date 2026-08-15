@@ -5,6 +5,7 @@ from typing import cast
 import pandas as pd
 import pytest
 import torch
+from transformers import PreTrainedTokenizerBase
 
 from blackwell_ita.train_rms import (
     Batch,
@@ -17,7 +18,9 @@ from blackwell_ita.train_rms import (
     load_reward_model,
     masked_binary_cross_entropy,
     pairwise_text,
+    per_criterion_metrics,
     train_until_no_improvement,
+    truncated_pairwise_text,
 )
 
 CRITERION_COLUMNS = ["first_criterion", "second_criterion"]
@@ -78,6 +81,46 @@ def test_text_builders():
     assert pairwise_text("p", "r1", "r2") == "p\n\n[RESPONSE 1]\nr1\n\n[RESPONSE 2]\nr2"
 
 
+class CharTokenizer:
+    """Tokenizer with one token per character and lossless decoding."""
+
+    def encode(self, text: str) -> list[int]:
+        """Return one token id per character."""
+        return [ord(character) for character in text]
+
+    def decode(self, ids: list[int]) -> str:
+        """Rebuild text from character token ids."""
+        return "".join(chr(token_id) for token_id in ids)
+
+
+CHAR_TOKENIZER = cast(PreTrainedTokenizerBase, CharTokenizer())
+
+
+def test_truncated_pairwise_text_leaves_short_pairs_alone():
+    """A pair within the token budget is formatted unchanged."""
+    assert truncated_pairwise_text(
+        "p", "aaa", "bbb", CHAR_TOKENIZER, max_tokens=100
+    ) == pairwise_text("p", "aaa", "bbb")
+
+
+def test_truncated_pairwise_text_splits_budget_equally():
+    """Two overlong responses each keep half of the remaining budget."""
+    # pairwise_text("p", "", "") is 31 characters, leaving a budget of 10
+    assert truncated_pairwise_text(
+        "p", "a" * 20, "b" * 20, CHAR_TOKENIZER, max_tokens=41
+    ) == pairwise_text("p", "a" * 5, "b" * 5)
+
+
+def test_truncated_pairwise_text_donates_surplus_to_longer_response():
+    """A response shorter than its half donates the surplus to the other."""
+    assert truncated_pairwise_text(
+        "p", "a" * 3, "b" * 20, CHAR_TOKENIZER, max_tokens=41
+    ) == pairwise_text("p", "a" * 3, "b" * 7)
+    assert truncated_pairwise_text(
+        "p", "a" * 20, "b" * 3, CHAR_TOKENIZER, max_tokens=41
+    ) == pairwise_text("p", "a" * 7, "b" * 3)
+
+
 def test_build_loaders_splits_by_prompt_and_augments_only_training_data():
     """Loaders split prompts disjointly and augment only the training set."""
     # Three pairs per prompt: a row-level split would leak prompts across the
@@ -127,6 +170,58 @@ def test_evaluate_loss_averages_batches():
     """Evaluation averages the per-batch losses."""
     model = cast(RewardModelBase, FixedLossModel([1.0, 3.0]))
     assert evaluate_loss(model, cast(list[Batch], [{}, {}]), "cpu") == 2.0
+
+
+class FixedLogitsModel(torch.nn.Module):
+    """Model returning a scripted sequence of per-batch logits."""
+
+    def __init__(self, logits: list[torch.Tensor]) -> None:
+        """Store the scripted logits."""
+        super().__init__()
+        self.logits = iter(logits)
+
+    def batch_logits(self, batch: dict, device: str) -> torch.Tensor:
+        """Return the next scripted logits."""
+        return next(self.logits)
+
+
+def test_per_criterion_metrics_masks_and_thresholds():
+    """Metrics respect the mask and count only decisive unmasked entries."""
+    batches = cast(
+        list[Batch],
+        [
+            {
+                "target": torch.tensor([[1.0, 0.0], [0.0, 0.5]]),
+                "mask": torch.tensor([[1.0, 1.0], [1.0, 0.0]]),
+            },
+            {
+                "target": torch.tensor([[1.0, 0.4]]),
+                "mask": torch.tensor([[1.0, 1.0]]),
+            },
+        ],
+    )
+    model = FixedLogitsModel(
+        [torch.tensor([[2.0, -1.0], [1.0, 3.0]]), torch.tensor([[-2.0, 1.0]])]
+    )
+    metrics = per_criterion_metrics(
+        cast(RewardModelBase, model), batches, ["c1", "c2"], "cpu"
+    )
+    # c1: all three entries are unmasked and decisive; only the first is
+    # predicted on the right side of zero
+    expected_c1_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        torch.tensor([2.0, 1.0, -2.0]), torch.tensor([1.0, 0.0, 1.0])
+    )
+    assert metrics["c1"]["loss"] == pytest.approx(expected_c1_loss.item())
+    assert metrics["c1"]["decisive_accuracy"] == pytest.approx(1 / 3)
+    assert metrics["c1"]["decisive_count"] == 3
+    # c2: the masked 0.5 entry is excluded everywhere and the unmasked 0.4
+    # entry counts towards the loss but is not decisive
+    expected_c2_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        torch.tensor([-1.0, 1.0]), torch.tensor([0.0, 0.4])
+    )
+    assert metrics["c2"]["loss"] == pytest.approx(expected_c2_loss.item())
+    assert metrics["c2"]["decisive_accuracy"] == 1.0
+    assert metrics["c2"]["decisive_count"] == 1
 
 
 class ScriptedModel(torch.nn.Module):
@@ -185,6 +280,21 @@ def test_train_until_no_improvement_cycles_loader_for_longer_rounds():
     # Three rounds of three steps each, from a single-batch loader
     assert model.steps_trained == 9
     assert model.weight.item() == 3.0
+
+
+def test_train_until_no_improvement_raises_without_a_best_state():
+    """A run whose every validation loss is NaN raises instead of returning."""
+    model = ScriptedModel([float("nan"), float("nan")])
+    with pytest.raises(RuntimeError, match="nan"):
+        train_until_no_improvement(
+            cast(RewardModelBase, model),
+            train_loader=cast(list[Batch], [{}]),
+            validation_loader=cast(list[Batch], [{}]),
+            learning_rate=0.0,
+            warmup_steps=1,
+            device="cpu",
+            steps_per_epoch=1,
+        )
 
 
 def test_default_device_prefers_cuda(monkeypatch):
