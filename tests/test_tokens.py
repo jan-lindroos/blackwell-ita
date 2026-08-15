@@ -13,9 +13,9 @@ class LengthTokenizer:
 
 def test_lengths_cover_every_text():
     """Every text's tokenized length is returned, in order."""
-    assert token_lengths(["a", "abcd", "ab"], LengthTokenizer()) == [1, 4, 2]
+    assert token_lengths(["a", "abcd", "ab"], LengthTokenizer()) == [1, 4, 2]  # pyright: ignore[reportArgumentType]
 
 
 def test_empty_texts_give_empty_lengths():
     """An empty collection yields no lengths."""
-    assert token_lengths([], LengthTokenizer()) == []
+    assert token_lengths([], LengthTokenizer()) == []  # pyright: ignore[reportArgumentType]
