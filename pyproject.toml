@@ -4,11 +4,11 @@ version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
     "huggingface-hub",
+    "marimo>=0.23.16",
     "numpy",
     "pandas",
     "scipy",
     "torch",
-    "tqdm",
     "transformers",
 ]
 
@@ -22,7 +22,6 @@ dev = [
     # datasets is imported only by notebooks (which carry their own inline
     # deps); the dev install keeps it available for local notebook editing
     "datasets",
-    "marimo>=0.23.16",
     "matplotlib",
     "pytest",
     "ruff",

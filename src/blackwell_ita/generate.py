@@ -1,5 +1,6 @@
 """Candidate response generation with a local causal language model."""
 
+import marimo as mo
 import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -26,7 +27,7 @@ def generate_candidates(
     model = AutoModelForCausalLM.from_pretrained(model_name, dtype="auto").to(device)  # pyright: ignore[reportArgumentType]
     torch.manual_seed(seed)
     rows = []
-    for prompt in prompts:
+    for prompt in mo.status.progress_bar(prompts, title="prompts"):
         inputs = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
             add_generation_prompt=True,

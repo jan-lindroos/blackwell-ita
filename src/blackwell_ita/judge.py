@@ -5,6 +5,8 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import marimo as mo
+
 # Pinned full model ID: a floating alias like "sonnet" can silently resolve to
 # a different model between judging runs
 JUDGE_MODEL = "claude-sonnet-5"
@@ -98,4 +100,13 @@ def outcomes(
 ) -> list[dict]:
     """Judge many comparisons concurrently, preserving input order."""
     with ThreadPoolExecutor(workers) as pool:
-        return list(pool.map(lambda comparison: outcome(**comparison, model=model), comparisons))
+        return list(
+            mo.status.progress_bar(
+                pool.map(
+                    lambda comparison: outcome(**comparison, model=model),
+                    comparisons,
+                ),
+                total=len(comparisons),
+                title="judging",
+            )
+        )

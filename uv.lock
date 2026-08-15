@@ -162,11 +162,11 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "huggingface-hub" },
+    { name = "marimo" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "scipy" },
     { name = "torch" },
-    { name = "tqdm" },
     { name = "transformers" },
 ]
 
@@ -174,7 +174,6 @@ dependencies = [
 dev = [
     { name = "basedpyright" },
     { name = "datasets" },
-    { name = "marimo" },
     { name = "matplotlib" },
     { name = "pytest" },
     { name = "ruff" },
@@ -183,11 +182,11 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "huggingface-hub" },
+    { name = "marimo", specifier = ">=0.23.16" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "scipy" },
     { name = "torch" },
-    { name = "tqdm" },
     { name = "transformers" },
 ]
 
@@ -195,7 +194,6 @@ requires-dist = [
 dev = [
     { name = "basedpyright", specifier = ">=1.39.10" },
     { name = "datasets" },
-    { name = "marimo", specifier = ">=0.23.16" },
     { name = "matplotlib" },
     { name = "pytest" },
     { name = "ruff" },

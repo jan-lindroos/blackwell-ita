@@ -5,10 +5,10 @@ from itertools import islice
 from pathlib import Path
 from typing import TypedDict
 
+import marimo as mo
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerBase
 
 
@@ -386,19 +386,18 @@ def train_until_no_improvement(
     step = 0
     while True:
         model.train()
-        progress = tqdm(
-            islice(batches, steps_per_epoch),
+        with mo.status.progress_bar(
             total=steps_per_epoch,
-            desc=f"steps {step + 1}-{step + steps_per_epoch}",
-            leave=False,
-        )
-        for batch in progress:
-            optimizer.zero_grad()
-            loss = model.compute_loss(batch, device)
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-            progress.set_postfix(loss=f"{loss.item():.4f}")
+            title=f"steps {step + 1}-{step + steps_per_epoch}",
+            remove_on_exit=True,
+        ) as progress:
+            for batch in islice(batches, steps_per_epoch):
+                optimizer.zero_grad()
+                loss = model.compute_loss(batch, device)
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                progress.update(subtitle=f"loss={loss.item():.4f}")
         step += steps_per_epoch
         validation_loss = evaluate_loss(model, validation_loader, device)
         print(f"step {step}: validation_loss={validation_loss:.4f}")
