@@ -36,6 +36,15 @@ def _():
     import matplotlib.pyplot as plt
     import pandas as pd
 
+    plt.rcParams.update(
+        {
+            "font.size": 9,
+            "axes.labelsize": 9,
+            "legend.fontsize": 8,
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 8,
+        }
+    )
     return pd, plt
 
 
@@ -66,16 +75,18 @@ def _(HEADLINE_METHODS):
     # Colour follows the method across every figure. The slot order is fixed,
     # so new methods append rather than reorder
     palette = [
-        "#2a78d6",
-        "#eb6834",
-        "#1baf7a",
-        "#eda100",
-        "#e87ba4",
-        "#008300",
-        "#4a3aa7",
-        "#e34948",
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
     ]
     method_colours = dict(zip(HEADLINE_METHODS, palette, strict=True))
+    markers = ["o", "s", "^", "D", "v", "P", "X", "*"]
+    method_markers = dict(zip(HEADLINE_METHODS, markers, strict=True))
     method_labels = {
         "base": "Base policy",
         "bt_best_of_n": "BT best-of-N",
@@ -86,8 +97,7 @@ def _(HEADLINE_METHODS):
         "bt_mean_criterion_best_of_n": "BT mean-criterion best-of-N",
         "bt_worst_criterion_best_of_n": "BT worst-criterion best-of-N",
     }
-    headline_methods = HEADLINE_METHODS
-    return headline_methods, method_colours, method_labels
+    return method_colours, method_labels, method_markers
 
 
 @app.cell(hide_code=True)
@@ -105,14 +115,14 @@ def _(mo):
 
 
 @app.cell
-def _(criterion_scores, headline_methods, judgements, pd):
+def _(HEADLINE_METHODS, criterion_scores, judgements, pd):
     max_n = judgements["n"].max()
     headline_judgements = judgements[
-        judgements["method"].isin(headline_methods)
+        judgements["method"].isin(HEADLINE_METHODS)
         & ((judgements["n"] == max_n) | (judgements["method"] == "base"))
     ]
     per_criterion = criterion_scores.pivot_table(
-        index="method", columns="criterion", values="score"
+        index="method", columns="criterion", values="score", aggfunc="mean"
     )
     headline_table = pd.DataFrame(
         {
@@ -123,7 +133,7 @@ def _(criterion_scores, headline_methods, judgements, pd):
             .groupby("method")["score"]
             .mean(),
         }
-    ).reindex(headline_methods)
+    ).reindex(HEADLINE_METHODS)
     headline_table.round(3)
     return (per_criterion,)
 
@@ -137,11 +147,11 @@ def _(mo):
 
 
 @app.cell
-def _(headline_methods, method_colours, method_labels, per_criterion, plt):
-    criterion_figure, criterion_axes = plt.subplots(figsize=(8, 3.5))
+def _(HEADLINE_METHODS, method_colours, method_labels, per_criterion, plt):
+    criterion_figure, criterion_axes = plt.subplots(figsize=(6.5, 3))
     criteria = list(per_criterion.columns)
-    bar_width = 0.8 / len(headline_methods)
-    for method_index, bar_method in enumerate(headline_methods):
+    bar_width = 0.8 / len(HEADLINE_METHODS)
+    for method_index, bar_method in enumerate(HEADLINE_METHODS):
         criterion_axes.bar(
             [
                 position + method_index * bar_width
@@ -150,8 +160,8 @@ def _(headline_methods, method_colours, method_labels, per_criterion, plt):
             per_criterion.loc[bar_method, criteria],
             width=bar_width,
             color=method_colours[bar_method],
-            edgecolor="white",
-            linewidth=2,
+            edgecolor="black",
+            linewidth=0.4,
             label=method_labels[bar_method],
         )
     criterion_axes.set_xticks(
@@ -160,9 +170,11 @@ def _(headline_methods, method_colours, method_labels, per_criterion, plt):
         rotation=20,
         ha="right",
     )
-    criterion_axes.axhline(0.5, color="#c3c2b7", linewidth=1, zorder=0)
+    criterion_axes.axhline(
+        0.5, color="grey", linewidth=0.8, linestyle="--", zorder=0
+    )
     criterion_axes.set_ylabel("Win rate vs anchor")
-    criterion_axes.legend(frameon=False)
+    criterion_axes.legend(frameon=False, ncols=2)
     criterion_axes.spines[["top", "right"]].set_visible(False)
     criterion_figure.tight_layout()
     criterion_figure
@@ -178,27 +190,31 @@ def _(mo):
 
 
 @app.cell
-def _(judgements, method_colours, method_labels, plt):
-    sweep_figure, sweep_axes = plt.subplots(figsize=(7, 3.5))
+def _(
+    HEADLINE_METHODS, judgements, method_colours, method_labels, method_markers, plt
+):
+    sweep_figure, sweep_axes = plt.subplots(figsize=(5.5, 3))
     n_sweep = judgements[
         (judgements["anchor"] == "reference") & (judgements["method"] != "base")
     ]
-    for sweep_method, method_frame in n_sweep.groupby("method"):
-        means = method_frame.groupby("n")["score"].mean()
-        standard_errors = method_frame.groupby("n")["score"].sem()
+    for sweep_method in HEADLINE_METHODS:
+        method_frame = n_sweep[n_sweep["method"] == sweep_method]
+        if method_frame.empty:
+            continue
+        stats = method_frame.groupby("n")["score"].agg(["mean", "sem"])
         sweep_axes.plot(
-            means.index,
-            means.values,
+            stats.index,
+            stats["mean"],
             color=method_colours[sweep_method],
-            linewidth=2,
-            marker="o",
-            markersize=6,
+            linewidth=1.2,
+            marker=method_markers[sweep_method],
+            markersize=4,
             label=method_labels[sweep_method],
         )
         sweep_axes.fill_between(
-            means.index,
-            means - standard_errors,
-            means + standard_errors,
+            stats.index,
+            stats["mean"] - stats["sem"],
+            stats["mean"] + stats["sem"],
             color=method_colours[sweep_method],
             alpha=0.15,
             linewidth=0,
