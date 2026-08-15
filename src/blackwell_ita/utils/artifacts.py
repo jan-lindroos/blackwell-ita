@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 
 import pandas as pd
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, file_exists, hf_hub_download
 
 RMS_REPO = "jan-lindroos/blackwell-ita-rms"
 ARTIFACTS_REPO = "jan-lindroos/blackwell-ita-artifacts"
@@ -62,3 +62,16 @@ def upload_dataframe(dataset: str, filename: str, dataframe: pd.DataFrame) -> No
         path = Path(temp_name) / filename
         dataframe.to_parquet(path)
         upload_artifact(dataset, path)
+
+
+def upsert_dataframe(
+    dataset: str, filename: str, dataframe: pd.DataFrame, keys: list[str]
+) -> None:
+    """Upload a dataframe, replacing existing hub rows that match its keys."""
+    if file_exists(ARTIFACTS_REPO, f"{dataset}/{filename}", repo_type="dataset"):
+        existing = pd.read_parquet(artifact_path(dataset, filename))
+        replaced = pd.MultiIndex.from_frame(existing[keys]).isin(  # pyright: ignore[reportArgumentType]
+            pd.MultiIndex.from_frame(dataframe[keys])  # pyright: ignore[reportArgumentType]
+        )
+        dataframe = pd.concat([existing[~replaced], dataframe], ignore_index=True)  # pyright: ignore[reportAssignmentType]
+    upload_dataframe(dataset, filename, dataframe)

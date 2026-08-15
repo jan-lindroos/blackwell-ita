@@ -39,6 +39,7 @@ def _():
         HEADLINE_METHODS,
         artifact_path,
         upload_dataframe,
+        upsert_dataframe,
     )
     from blackwell_ita.winners import (
         best_of_nash,
@@ -64,6 +65,7 @@ def _():
         outcomes,
         policy_support,
         upload_dataframe,
+        upsert_dataframe,
         worst_criterion_best_of_n,
     )
 
@@ -109,14 +111,9 @@ def _(mo):
     ## Inputs from the hub
 
     The GPU notebooks cache everything model-side on the artifacts repo:
-    candidate responses (64 pool samples per prompt plus a reserved
-    base-policy anchor at sample index 64), reference anchors (the
-    overall-preferred response of the validation pair for HelpSteer2, the
-    held-out response with the highest pooled human win fraction for
-    Community Alignment), the preference tensors and Bradley-Terry rewards
-    for every prompt, and the evaluation model's per-criterion anchor
-    scores. This notebook is CPU-only: linear programmes, Claude judging
-    and aggregation.
+    candidate responses, reference anchors, preference tensors,
+    Bradley-Terry rewards and per-criterion anchor scores. This notebook is
+    CPU-only: linear programmes, Claude judging and aggregation.
     """)
     return
 
@@ -245,10 +242,15 @@ def _(
 
 
 @app.cell
-def _(mo):
+def _(HEADLINE_METHODS, mo):
+    judge_method_picker = mo.ui.multiselect(
+        options=HEADLINE_METHODS,
+        value=HEADLINE_METHODS,
+        label="Methods",
+    )
     judge_button = mo.ui.run_button(label="Judge with Claude")
-    judge_button
-    return (judge_button,)
+    mo.hstack([judge_method_picker, judge_button], justify="start")
+    return judge_button, judge_method_picker
 
 
 @app.cell
@@ -258,16 +260,17 @@ def _(
     dataset,
     expected_scores,
     judge_button,
+    judge_method_picker,
     judge_n_values,
     mo,
     outcomes,
     pd,
     selections_dataframe,
-    upload_dataframe,
+    upsert_dataframe,
 ):
     mo.stop(not judge_button.value)
     judged_selections = selections_dataframe[
-        (selections_dataframe["method"] != "base_anchor")
+        selections_dataframe["method"].isin(judge_method_picker.value)
         & selections_dataframe["n"].isin(judge_n_values)
     ]
     # Expectation scoring: judge each distinct support atom once against the
@@ -308,8 +311,17 @@ def _(
     judgements_dataframe = judgements_dataframe[
         ["prompt", "method", "n", "anchor", "criterion", "judge_model", "score"]
     ]
-    upload_dataframe(dataset, "judgements.parquet", judgements_dataframe)
-    upload_dataframe(dataset, "atom_judgements.parquet", pd.DataFrame(atom_rows))
+    # Judging a subset of methods replaces only their hub rows, so partial
+    # runs compose into the full artifact notebook 06 reads
+    upsert_dataframe(
+        dataset, "judgements.parquet", judgements_dataframe, ["method", "n"]
+    )
+    upsert_dataframe(
+        dataset,
+        "atom_judgements.parquet",
+        pd.DataFrame(atom_rows),
+        ["prompt", "response"],
+    )
     judgements_dataframe
     return
 
@@ -319,10 +331,8 @@ def _(mo):
     mo.md(r"""
     ## Per-criterion measurement
 
-    Per-criterion (HelpSteer2 attributes) and per-group (Community Alignment
-    country and age subpopulations) win probabilities come from the held-out
-    evaluation pairwise model for both datasets. Claude judges overall
-    quality only.
+    Per-criterion and per-group win probabilities come from the held-out
+    evaluation pairwise model. Claude judges overall quality only.
     """)
     return
 
