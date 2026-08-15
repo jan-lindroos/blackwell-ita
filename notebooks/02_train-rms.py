@@ -108,9 +108,9 @@ def _(preferences_dataframe):
 
 @app.cell
 def _(dataset_picker):
-    encoder_name = "Qwen/Qwen2.5-3B"
+    encoder_name = "Qwen/Qwen3-4B-Instruct-2507"
     learning_rate = 1e-5
-    batch_size = 16
+    batch_size = 12
     bradley_terry_max_tokens = 2000
     pairwise_max_tokens = 4000
     warmup_steps = 100
@@ -195,9 +195,14 @@ def _(evaluation_count, preferences_dataframe, prompt_splits, seed):
 
 @app.cell
 def _(mo):
-    train_button = mo.ui.run_button(label="Train reward models")
-    train_button
-    return (train_button,)
+    bradley_terry_button = mo.ui.run_button(label="Train bradley_terry")
+    pairwise_button = mo.ui.run_button(label="Train pairwise")
+    evaluation_pairwise_button = mo.ui.run_button(label="Train evaluation_pairwise")
+    mo.hstack(
+        [bradley_terry_button, pairwise_button, evaluation_pairwise_button],
+        justify="start",
+    )
+    return (bradley_terry_button, evaluation_pairwise_button, pairwise_button)
 
 
 @app.cell
@@ -225,6 +230,7 @@ def _(
 def _(
     BradleyTerryModel,
     batch_size,
+    bradley_terry_button,
     bradley_terry_max_tokens,
     criterion_columns,
     encoder_name,
@@ -232,11 +238,10 @@ def _(
     mo,
     optimisation_frame,
     save_and_upload,
-    train_button,
     train_reward_model,
     warmup_steps,
 ):
-    mo.stop(not train_button.value)
+    mo.stop(not bradley_terry_button.value)
     bradley_terry_model, bradley_terry_loss = train_reward_model(
         optimisation_frame,
         criterion_columns,
@@ -256,20 +261,18 @@ def _(
 def _(
     PairwisePreferenceModel,
     batch_size,
-    bradley_terry_loss,
     criterion_columns,
     encoder_name,
     learning_rate,
     mo,
     optimisation_frame,
+    pairwise_button,
     pairwise_max_tokens,
     save_and_upload,
     train_reward_model,
     warmup_steps,
 ):
-    # bradley_terry_loss is referenced so this cell runs after the Bradley-Terry
-    # upload; the GPU only fits one model's training state at a time
-    _ = bradley_terry_loss
+    mo.stop(not pairwise_button.value)
     pairwise_model, pairwise_loss = train_reward_model(
         optimisation_frame,
         criterion_columns,
@@ -292,15 +295,15 @@ def _(
     criterion_columns,
     encoder_name,
     evaluation_frame,
+    evaluation_pairwise_button,
     learning_rate,
     mo,
-    pairwise_loss,
     pairwise_max_tokens,
     save_and_upload,
     train_reward_model,
     warmup_steps,
 ):
-    _ = pairwise_loss
+    mo.stop(not evaluation_pairwise_button.value)
     evaluation_pairwise_model, evaluation_pairwise_loss = train_reward_model(
         evaluation_frame,
         criterion_columns,

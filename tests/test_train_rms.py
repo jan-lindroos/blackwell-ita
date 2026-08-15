@@ -130,27 +130,29 @@ def test_evaluate_loss_averages_batches():
 
 
 class ScriptedModel(torch.nn.Module):
-    """Reports scripted validation losses and stamps the epoch into its weight."""
+    """Reports scripted validation losses and stamps the step into its weight."""
 
     def __init__(self, validation_losses: list[float]) -> None:
         """Store the scripted validation losses."""
         super().__init__()
         self.weight = torch.nn.Parameter(torch.tensor(0.0))
         self.validation_losses = iter(validation_losses)
-        self.epochs_trained = 0
+        self.steps_trained = 0
 
     def compute_loss(self, batch: dict, device: str) -> torch.Tensor:
-        """Stamp the epoch when training; return the next scripted loss otherwise."""
+        """Stamp the step when training; return the next scripted loss otherwise."""
         if self.training:
-            self.epochs_trained += 1
-            self.weight.data.fill_(float(self.epochs_trained))
+            self.steps_trained += 1
+            self.weight.data.fill_(float(self.steps_trained))
             return self.weight * 0.0
         return self.weight * 0.0 + next(self.validation_losses)
 
 
 def test_train_until_no_improvement_stops_and_restores_best_state():
-    """Training stops after a non-improving epoch and restores the best weights."""
-    model = ScriptedModel([3.0, 2.0, 2.5])
+    """Training stops after two non-improving rounds and restores the best weights."""
+    # Round 3 is a single bad round that round 4's improvement forgives;
+    # rounds 5 and 6 exhaust the patience of 2
+    model = ScriptedModel([3.0, 2.0, 2.5, 1.5, 1.6, 1.7])
     best = train_until_no_improvement(
         cast(RewardModelBase, model),
         train_loader=cast(list[Batch], [{}]),
@@ -158,12 +160,31 @@ def test_train_until_no_improvement_stops_and_restores_best_state():
         learning_rate=0.0,
         warmup_steps=1,
         device="cpu",
+        steps_per_epoch=1,
+    )
+    assert best == 1.5
+    assert model.steps_trained == 6
+    # The weight carries the step number, so restoring the best state
+    # (step 4) undoes the final two non-improving rounds
+    assert model.weight.item() == 4.0
+
+
+def test_train_until_no_improvement_cycles_loader_for_longer_rounds():
+    """A round longer than the loader cycles it instead of ending early."""
+    model = ScriptedModel([2.0, 3.0, 3.1])
+    best = train_until_no_improvement(
+        cast(RewardModelBase, model),
+        train_loader=cast(list[Batch], [{}]),
+        validation_loader=cast(list[Batch], [{}]),
+        learning_rate=0.0,
+        warmup_steps=1,
+        device="cpu",
+        steps_per_epoch=3,
     )
     assert best == 2.0
-    assert model.epochs_trained == 3
-    # The weight carries the epoch number, so restoring the best state
-    # (epoch 2) undoes the final, non-improving epoch
-    assert model.weight.item() == 2.0
+    # Three rounds of three steps each, from a single-batch loader
+    assert model.steps_trained == 9
+    assert model.weight.item() == 3.0
 
 
 def test_default_device_prefers_cuda(monkeypatch):

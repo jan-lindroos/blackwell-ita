@@ -1,6 +1,6 @@
 """Training and persistence of multi-head reward models on preference pairs."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from itertools import islice
 from pathlib import Path
 from typing import TypedDict
@@ -104,10 +104,6 @@ class MultiHeadEncoder(torch.nn.Module):
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
         self.head = torch.nn.Linear(self.encoder.config.hidden_size, head_count)
-        # Zero-init keeps encoder gradients exactly zero until the head grows,
-        # so the untrained head's noise never distorts the pretrained features
-        torch.nn.init.zeros_(self.head.weight)
-        torch.nn.init.zeros_(self.head.bias)
 
     def forward(self, tokenized: dict[str, torch.Tensor]) -> torch.Tensor:
         """Score tokenized inputs from the last non-padding token's hidden state."""
@@ -276,22 +272,38 @@ def train_until_no_improvement(
     learning_rate: float,
     warmup_steps: int,
     device: str,
+    steps_per_epoch: int,
+    patience: int = 2,
 ) -> float:
-    """Train epoch by epoch, stopping when validation loss stops improving.
+    """Train in rounds of ``steps_per_epoch`` steps, validating after each round.
 
-    Restores the best-validation weights and returns the best validation loss.
+    Stops after ``patience`` rounds without a new best validation loss,
+    restores the best-validation weights and returns the best validation loss.
     """
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda step: min(1.0, (step + 1) / warmup_steps)
     )
+
+    def cycling_batches() -> Iterator[Batch]:
+        # Each pass over a shuffling DataLoader draws a fresh order
+        while True:
+            yield from train_loader
+
+    batches = cycling_batches()
     best_validation_loss = float("inf")
     best_state: dict[str, torch.Tensor] | None = None
-    epoch = 0
+    rounds_without_improvement = 0
+    step = 0
     while True:
         model.train()
-        progress = tqdm(train_loader, desc=f"epoch {epoch + 1}", leave=False)
+        progress = tqdm(
+            islice(batches, steps_per_epoch),
+            total=steps_per_epoch,
+            desc=f"steps {step + 1}-{step + steps_per_epoch}",
+            leave=False,
+        )
         for batch in progress:
             optimizer.zero_grad()
             loss = model.compute_loss(batch, device)
@@ -299,13 +311,17 @@ def train_until_no_improvement(
             optimizer.step()
             scheduler.step()
             progress.set_postfix(loss=f"{loss.item():.4f}")
+        step += steps_per_epoch
         validation_loss = evaluate_loss(model, validation_loader, device)
-        epoch += 1
-        print(f"epoch {epoch}: validation_loss={validation_loss:.4f}")
+        print(f"step {step}: validation_loss={validation_loss:.4f}")
         # A NaN validation loss also fails this comparison, so a diverged run
-        # stops instead of looping forever on NaN >= best
+        # exhausts its patience instead of looping forever on NaN >= best
         if not (validation_loss < best_validation_loss):
-            break
+            rounds_without_improvement += 1
+            if rounds_without_improvement >= patience:
+                break
+            continue
+        rounds_without_improvement = 0
         best_validation_loss = validation_loss
         # CPU copies, not an on-device deepcopy: a 3B model cannot afford a
         # second device-resident set of weights
@@ -359,7 +375,7 @@ def train_reward_model(
     criterion_columns: list[str],
     model_class: type[RewardModelBase],
     max_tokens: int,
-    encoder_name: str = "Qwen/Qwen2.5-3B",
+    encoder_name: str = "Qwen/Qwen3-4B-Instruct-2507",
     learning_rate: float = 1e-5,
     batch_size: int = 16,
     warmup_steps: int = 100,
@@ -370,13 +386,14 @@ def train_reward_model(
 ) -> tuple[RewardModelBase, float]:
     """Train one reward model; returns it on the CPU with its validation loss.
 
-    Training opens with a head-only half-epoch (epoch 0) over a frozen
-    encoder, so full fine-tuning starts from a settled head rather than the
-    zero-initialised one. The train/validation split is deterministic in
-    ``seed``, so successive calls on the same dataframe train against
-    identical splits. The model is moved off the device before returning,
-    freeing the GPU for the next call: a 95 GiB GPU cannot train a 3B model
-    beside a finished one still holding its weights and gradients.
+    Validation (and with it the early-stopping check) runs every third of a
+    pass over the training pairs, so checkpoint selection can catch a peak
+    inside the first pass. The train/validation split is deterministic in
+    ``seed``, so successive
+    calls on the same dataframe train against identical splits. The model is
+    moved off the device before returning, freeing the GPU for the next call:
+    a 95 GiB GPU cannot train a 3B model beside a finished one still holding
+    its weights and gradients.
     """
     if device is None:
         device = default_device()
@@ -394,26 +411,14 @@ def train_reward_model(
         max_tokens,
         len(criterion_columns),
     )
-    model.to(device)
-    # The frozen encoder keeps epoch 0 cheap: no gradients flow through it,
-    # so its forward pass runs without a backward. A lone linear head can
-    # take a far higher learning rate than the encoder fine-tuning
-    model.scorer.encoder.requires_grad_(False)
-    head_optimizer = torch.optim.AdamW(model.scorer.head.parameters(), lr=1e-3)
-    head_steps = max(1, len(train_loader) // 2)
-    model.train()
-    for batch in tqdm(
-        islice(iter(train_loader), head_steps),
-        total=head_steps,
-        desc="epoch 0",
-        leave=False,
-    ):
-        head_optimizer.zero_grad()
-        model.compute_loss(batch, device).backward()
-        head_optimizer.step()
-    model.scorer.encoder.requires_grad_(True)
     validation_loss = train_until_no_improvement(
-        model, train_loader, validation_loader, learning_rate, warmup_steps, device
+        model,
+        train_loader,
+        validation_loader,
+        learning_rate,
+        warmup_steps,
+        device,
+        steps_per_epoch=max(1, len(train_loader) // 3),
     )
     model.to("cpu")
     model.zero_grad(set_to_none=True)
