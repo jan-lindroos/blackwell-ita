@@ -9,7 +9,7 @@
 #     "pyarrow",
 #     "torch",
 #     # molab's base image leaks a torchvision built against a different
-#     # torch; install a matching one so transformers doesn't import the
+#     # torch. Install a matching one so transformers doesn't import the
 #     # broken system copy
 #     "torchvision",
 #     "transformers",
@@ -41,7 +41,7 @@ def _():
 
 @app.cell
 def _():
-    from blackwell_ita.artifacts import model_path, upload_artifact
+    from blackwell_ita.artifacts import model_path, upload_dataframe
     from blackwell_ita.generate import generate_candidates
     from blackwell_ita.human_prefs import (
         community_alignment_anchors,
@@ -55,20 +55,18 @@ def _():
         helpsteer2_anchors,
         model_path,
         prompt_splits,
-        upload_artifact,
+        upload_dataframe,
     )
 
 
 @app.cell
 def _():
     import json
-    import tempfile
-    from pathlib import Path
 
     import datasets
     import pandas as pd
 
-    return Path, datasets, json, pd, tempfile
+    return datasets, json, pd
 
 
 @app.cell
@@ -100,14 +98,15 @@ def _(mo):
     ## Evaluation prompts and reference anchors
 
     ### HelpSteer2
-    Prompts from the validation split; the
-    anchor is the pair response preferred overall in HelpSteer2-Preference. Prompts whose pair lacks a preference annotation or ties on overall
-    preference have no strict human winner and are skipped.
+    Prompts come from the validation split, and the anchor is the pair
+    response preferred overall in HelpSteer2-Preference. Prompts whose pair
+    lacks a preference annotation or ties on overall preference have no
+    strict human winner and are skipped.
 
     ### Community Alignment
-    The 100 held-out prompts from `prompt_splits` (excluded
-    from both training halves); the anchor is the response with the highest
-    pooled human win fraction.
+    The 100 held-out prompts from `prompt_splits`, excluded from both
+    training halves. The anchor is the response with the highest pooled
+    human win fraction.
     """)
     return
 
@@ -147,7 +146,7 @@ def _(
         held_out_prompts, _, _ = prompt_splits(
             pairs_dataframe["prompt"], evaluation_prompt_count, seed
         )
-        # The split is a function of hub-dataset row order; if the pairs dataset
+        # The split is a function of hub-dataset row order. If the pairs dataset
         # were re-pushed, checkpoints would silently be evaluated on prompts
         # from their own training half. 02_train-rms.py records the lists
         prompt_split = json.loads(
@@ -167,7 +166,7 @@ def _(mo):
 
     Each evaluation prompt gets 65 base-policy samples: indices 0-63 form the
     candidate pool the methods select from, and index 64 is reserved as the
-    base-policy anchor for judging — it never enters the pool.
+    base-policy anchor for judging: it never enters the pool.
     """)
     return
 
@@ -181,7 +180,6 @@ def _(mo):
 
 @app.cell
 def _(
-    Path,
     anchors,
     base_model_name,
     dataset_picker,
@@ -192,11 +190,9 @@ def _(
     pd,
     samples_per_prompt,
     seed,
-    tempfile,
-    upload_artifact,
+    upload_dataframe,
 ):
     mo.stop(not generate_button.value)
-    # One extra sample per prompt is reserved as the base-policy anchor
     candidates_dataframe = generate_candidates(
         base_model_name,
         evaluation_prompts,
@@ -214,12 +210,8 @@ def _(
             "anchor": [anchors[prompt] for prompt in evaluation_prompts],
         }
     )
-    with tempfile.TemporaryDirectory() as temp_name:
-        temp_directory = Path(temp_name)
-        candidates_dataframe.to_parquet(temp_directory / "candidates.parquet")
-        anchors_dataframe.to_parquet(temp_directory / "anchors.parquet")
-        upload_artifact(dataset_picker.selected_key, temp_directory / "candidates.parquet")
-        upload_artifact(dataset_picker.selected_key, temp_directory / "anchors.parquet")
+    upload_dataframe(dataset_picker.selected_key, "candidates.parquet", candidates_dataframe)
+    upload_dataframe(dataset_picker.selected_key, "anchors.parquet", anchors_dataframe)
     candidates_dataframe
     return
 

@@ -10,7 +10,7 @@
 #     "scipy",
 #     "torch",
 #     # molab's base image leaks a torchvision built against a different
-#     # torch; install a matching one so transformers doesn't import the
+#     # torch. Install a matching one so transformers doesn't import the
 #     # broken system copy
 #     "torchvision",
 #     "transformers",
@@ -116,7 +116,7 @@ def _(dataset_picker, default_device, load_reward_model, model_path):
     pairwise_model, pairwise_columns = load_reward_model(
         model_path(dataset_picker.selected_key, "pairwise.pt"), device
     )
-    # The cached tensors' head order is criterion_columns; if the two
+    # The cached tensors' head order is criterion_columns. If the two
     # checkpoints were ever retrained separately with different column orders,
     # "overall" would silently become a different criterion
     assert criterion_columns == pairwise_columns

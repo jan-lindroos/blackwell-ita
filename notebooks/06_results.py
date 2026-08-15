@@ -63,9 +63,8 @@ def _(artifact_path, dataset_picker, pd):
 
 @app.cell
 def _(HEADLINE_METHODS):
-    # Categorical palette slots 1-8 in fixed order (see dataviz palette reference);
-    # colour follows the method across every figure. The slot order is the
-    # validated adjacency order, so new methods append rather than reorder
+    # Colour follows the method across every figure. The slot order is fixed,
+    # so new methods append rather than reorder
     palette = [
         "#2a78d6",
         "#eb6834",
@@ -96,10 +95,11 @@ def _(mo):
     mo.md(r"""
     ## Headline: worst group and overall cost
 
-    The Blackwell winner optimises the worst per-criterion (HelpSteer2 attributes)
-    or per-group (Community Alignment country-age) win rate; the overall expected
-    win rate (EWR = win + draw/2) against the reference anchor shows what that
-    costs.
+    The Blackwell winner optimises the worst per-criterion (HelpSteer2
+    attributes) or per-group (Community Alignment country and age
+    subpopulations) win rate.
+    The overall expected win rate (EWR = win + draw/2) against the reference
+    anchor shows what that costs.
     """)
     return
 

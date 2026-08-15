@@ -8,11 +8,11 @@
 #     "pandas",
 #     "pyarrow",
 #     "scipy",
-#     # torch and transformers run no model here; winners imports them
+#     # torch and transformers run no model here: winners imports them
 #     # transitively via train_rms
 #     "torch",
 #     # molab's base image leaks a torchvision built against a different
-#     # torch; install a matching one so transformers doesn't import the
+#     # torch. Install a matching one so transformers doesn't import the
 #     # broken system copy
 #     "torchvision",
 #     "transformers",
@@ -37,9 +37,9 @@ def _():
     from blackwell_ita.artifacts import (
         HEADLINE_METHODS,
         artifact_path,
-        upload_artifact,
+        upload_dataframe,
     )
-    from blackwell_ita.judge import outcomes
+    from blackwell_ita.judge import JUDGE_MODEL, outcomes
     from blackwell_ita.winners import (
         best_of_nash,
         blackwell_winner,
@@ -53,6 +53,7 @@ def _():
 
     return (
         HEADLINE_METHODS,
+        JUDGE_MODEL,
         artifact_path,
         best_of_nash,
         blackwell_winner,
@@ -62,7 +63,7 @@ def _():
         mean_criterion_best_of_n,
         outcomes,
         policy_support,
-        upload_artifact,
+        upload_dataframe,
         worst_criterion_best_of_n,
     )
 
@@ -70,13 +71,11 @@ def _():
 @app.cell
 def _():
     import json
-    import tempfile
-    from pathlib import Path
 
     import numpy as np
     import pandas as pd
 
-    return Path, json, np, pd, tempfile
+    return json, np, pd
 
 
 @app.cell
@@ -96,10 +95,8 @@ def _():
     samples_per_prompt = 64
     n_values = [1, 2, 4, 8, 16, 32, 64]
     judge_n_values = [1, 4, 16, 64]
-    judge_model = "claude-sonnet-5"
     return (
         evaluation_prompt_count,
-        judge_model,
         judge_n_values,
         n_values,
         samples_per_prompt,
@@ -112,13 +109,14 @@ def _(mo):
     ## Inputs from the hub
 
     The GPU notebooks cache everything model-side on the artifacts repo:
-    candidate responses (64 pool samples per prompt plus a reserved base-policy
-    anchor at sample index 64), reference anchors (HelpSteer2: the
-    higher-helpfulness of the validation pair's two dataset responses;
-    Community Alignment: the held-out response with the highest pooled human
-    win fraction), the preference tensors and Bradley-Terry rewards for every
-    prompt, and the evaluation model's per-criterion anchor scores. This
-    notebook is CPU-only: linear programmes, Claude judging, and aggregation.
+    candidate responses (64 pool samples per prompt plus a reserved
+    base-policy anchor at sample index 64), reference anchors (the
+    overall-preferred response of the validation pair for HelpSteer2, the
+    held-out response with the highest pooled human win fraction for
+    Community Alignment), the preference tensors and Bradley-Terry rewards
+    for every prompt, and the evaluation model's per-criterion anchor
+    scores. This notebook is CPU-only: linear programmes, Claude judging
+    and aggregation.
     """)
     return
 
@@ -137,7 +135,7 @@ def _(artifact_path, dataset_picker, evaluation_prompt_count, json, np, pd):
     )
     evaluation_prompts = model_scores_meta["prompts"]
     criterion_columns = model_scores_meta["criterion_columns"]
-    # tensor_{i}/rewards_{i} index rows of anchors.parquet; a mismatch would
+    # tensor_{i}/rewards_{i} index rows of anchors.parquet. A mismatch would
     # silently score every prompt against another prompt's cached tensors
     assert evaluation_prompts == anchors_dataframe["prompt"].tolist()
     assert len(evaluation_prompts) == evaluation_prompt_count
@@ -170,7 +168,6 @@ def _(mo):
 
 @app.cell
 def _(
-    Path,
     best_of_nash,
     blackwell_winner,
     bt_best_of_n,
@@ -188,8 +185,7 @@ def _(
     policy_support,
     samples_per_prompt,
     solve_button,
-    tempfile,
-    upload_artifact,
+    upload_dataframe,
     worst_criterion_best_of_n,
 ):
     mo.stop(not solve_button.value)
@@ -205,7 +201,7 @@ def _(
         tensor = model_scores[f"tensor_{prompt_index}"]
         full_rewards = model_scores[f"rewards_{prompt_index}"]
         rewards = full_rewards[:, overall_index]
-        # Each policy is persisted as its support atoms; every score downstream
+        # Each policy is persisted as its support atoms. Every score downstream
         # is the weight-averaged candidate score, never a sampled draw
         rows = [
             {"method": "base", "n": 1, "weight": 1.0, "response": responses[0]},
@@ -245,10 +241,7 @@ def _(
     selections_dataframe = pd.DataFrame(
         selection_rows, columns=["prompt", "method", "n", "weight", "response"]
     )
-    with tempfile.TemporaryDirectory() as selections_directory:
-        selections_path = Path(selections_directory) / "selections.parquet"
-        selections_dataframe.to_parquet(selections_path)
-        upload_artifact(dataset, selections_path)
+    upload_dataframe(dataset, "selections.parquet", selections_dataframe)
     selections_dataframe
     return (selections_dataframe,)
 
@@ -262,19 +255,17 @@ def _(mo):
 
 @app.cell
 def _(
-    Path,
+    JUDGE_MODEL,
     anchors,
     dataset,
     expected_scores,
     judge_button,
-    judge_model,
     judge_n_values,
     mo,
     outcomes,
     pd,
     selections_dataframe,
-    tempfile,
-    upload_artifact,
+    upload_dataframe,
 ):
     mo.stop(not judge_button.value)
     judged_selections = selections_dataframe[
@@ -298,7 +289,7 @@ def _(
     atom_scores = {}
     atom_rows = []
     for (_, judged_atom), judgement in zip(
-        atoms.iterrows(), outcomes(comparisons, model=judge_model), strict=True
+        atoms.iterrows(), outcomes(comparisons), strict=True
     ):
         atom_scores[(judged_atom["prompt"], judged_atom["response"])] = judgement[
             "score"
@@ -308,25 +299,20 @@ def _(
                 "prompt": judged_atom["prompt"],
                 "response": judged_atom["response"],
                 "anchor": "reference",
-                "judge_model": judge_model,
+                "judge_model": JUDGE_MODEL,
                 **judgement,
             }
         )
     judgements_dataframe = expected_scores(judged_selections, atom_scores)
     judgements_dataframe["anchor"] = "reference"
     judgements_dataframe["criterion"] = "overall"
-    judgements_dataframe["judge_model"] = judge_model
+    judgements_dataframe["judge_model"] = JUDGE_MODEL
     judgements_dataframe = judgements_dataframe[
         ["prompt", "method", "n", "anchor", "criterion", "judge_model", "score"]
     ]
-    with tempfile.TemporaryDirectory() as judgements_directory:
-        judgements_path = Path(judgements_directory) / "judgements.parquet"
-        judgements_dataframe.to_parquet(judgements_path)
-        upload_artifact(dataset, judgements_path)
-        # Raw per-atom verdicts kept for analysing draw and disagreement rates
-        atom_judgements_path = Path(judgements_directory) / "atom_judgements.parquet"
-        pd.DataFrame(atom_rows).to_parquet(atom_judgements_path)
-        upload_artifact(dataset, atom_judgements_path)
+    upload_dataframe(dataset, "judgements.parquet", judgements_dataframe)
+    # Raw per-atom verdicts kept for analysing draw and disagreement rates
+    upload_dataframe(dataset, "atom_judgements.parquet", pd.DataFrame(atom_rows))
     judgements_dataframe
     return
 
@@ -337,8 +323,9 @@ def _(mo):
     ## Per-criterion measurement
 
     Per-criterion (HelpSteer2 attributes) and per-group (Community Alignment
-    country-age) win probabilities come from the held-out evaluation pairwise
-    model for both datasets. Claude judges overall quality only.
+    country and age subpopulations) win probabilities come from the held-out
+    evaluation pairwise model for both datasets. Claude judges overall
+    quality only.
     """)
     return
 
@@ -346,15 +333,13 @@ def _(mo):
 @app.cell
 def _(
     HEADLINE_METHODS,
-    Path,
     criterion_anchor_scores,
     dataset,
     expected_scores,
     pd,
     samples_per_prompt,
     selections_dataframe,
-    tempfile,
-    upload_artifact,
+    upload_dataframe,
 ):
     headline_selections = selections_dataframe[
         selections_dataframe["method"].isin(HEADLINE_METHODS)
@@ -385,10 +370,7 @@ def _(
     criterion_scores_dataframe = pd.concat(criterion_frames, ignore_index=True)[
         ["prompt", "method", "criterion", "score"]
     ]
-    with tempfile.TemporaryDirectory() as criterion_directory:
-        criterion_scores_path = Path(criterion_directory) / "criterion_scores.parquet"
-        criterion_scores_dataframe.to_parquet(criterion_scores_path)
-        upload_artifact(dataset, criterion_scores_path)
+    upload_dataframe(dataset, "criterion_scores.parquet", criterion_scores_dataframe)
     criterion_scores_dataframe
     return
 

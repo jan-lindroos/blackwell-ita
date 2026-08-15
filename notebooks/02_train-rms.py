@@ -8,7 +8,7 @@
 #     "pandas",
 #     "torch",
 #     # molab's base image leaks a torchvision built against a different
-#     # torch; install a matching one so transformers doesn't import the
+#     # torch. Install a matching one so transformers doesn't import the
 #     # broken system copy
 #     "torchvision",
 #     "transformers",
@@ -119,7 +119,7 @@ def _(dataset_picker):
     pairwise_max_tokens = 4000
     warmup_steps = 100
     seed = 1810
-    # Community Alignment holds out 100 prompts as its evaluation set;
+    # Community Alignment holds out 100 prompts as its evaluation set.
     # HelpSteer2's evaluation prompts come from the validation split instead
     evaluation_count = 100 if dataset_picker.selected_key == "community-alignment" else 0
     return (
@@ -389,7 +389,7 @@ def _(
     upload_model,
 ):
     # Recorded so 03_generate-candidates.py can verify the held-out evaluation
-    # prompts still match what these checkpoints were trained without; uploaded
+    # prompts still match what these checkpoints were trained without. Uploaded
     # last so its presence marks a complete, consistent checkpoint set
     with tempfile.TemporaryDirectory() as split_temp_name:
         split_path = Path(split_temp_name) / "prompt_split.json"
