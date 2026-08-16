@@ -60,12 +60,16 @@ def bt_preference_tensor(rewards: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-gaps))
 
 
-def blackwell_winner(preference_tensor: np.ndarray) -> np.ndarray:
+def blackwell_winner(
+    preference_tensor: np.ndarray, thresholds: list[float] | None = None
+) -> np.ndarray:
     """Blackwell winner policy minimising the worst per-criterion shortfall."""
-    # Data-oblivious target set S = {z : z >= 1/2}: minimise the worst clipped
-    # shortfall max_{i,j} (1/2 - P_j(pi, e_i)) over pure opponents i and
-    # criteria j. Constructing S from data replaces the fixed 1/2 in later work
+    # Orthant target set S = {z : z_j >= tau_j}, tau = 1/2 per head by default:
+    # minimise the worst clipped shortfall max_{i,j} (tau_j - P_j(pi, e_i))
+    # over pure opponents i and criteria j
     head_count, count, _ = preference_tensor.shape
+    if thresholds is None:
+        thresholds = [0.5] * head_count
     inequality_matrix = np.vstack(
         [
             np.hstack([-preference_tensor[head].T, -np.ones((count, 1))])
@@ -75,7 +79,7 @@ def blackwell_winner(preference_tensor: np.ndarray) -> np.ndarray:
     result = linprog(
         c=[0.0] * count + [1.0],
         A_ub=inequality_matrix,
-        b_ub=np.full(head_count * count, -0.5),
+        b_ub=np.repeat(-np.asarray(thresholds), count),
         A_eq=[[1.0] * count + [0.0]],
         b_eq=[1.0],
         bounds=[(0.0, None)] * count + [(0.0, None)],

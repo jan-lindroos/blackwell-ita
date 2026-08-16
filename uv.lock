@@ -175,6 +175,7 @@ dev = [
     { name = "basedpyright" },
     { name = "datasets" },
     { name = "matplotlib" },
+    { name = "pyarrow" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -195,6 +196,7 @@ dev = [
     { name = "basedpyright", specifier = ">=1.39.10" },
     { name = "datasets" },
     { name = "matplotlib" },
+    { name = "pyarrow" },
     { name = "pytest" },
     { name = "ruff" },
 ]

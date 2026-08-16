@@ -33,6 +33,11 @@ def artifact_path(dataset: str, filename: str) -> Path:
     )
 
 
+def artifact_exists(dataset: str, filename: str) -> bool:
+    """Check whether a results artifact exists on the hub."""
+    return file_exists(ARTIFACTS_REPO, f"{dataset}/{filename}", repo_type="dataset")
+
+
 def upload_model(dataset: str, local_path: Path) -> None:
     """Upload a reward-model artifact to the hub."""
     api = HfApi()
@@ -68,7 +73,7 @@ def upsert_dataframe(
     dataset: str, filename: str, dataframe: pd.DataFrame, keys: list[str]
 ) -> None:
     """Upload a dataframe, replacing existing hub rows that match its keys."""
-    if file_exists(ARTIFACTS_REPO, f"{dataset}/{filename}", repo_type="dataset"):
+    if artifact_exists(dataset, filename):
         existing = pd.read_parquet(artifact_path(dataset, filename))
         replaced = pd.MultiIndex.from_frame(existing[keys]).isin(  # pyright: ignore[reportArgumentType]
             pd.MultiIndex.from_frame(dataframe[keys])  # pyright: ignore[reportArgumentType]

@@ -23,6 +23,7 @@ dev = [
     # deps); the dev install keeps it available for local notebook editing
     "datasets",
     "matplotlib",
+    "pyarrow",
     "pytest",
     "ruff",
 ]

@@ -1,13 +1,3 @@
-# /// script
-# requires-python = ">=3.13"
-# dependencies = [
-#     "marimo>=0.23.16",
-#     "blackwell-ita @ git+https://github.com/jan-lindroos/blackwell-ita",
-#     "datasets",
-#     "pandas",
-# ]
-# ///
-
 import marimo
 
 __generated_with = "0.23.16"

@@ -1,24 +1,3 @@
-# /// script
-# requires-python = ">=3.13"
-# dependencies = [
-#     "marimo>=0.23.16",
-#     "blackwell-ita @ git+https://github.com/jan-lindroos/blackwell-ita",
-#     "huggingface_hub",
-#     "numpy",
-#     "pandas",
-#     "pyarrow",
-#     "scipy",
-#     # torch and transformers run no model here: winners imports them
-#     # transitively via train_rms
-#     "torch",
-#     # molab's base image leaks a torchvision built against a different
-#     # torch. Install a matching one so transformers doesn't import the
-#     # broken system copy
-#     "torchvision",
-#     "transformers",
-# ]
-# ///
-
 import marimo
 
 __generated_with = "0.23.16"
@@ -37,6 +16,7 @@ def _():
     from blackwell_ita.judge import JUDGE_MODEL, outcomes
     from blackwell_ita.utils.artifacts import (
         HEADLINE_METHODS,
+        artifact_exists,
         artifact_path,
         upload_dataframe,
         upsert_dataframe,
@@ -55,6 +35,7 @@ def _():
     return (
         HEADLINE_METHODS,
         JUDGE_MODEL,
+        artifact_exists,
         artifact_path,
         best_of_nash,
         blackwell_winner,
@@ -97,11 +78,15 @@ def _():
     samples_per_prompt = 64
     n_values = [1, 2, 4, 8, 16, 32, 64]
     judge_n_values = [1, 4, 16, 64]
+    tau_values = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+    sweep_methods = [f"blackwell_tau_{round(tau * 100):02d}" for tau in tau_values]
     return (
         evaluation_prompt_count,
         judge_n_values,
         n_values,
         samples_per_prompt,
+        sweep_methods,
+        tau_values,
     )
 
 
@@ -182,6 +167,7 @@ def _(
     policy_support,
     samples_per_prompt,
     solve_button,
+    tau_values,
     upload_dataframe,
     worst_criterion_best_of_n,
 ):
@@ -221,6 +207,13 @@ def _(
                 "bt_worst_criterion_best_of_n": worst_criterion_best_of_n(
                     bt_criteria_tensor
                 ),
+                **{
+                    f"blackwell_tau_{round(tau * 100):02d}": blackwell_winner(
+                        tensor[[*criteria_indices, overall_index]][:, :n, :n],
+                        thresholds=[0.5] * len(criteria_indices) + [tau],
+                    )
+                    for tau in tau_values
+                },
             }
             rows.extend(
                 {
@@ -242,9 +235,9 @@ def _(
 
 
 @app.cell
-def _(HEADLINE_METHODS, mo):
+def _(HEADLINE_METHODS, mo, sweep_methods):
     judge_method_picker = mo.ui.multiselect(
-        options=HEADLINE_METHODS,
+        options=HEADLINE_METHODS + sweep_methods,
         value=HEADLINE_METHODS,
         label="Methods",
     )
@@ -257,6 +250,8 @@ def _(HEADLINE_METHODS, mo):
 def _(
     JUDGE_MODEL,
     anchors,
+    artifact_exists,
+    artifact_path,
     dataset,
     expected_scores,
     judge_button,
@@ -265,20 +260,53 @@ def _(
     mo,
     outcomes,
     pd,
+    samples_per_prompt,
     selections_dataframe,
+    sweep_methods,
     upsert_dataframe,
 ):
     mo.stop(not judge_button.value)
+    in_sweep = selections_dataframe["method"].isin(sweep_methods)
     judged_selections = selections_dataframe[
         selections_dataframe["method"].isin(judge_method_picker.value)
-        & selections_dataframe["n"].isin(judge_n_values)
+        & (
+            (in_sweep & (selections_dataframe["n"] == samples_per_prompt))
+            | (~in_sweep & selections_dataframe["n"].isin(judge_n_values))
+        )
     ]
     # Expectation scoring: judge each distinct support atom once against the
     # reference anchor, then average atom scores under each policy's
     # weights. Shared atom scores pin all methods to the same value at
     # N = 1 and make sweep curves move only where the policies actually
     # differ
+    # Seeding from the hub extends the sharing across judging runs: atoms
+    # judged earlier keep their stored score instead of a fresh stochastic
+    # one, and only unseen atoms cost judge calls
+    atom_scores = {}
+    if artifact_exists(dataset, "atom_judgements.parquet"):
+        cached_atoms = pd.read_parquet(
+            artifact_path(dataset, "atom_judgements.parquet")
+        )
+        atom_scores = {
+            (cached_prompt, cached_response): cached_score
+            for cached_prompt, cached_response, cached_judge, cached_score in zip(
+                cached_atoms["prompt"],
+                cached_atoms["response"],
+                cached_atoms["judge_model"],
+                cached_atoms["score"],
+                strict=True,
+            )
+            if cached_judge == JUDGE_MODEL
+        }
     atoms = judged_selections[["prompt", "response"]].drop_duplicates()
+    atoms = atoms[
+        [
+            (atom_prompt, atom_response) not in atom_scores
+            for atom_prompt, atom_response in zip(
+                atoms["prompt"], atoms["response"], strict=True
+            )
+        ]
+    ]
     comparisons = [
         {
             "instruction": atom["prompt"],
@@ -287,7 +315,6 @@ def _(
         }
         for _, atom in atoms.iterrows()
     ]
-    atom_scores = {}
     atom_rows = []
     for (_, judged_atom), judgement in zip(
         atoms.iterrows(), outcomes(comparisons), strict=True
@@ -316,12 +343,13 @@ def _(
     upsert_dataframe(
         dataset, "judgements.parquet", judgements_dataframe, ["method", "n"]
     )
-    upsert_dataframe(
-        dataset,
-        "atom_judgements.parquet",
-        pd.DataFrame(atom_rows),
-        ["prompt", "response"],
-    )
+    if atom_rows:
+        upsert_dataframe(
+            dataset,
+            "atom_judgements.parquet",
+            pd.DataFrame(atom_rows),
+            ["prompt", "response"],
+        )
     judgements_dataframe
     return
 
@@ -346,10 +374,11 @@ def _(
     pd,
     samples_per_prompt,
     selections_dataframe,
+    sweep_methods,
     upload_dataframe,
 ):
     headline_selections = selections_dataframe[
-        selections_dataframe["method"].isin(HEADLINE_METHODS)
+        selections_dataframe["method"].isin(HEADLINE_METHODS + sweep_methods)
         & (
             (selections_dataframe["n"] == samples_per_prompt)
             | (selections_dataframe["method"] == "base")
