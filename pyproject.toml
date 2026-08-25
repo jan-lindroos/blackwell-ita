@@ -1,19 +1,51 @@
 [project]
 name = "blackwell-ita"
 version = "0.1.0"
-description = "Add your description here"
+description = "Multi-preference inference-time alignment via the Blackwell winner"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "datasets",
+    "huggingface-hub",
+    "marimo>=0.23.16",
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "scipy",
+    "torch",
+    "transformers",
+]
 
 [dependency-groups]
 dev = [
     "basedpyright>=1.39.10",
+    "pytest",
     "ruff>=0.16.3",
 ]
 
 [tool.ruff.lint]
 extend-select = ["I"]
 
+[tool.ruff.lint.per-file-ignores]
+# A marimo cell's trailing bare expression is its rendered output, and the
+# serialised cell format can end with a bare return
+"notebooks/*" = ["B018", "PLR1711"]
+
 [tool.basedpyright]
-typeCheckingMode = "strict"
+typeCheckingMode = "standard"
+exclude = ["**/node_modules", "**/__pycache__", "**/.*"]
+
+[[tool.basedpyright.executionEnvironments]]
+# A marimo cell's trailing bare expression is its rendered output
+root = "notebooks"
+reportUnusedExpression = "none"
+
+[[tool.basedpyright.executionEnvironments]]
+root = "tests"
+extraPaths = ["notebooks"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["notebooks"]
+markers = ["slow: downloads models"]
