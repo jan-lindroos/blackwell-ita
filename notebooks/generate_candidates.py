@@ -104,6 +104,12 @@ def combine_with_anchors(
 
 
 @app.function
+def token_counts(texts: list[str], tokenizer) -> list[int]:
+    """Token count per text under the base policy tokenizer."""
+    return [len(ids) for ids in tokenizer(texts)["input_ids"]]
+
+
+@app.function
 def default_device() -> str:
     """Pick the best available torch device: cuda, then mps, then cpu."""
     if torch.cuda.is_available():
@@ -200,6 +206,12 @@ def _(anchors_dataframe, base_model_name, generate_button, samples_per_prompt):
     )
     candidates_dataframe = combine_with_anchors(
         raw_candidates, anchors_dataframe, samples_per_prompt
+    )
+    candidates_dataframe = candidates_dataframe.assign(
+        tokens=token_counts(
+            candidates_dataframe["response"].tolist(),
+            AutoTokenizer.from_pretrained(base_model_name),
+        )
     )
     upload_dataframe("anchors.parquet", anchors_dataframe)
     upload_dataframe("candidates.parquet", candidates_dataframe)

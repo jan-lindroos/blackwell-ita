@@ -7,14 +7,17 @@ import experiments
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 from experiments import (
     HEADS,
-    anchor_win_rates,
+    anchor_preference_rates,
     best_of_nash,
     blackwell_winner,
     comparison_prompt,
     expected_scores,
+    expected_token_counts,
     held_out_win_rates,
+    pairwise_text,
     policy_support,
     prompt_tensor,
 )
@@ -118,16 +121,17 @@ def test_blackwell_single_criterion_equals_von_neumann_winner():
         matrix = (raw + 1.0 - raw.T) / 2.0
         blackwell_policy = blackwell_winner(matrix[None])
         von_neumann_policy, game_value = independent_von_neumann(matrix)
-        np.testing.assert_allclose(game_value, 0.5, atol=1e-9)
-        assert worst_case_win(blackwell_policy, matrix) >= 0.5 - 1e-9
-        assert blackwell_objective(von_neumann_policy, matrix[None]) <= 1e-9
+        # Interior-point solutions land within ~1e-8 of the optimum, unlike
+        # the exact simplex vertices the 1e-9 tolerances here once assumed
+        np.testing.assert_allclose(game_value, 0.5, atol=1e-6)
+        assert worst_case_win(blackwell_policy, matrix) >= 0.5 - 1e-6
+        assert blackwell_objective(von_neumann_policy, matrix[None]) <= 1e-6
 
 
-def test_blackwell_winner_raises_on_lp_failure():
+def test_blackwell_winner_raises_on_solver_failure():
     """A solver failure surfaces as RuntimeError rather than returning None."""
-    # NaN inputs are rejected earlier by scipy itself; overflow-scale values
-    # reach the solver and make it report failure
-    with pytest.raises(RuntimeError, match="linprog failed"):
+    # Overflow-scale values make the solve fail rather than return a policy
+    with pytest.raises(RuntimeError, match="solve failed"):
         blackwell_winner(np.full((1, 2, 2), 1e300))
 
 
@@ -142,6 +146,42 @@ def test_blackwell_matches_definition_by_grid_search():
         for weight in np.linspace(0.0, 1.0, 2001)
     ]
     np.testing.assert_allclose(solver_value, min(grid_values), atol=1e-3)
+
+
+def test_entropic_blackwell_keeps_cycle_uniform():
+    """The uniform policy stays optimal on a cycle at every regularisation."""
+    for beta in (0.01, 0.05, 0.5):
+        np.testing.assert_allclose(
+            blackwell_winner(CYCLE[None], beta=beta), np.full(3, 1 / 3), atol=1e-6
+        )
+
+
+def test_entropic_blackwell_has_full_support_and_bounded_excess():
+    """The entropic policy has full support and value within beta log n."""
+    rng = np.random.default_rng(1810)
+    raw = rng.uniform(0.0, 1.0, size=(2, 6, 6))
+    tensor = (raw + 1.0 - raw.transpose(0, 2, 1)) / 2.0
+    beta = 0.05
+    entropic = blackwell_winner(tensor, beta=beta)
+    assert entropic.min() > 0.0
+    exact_value = blackwell_objective(blackwell_winner(tensor), tensor)
+    assert blackwell_objective(entropic, tensor) <= (
+        exact_value + beta * np.log(6) + 1e-6
+    )
+
+
+def test_entropic_blackwell_gives_identical_candidates_equal_mass():
+    """Strict convexity forces equal mass on duplicated candidates."""
+    policy = blackwell_winner(DOMINANT[None], beta=0.05)
+    assert policy[1] == pytest.approx(policy[2], abs=1e-6)
+
+
+def test_entropic_blackwell_interpolates_between_lp_and_uniform():
+    """Small beta approaches the LP vertex; large beta approaches uniform."""
+    assert blackwell_winner(DOMINANT[None], beta=0.01)[0] > 0.9
+    np.testing.assert_allclose(
+        blackwell_winner(DOMINANT[None], beta=5.0), np.full(3, 1 / 3), atol=0.05
+    )
 
 
 def test_policy_support_drops_dust_and_renormalises():
@@ -181,6 +221,22 @@ def test_expected_scores_weight_averages_atoms_per_group():
         assert actual[key] == pytest.approx(value)
 
 
+def test_expected_token_counts_weights_pool_prefix_and_averages_prompts():
+    """Expected tokens weight the pool prefix and average over prompts."""
+    policies = {
+        ("p", "blackwell", 2): np.array([0.25, 0.75]),
+        ("q", "blackwell", 2): np.array([1.0, 0.0]),
+        ("p", "base", 1): np.array([1.0]),
+    }
+    pool_tokens = {"p": [100, 200, 999], "q": [40, 999, 999]}
+    counts = expected_token_counts(policies, pool_tokens)
+    actual = {
+        (row["method"], row["n"]): row["tokens"] for _, row in counts.iterrows()
+    }
+    assert actual[("blackwell", 2)] == pytest.approx((175.0 + 40.0) / 2)
+    assert actual[("base", 1)] == pytest.approx(100.0)
+
+
 def test_prompt_tensor_reads_the_key_scheme():
     """The loader reads tensor_{i} keys and fails loudly on a missing prompt."""
     array = np.ones((6, 2, 2))
@@ -189,39 +245,66 @@ def test_prompt_tensor_reads_the_key_scheme():
         prompt_tensor({"tensor_1": array}, 0)
 
 
-def test_anchor_win_rates_hand_computed():
-    """Per-head anchor win rates match a hand computation on a tiny tensor."""
-    tensor = np.array(
-        [
-            [[0.5, 0.6, 0.8], [0.4, 0.5, 0.2], [0.2, 0.8, 0.5]],
-            [[0.5, 0.1, 0.4], [0.9, 0.5, 0.6], [0.6, 0.4, 0.5]],
-        ]
+def stub_scorer(logits_by_text: dict[str, list[float]], scored_texts: list[str]):
+    """Stand-in model returning fixed per-head logits for known pairwise texts."""
+
+    def score(texts: list[str], device: str) -> torch.Tensor:
+        scored_texts.extend(texts)
+        return torch.tensor([logits_by_text[text] for text in texts])
+
+    return SimpleNamespace(score=score)
+
+
+def test_anchor_preference_rates_skew_symmetrises_both_orders():
+    """Rates average the forward and complemented backward pass per head."""
+    logit = float(np.log(3.0))
+    logits_by_text = {
+        pairwise_text("p", "r", "a"): [0.0, logit],
+        pairwise_text("p", "a", "r"): [0.0, -logit],
+    }
+    rates = anchor_preference_rates(
+        stub_scorer(logits_by_text, []), "p", ["r"], "a", "cpu"
     )
-    policy = np.array([0.25, 0.75])
-    rates = anchor_win_rates(tensor, policy)
-    np.testing.assert_allclose(rates, [0.25 * 0.8 + 0.75 * 0.2, 0.25 * 0.4 + 0.75 * 0.6])
-    assert rates.min() == pytest.approx(0.35)
+    np.testing.assert_allclose(rates, [[0.5, 0.75]], atol=1e-6)
 
 
-def test_held_out_win_rates_aggregate_and_worst_criterion():
-    """Win rates average over prompts and the worst criterion is the min."""
-    first = np.full((6, 2, 2), 0.5)
-    second = np.full((6, 2, 2), 0.5)
-    first[:, 0, 1] = np.arange(6) / 10.0
-    second[:, 0, 1] = np.arange(6) / 10.0 + 0.2
-    tensors = {"tensor_0": first, "tensor_1": second}
+def test_held_out_win_rates_scores_atoms_once_and_averages():
+    """Distinct atoms score once; win rates weight supports and average prompts."""
+    atom_rates = {("p", "p0"): 0.8, ("p", "p1"): 0.4, ("q", "q0"): 0.6}
+    anchors = {"p": "ap", "q": "aq"}
+    logits_by_text = {}
+    for (prompt, response), rate in atom_rates.items():
+        logit = float(np.log(rate / (1.0 - rate)))
+        logits_by_text[pairwise_text(prompt, response, anchors[prompt])] = [
+            logit
+        ] * len(HEADS)
+        logits_by_text[pairwise_text(prompt, anchors[prompt], response)] = [
+            -logit
+        ] * len(HEADS)
     policies = {
         ("p", "base", 1): np.array([1.0]),
+        ("p", "blackwell", 2): np.array([0.5, 0.5]),
         ("q", "base", 1): np.array([1.0]),
     }
-    frame = held_out_win_rates(policies, tensors, {"p": 0, "q": 1})
-    assert list(frame.columns) == ["method", "n", "criterion", "win_rate"]
-    rates = dict(zip(frame["criterion"], frame["win_rate"], strict=True))
-    assert rates == pytest.approx(
-        {criterion: index / 10.0 + 0.1 for index, criterion in enumerate(HEADS)}
+    scored_texts: list[str] = []
+    frame = held_out_win_rates(
+        policies,
+        stub_scorer(logits_by_text, scored_texts),
+        {"p": ["p0", "p1"], "q": ["q0"]},
+        anchors,
+        "cpu",
     )
-    worst = frame[frame["criterion"].isin(HEADS[:5])]["win_rate"].min()
-    assert worst == pytest.approx(0.1)
+    # Both p policies share atom p0, so only 3 atoms score, in both orders
+    assert len(scored_texts) == 6
+    assert len(scored_texts) == len(set(scored_texts))
+    assert list(frame.columns) == ["method", "n", "criterion", "win_rate"]
+    rates = {
+        (row["method"], row["n"], row["criterion"]): row["win_rate"]
+        for _, row in frame.iterrows()
+    }
+    for criterion in HEADS:
+        assert rates[("base", 1, criterion)] == pytest.approx((0.8 + 0.6) / 2)
+        assert rates[("blackwell", 2, criterion)] == pytest.approx(0.6)
 
 
 def order_sensitive_pick(preferred: str):

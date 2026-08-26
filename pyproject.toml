@@ -5,6 +5,7 @@ description = "Multi-preference inference-time alignment via the Blackwell winne
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "cvxpy",
     "datasets",
     "huggingface-hub",
     "marimo>=0.23.16",

@@ -3,7 +3,12 @@
 import numpy as np
 import pandas as pd
 import pytest
-from generate_candidates import batch_sizes, combine_with_anchors, select_anchors
+from generate_candidates import (
+    batch_sizes,
+    combine_with_anchors,
+    select_anchors,
+    token_counts,
+)
 
 
 def pair_row(prompt, response_a, response_b, overall, split="evaluation"):
@@ -88,6 +93,19 @@ def test_combine_with_anchors_rejects_wrong_sample_count():
     anchors = pd.DataFrame({"prompt": ["p1"], "anchor": ["a1"]})
     with pytest.raises(AssertionError):
         combine_with_anchors(candidates, anchors, samples_per_prompt=2)
+
+
+class WordTokenizer:
+    """Tokenizer stub splitting on whitespace."""
+
+    def __call__(self, texts: list[str]) -> dict:
+        """Return one token id per word for each text."""
+        return {"input_ids": [[0] * len(text.split()) for text in texts]}
+
+
+def test_token_counts_per_text():
+    """Counts follow the tokenizer's ids, one entry per input text."""
+    assert token_counts(["one two three", "", "one"], WordTokenizer()) == [3, 0, 1]
 
 
 def test_batch_sizes_cover_total():

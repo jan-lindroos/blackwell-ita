@@ -864,38 +864,39 @@ def _(score_button):
     # Row order is the canonical evaluation-prompt order
     evaluation_prompts = candidates_dataframe["prompt"].drop_duplicates().tolist()
     scoring_device = default_device()
-    for scored_half in ("inference", "evaluate"):
-        scoring_model, scoring_columns = load_reward_model(
-            model_path(f"pairwise_{scored_half}.pt"), scoring_device
+    # Only the inference half precomputes the full tensor: policies are solved
+    # on it. The evaluate-half model scores just the policy support atoms
+    # against the anchor, on demand in the experiments notebook
+    scoring_model, scoring_columns = load_reward_model(
+        model_path("pairwise_inference.pt"), scoring_device
+    )
+    tensor_arrays = {}
+    for tensor_index, tensor_prompt in enumerate(
+        mo.status.progress_bar(evaluation_prompts, title="inference")
+    ):
+        prompt_candidates = candidates_dataframe[
+            candidates_dataframe["prompt"] == tensor_prompt
+        ].sort_values("sample_index")  # pyright: ignore[reportCallIssue]
+        # The anchor rides at the last sample_index; pool prefixes slice
+        # past it
+        tensor_arrays[f"tensor_{tensor_index}"] = preference_tensor(
+            scoring_model,
+            tensor_prompt,
+            prompt_candidates["response"].tolist(),
+            scoring_device,
         )
-        tensor_arrays = {}
-        for tensor_index, tensor_prompt in enumerate(
-            mo.status.progress_bar(evaluation_prompts, title=scored_half)
-        ):
-            prompt_candidates = candidates_dataframe[
-                candidates_dataframe["prompt"] == tensor_prompt
-            ].sort_values("sample_index")  # pyright: ignore[reportCallIssue]
-            # The anchor rides at the last sample_index so the tensors cover
-            # it: experiments slice pool prefixes and read the anchor from the
-            # last column
-            tensor_arrays[f"tensor_{tensor_index}"] = preference_tensor(
-                scoring_model,
-                tensor_prompt,
-                prompt_candidates["response"].tolist(),
-                scoring_device,
-            )
-        with tempfile.TemporaryDirectory() as tensors_temp:
-            tensors_path = Path(tensors_temp) / f"preference_tensors_{scored_half}.npz"
-            np.savez(
-                tensors_path,
-                prompts=np.array(evaluation_prompts),
-                criteria=np.array(scoring_columns),
-                **tensor_arrays,
-            )
-            upload_artifact(tensors_path)
-        scoring_model.to("cpu")
-        if scoring_device.startswith("cuda"):
-            torch.cuda.empty_cache()
+    with tempfile.TemporaryDirectory() as tensors_temp:
+        tensors_path = Path(tensors_temp) / "preference_tensors_inference.npz"
+        np.savez(
+            tensors_path,
+            prompts=np.array(evaluation_prompts),
+            criteria=np.array(scoring_columns),
+            **tensor_arrays,
+        )
+        upload_artifact(tensors_path)
+    scoring_model.to("cpu")
+    if scoring_device.startswith("cuda"):
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
