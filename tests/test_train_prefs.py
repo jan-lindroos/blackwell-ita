@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+import train_prefs
 from train_prefs import (
     Batch,
     PairwisePreferenceModel,
@@ -426,3 +427,45 @@ def test_preference_tensor_is_skew_symmetric():
     backward = torch.sigmoid(model.score([pairwise_text("p", "be", "alpha")], "cpu"))[0]
     expected = (forward + 1.0 - backward).numpy() / 2.0
     assert np.allclose(tensor[:, 0, 1], expected)
+
+
+def hub_stub(monkeypatch, tmp_path):
+    """Route the tensor checkpoint hub calls to a single local file."""
+    store = tmp_path / "tensors.npz"
+    monkeypatch.setattr(
+        train_prefs,
+        "upload_artifact",
+        lambda path: store.write_bytes(path.read_bytes()),
+    )
+    monkeypatch.setattr(train_prefs, "artifact_exists", lambda filename: store.exists())
+    monkeypatch.setattr(train_prefs, "artifact_path", lambda filename: store)
+
+
+def test_upload_and_resume_tensors_round_trip(monkeypatch, tmp_path):
+    """A partial checkpoint reloads exactly the scored prefix."""
+    hub_stub(monkeypatch, tmp_path)
+    prompts = ["p0", "p1", "p2"]
+    criteria = ["c0", "c1"]
+    assert train_prefs.resume_tensors("tensors.npz", prompts, criteria) == {}
+    arrays = {
+        "tensor_0": np.full((2, 3, 3), 0.25),
+        "tensor_1": np.full((2, 3, 3), 0.75),
+    }
+    train_prefs.upload_tensors("tensors.npz", prompts, criteria, arrays)
+    resumed = train_prefs.resume_tensors("tensors.npz", prompts, criteria)
+    assert sorted(resumed) == ["tensor_0", "tensor_1"]
+    np.testing.assert_array_equal(resumed["tensor_1"], arrays["tensor_1"])
+
+
+def test_resume_tensors_rejects_stale_checkpoints(monkeypatch, tmp_path):
+    """A checkpoint from another prompt order or head set must not resume."""
+    hub_stub(monkeypatch, tmp_path)
+    prompts = ["p0", "p1", "p2"]
+    criteria = ["c0", "c1"]
+    train_prefs.upload_tensors(
+        "tensors.npz", prompts, criteria, {"tensor_0": np.full((2, 3, 3), 0.25)}
+    )
+    with pytest.raises(AssertionError):
+        train_prefs.resume_tensors("tensors.npz", ["p1", "p0", "p2"], criteria)
+    with pytest.raises(AssertionError):
+        train_prefs.resume_tensors("tensors.npz", prompts, ["c0"])

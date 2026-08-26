@@ -674,16 +674,66 @@ def preference_tensor(
     texts = [
         pairwise_text(prompt, responses[i], responses[j]) for i, j in index_pairs
     ]
+    # Length-sorted batches pad to their own longest member rather than the
+    # pool's, so the forward spends little of its compute on padding;
+    # character length is a good-enough proxy for token length
+    order = sorted(range(len(texts)), key=lambda text_index: len(texts[text_index]))
     probability_batches = []
     with torch.no_grad():
-        for start in range(0, len(texts), batch_size):
-            logits = model.score(texts[start : start + batch_size], device)
+        for start in range(0, len(order), batch_size):
+            logits = model.score(
+                [texts[text_index] for text_index in order[start : start + batch_size]],
+                device,
+            )
             probability_batches.append(torch.sigmoid(logits).cpu())
-    probabilities = torch.cat(probability_batches).numpy()
+    probabilities = torch.cat(probability_batches).numpy()[np.argsort(order)]
     tensor = np.full((probabilities.shape[1], count, count), 0.5)
     for (i, j), row in zip(index_pairs, probabilities, strict=True):
         tensor[:, i, j] = row
     return (tensor + 1.0 - tensor.transpose(0, 2, 1)) / 2.0
+
+
+@app.function
+def upload_tensors(
+    filename: str,
+    prompts: list[str],
+    criteria: list[str],
+    tensor_arrays: dict[str, np.ndarray],
+) -> None:
+    """Upload scored tensors, the prompts key covering only scored prompts.
+
+    ``tensor_arrays`` must hold a contiguous ``tensor_0..tensor_{k-1}`` prefix
+    of ``prompts``; the truncated prompts key is what lets a resumed run tell
+    how far a dead session got.
+    """
+    with tempfile.TemporaryDirectory() as temp_name:
+        path = Path(temp_name) / filename
+        np.savez(
+            path,
+            prompts=np.array(prompts[: len(tensor_arrays)]),
+            criteria=np.array(criteria),
+            **tensor_arrays,  # pyright: ignore[reportArgumentType]
+        )
+        upload_artifact(path)
+
+
+@app.function
+def resume_tensors(
+    filename: str, prompts: list[str], criteria: list[str]
+) -> dict[str, np.ndarray]:
+    """Reload previously scored tensors from a partial hub artifact, if any."""
+    if not artifact_exists(filename):
+        return {}
+    saved = np.load(artifact_path(filename))
+    saved_prompts = saved["prompts"].tolist()
+    assert saved["criteria"].tolist() == criteria
+    # A checkpoint from a different prompt order or split must not be resumed:
+    # tensor_{i} keys are positional
+    assert saved_prompts == prompts[: len(saved_prompts)]
+    return {
+        f"tensor_{index}": saved[f"tensor_{index}"]
+        for index in range(len(saved_prompts))
+    }
 
 
 @app.cell(hide_code=True)
@@ -843,6 +893,9 @@ def _(
 def _():
     mo.md(r"""
     ## Preference tensors
+
+    Scoring checkpoints to the hub every 10 prompts and resumes from the
+    partial artifact, so a run can pick up where a dead session stopped.
     """)
 
 
@@ -870,10 +923,13 @@ def _(score_button):
     scoring_model, scoring_columns = load_reward_model(
         model_path("pairwise_inference.pt"), scoring_device
     )
-    tensor_arrays = {}
+    tensors_file = "preference_tensors_inference.npz"
+    tensor_arrays = resume_tensors(tensors_file, evaluation_prompts, scoring_columns)
     for tensor_index, tensor_prompt in enumerate(
         mo.status.progress_bar(evaluation_prompts, title="inference")
     ):
+        if f"tensor_{tensor_index}" in tensor_arrays:
+            continue
         prompt_candidates = candidates_dataframe[
             candidates_dataframe["prompt"] == tensor_prompt
         ].sort_values("sample_index")  # pyright: ignore[reportCallIssue]
@@ -884,16 +940,13 @@ def _(score_button):
             tensor_prompt,
             prompt_candidates["response"].tolist(),
             scoring_device,
+            batch_size=64,
         )
-    with tempfile.TemporaryDirectory() as tensors_temp:
-        tensors_path = Path(tensors_temp) / "preference_tensors_inference.npz"
-        np.savez(
-            tensors_path,
-            prompts=np.array(evaluation_prompts),
-            criteria=np.array(scoring_columns),
-            **tensor_arrays,
-        )
-        upload_artifact(tensors_path)
+        if (tensor_index + 1) % 10 == 0:
+            upload_tensors(
+                tensors_file, evaluation_prompts, scoring_columns, tensor_arrays
+            )
+    upload_tensors(tensors_file, evaluation_prompts, scoring_columns, tensor_arrays)
     scoring_model.to("cpu")
     if scoring_device.startswith("cuda"):
         torch.cuda.empty_cache()
