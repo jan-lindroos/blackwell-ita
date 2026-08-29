@@ -18,3 +18,5 @@ paper/sections/*.aux
 .ruff_cache/
 .DS_Store
 CLAUDE.md
+.pytest_cache/
+.idea/
