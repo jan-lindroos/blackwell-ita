@@ -22,8 +22,9 @@ __generated_with = "0.24.0"
 app = marimo.App(width="medium")
 
 with app.setup:
+    import math
     import tempfile
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
     from itertools import islice
     from pathlib import Path
     from typing import TypedDict
@@ -436,13 +437,13 @@ def evaluate_loss(
 
 
 @app.function
-def per_criterion_metrics(
+def validation_metrics(
     model: PairwisePreferenceModel,
     validation_loader: Iterable[Batch],
     criterion_columns: list[str],
     device: str,
-) -> dict[str, dict[str, float]]:
-    """Per-criterion mean loss and decisive-pair accuracy on the validation set.
+) -> tuple[float, dict[str, dict[str, float]]]:
+    """Pooled masked loss and per-criterion metrics from a single pass.
 
     A pair is decisive for a criterion when its unmasked target is at most
     0.25 or at least 0.75; accuracy thresholds the logit at zero against the
@@ -463,7 +464,7 @@ def per_criterion_metrics(
     )
     decisive = mask & ((targets <= 0.25) | (targets >= 0.75))
     correct = (logits > 0) == (targets > 0.5)
-    return {
+    return losses[mask].mean().item(), {
         column: {
             "loss": losses[:, index][mask[:, index]].mean().item(),
             "decisive_accuracy": correct[:, index][decisive[:, index]]
@@ -477,6 +478,17 @@ def per_criterion_metrics(
 
 
 @app.function
+def per_criterion_metrics(
+    model: PairwisePreferenceModel,
+    validation_loader: Iterable[Batch],
+    criterion_columns: list[str],
+    device: str,
+) -> dict[str, dict[str, float]]:
+    """Per-criterion mean loss and decisive-pair accuracy on the validation set."""
+    return validation_metrics(model, validation_loader, criterion_columns, device)[1]
+
+
+@app.function
 def train_until_no_improvement(
     model: PairwisePreferenceModel,
     train_loader: Iterable[Batch],
@@ -486,6 +498,13 @@ def train_until_no_improvement(
     device: str,
     steps_per_epoch: int,
     patience: int = 2,
+    max_rounds: int | None = None,
+    total_steps: int | None = None,
+    accumulation_steps: int = 1,
+    log_metrics: Callable[[dict], None] | None = None,
+    eval_every: int | None = None,
+    eval_loader: Iterable[Batch] | None = None,
+    eval_criteria: list[str] | None = None,
 ) -> float:
     """Train in rounds of ``steps_per_epoch`` steps, validating after each round.
 
@@ -493,12 +512,45 @@ def train_until_no_improvement(
     restores the best-validation weights and returns the best validation loss.
     Raises RuntimeError if no round ever produced a finite best loss, so a
     diverged model is never handed back as if it had trained.
+
+    ``max_rounds``, when given, caps the number of training rounds — for smoke
+    tests and timing runs — stopping after that round's validation even while
+    the loss is still improving.
+
+    ``total_steps``, when given, switches the post-warmup schedule from
+    constant to cosine decay reaching zero at that step — for fixed-length
+    runs, typically paired with ``max_rounds`` covering the same horizon.
+
+    ``accumulation_steps`` micro-batches feed each optimizer step (their mean
+    loss is what steps the model and the logs), so the effective batch is the
+    loader batch times this factor at the memory cost of one micro-batch.
+
+    ``log_metrics``, when given, receives one dict per training step and one
+    per validation round, for external monitors such as ``wandb.log``.
+
+    ``eval_every``, when given with ``log_metrics`` and ``eval_criteria``,
+    additionally logs ``eval/...`` pooled and per-criterion metrics every that
+    many steps, scored on ``eval_loader`` (default: the validation loader).
+    This is monitoring only; early stopping still follows the per-round
+    validation loss.
     """
+    if eval_every is not None and eval_criteria is None:
+        raise ValueError("eval_every requires eval_criteria for metric names")
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda step: min(1.0, (step + 1) / warmup_steps)
-    )
+
+    def lr_scale(scheduler_step: int) -> float:
+        scale = min(1.0, (scheduler_step + 1) / warmup_steps)
+        if total_steps is not None:
+            progress = min(
+                1.0,
+                max(0.0, scheduler_step + 1 - warmup_steps)
+                / max(1, total_steps - warmup_steps),
+            )
+            scale *= 0.5 * (1.0 + math.cos(math.pi * progress))
+        return scale
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
 
     def cycling_batches() -> Iterator[Batch]:
         while True:
@@ -516,31 +568,80 @@ def train_until_no_improvement(
             title=f"steps {step + 1}-{step + steps_per_epoch}",
             remove_on_exit=True,
         ) as progress:
-            for batch in islice(batches, steps_per_epoch):
+            for round_step in range(1, steps_per_epoch + 1):
                 optimizer.zero_grad()
-                loss = model.compute_loss(batch, device)
-                loss.backward()
+                step_loss = 0.0
+                for batch in islice(batches, accumulation_steps):
+                    # Scaling before backward keeps the accumulated gradient
+                    # the mean over the effective batch
+                    loss = model.compute_loss(batch, device) / accumulation_steps
+                    loss.backward()
+                    step_loss += loss.item()
                 optimizer.step()
                 scheduler.step()
-                progress.update(subtitle=f"loss={loss.item():.4f}")
+                if log_metrics is not None:
+                    # max_norm=inf computes the total gradient norm without
+                    # clipping anything; gradients are unchanged by step()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), float("inf")
+                    )
+                    log_metrics(
+                        {
+                            "step": step + round_step,
+                            "train_loss": step_loss,
+                            "grad_norm": grad_norm.item(),
+                            "learning_rate": scheduler.get_last_lr()[0],
+                        }
+                    )
+                    if (
+                        eval_every is not None
+                        and (step + round_step) % eval_every == 0
+                    ):
+                        eval_loss, eval_metrics = validation_metrics(
+                            model,
+                            eval_loader
+                            if eval_loader is not None
+                            else validation_loader,
+                            eval_criteria,  # pyright: ignore[reportArgumentType]
+                            device,
+                        )
+                        log_metrics(
+                            {"step": step + round_step, "eval/loss": eval_loss}
+                            | {
+                                f"eval/{criterion}_loss": values["loss"]
+                                for criterion, values in eval_metrics.items()
+                            }
+                            | {
+                                f"eval/{criterion}_accuracy": values[
+                                    "decisive_accuracy"
+                                ]
+                                for criterion, values in eval_metrics.items()
+                            }
+                        )
+                        model.train()
+                progress.update(subtitle=f"loss={step_loss:.4f}")
         step += steps_per_epoch
         validation_loss = evaluate_loss(model, validation_loader, device)
         print(f"step {step}: validation_loss={validation_loss:.4f}")
-        # A NaN validation loss also fails this comparison, so a diverged run
-        # exhausts its patience instead of looping forever on NaN >= best
-        if not (validation_loss < best_validation_loss):
+        if log_metrics is not None:
+            log_metrics({"step": step, "validation_loss": validation_loss})
+        if validation_loss < best_validation_loss:
+            rounds_without_improvement = 0
+            best_validation_loss = validation_loss
+            # CPU copies, not an on-device deepcopy: a 4B model cannot afford
+            # a second device-resident set of weights
+            best_state = {
+                key: value.detach().to("cpu", copy=True)
+                for key, value in model.state_dict().items()
+            }
+        else:
+            # A NaN validation loss also lands here, so a diverged run
+            # exhausts its patience instead of looping forever on NaN >= best
             rounds_without_improvement += 1
             if rounds_without_improvement >= patience:
                 break
-            continue
-        rounds_without_improvement = 0
-        best_validation_loss = validation_loss
-        # CPU copies, not an on-device deepcopy: a 4B model cannot afford a
-        # second device-resident set of weights
-        best_state = {
-            key: value.detach().to("cpu", copy=True)
-            for key, value in model.state_dict().items()
-        }
+        if max_rounds is not None and step >= max_rounds * steps_per_epoch:
+            break
     if best_state is None:
         raise RuntimeError(
             "training produced no best state to restore; "
@@ -574,7 +675,10 @@ def build_loaders(
     # a row-level split leaks nearly every validation prompt into training,
     # miscalibrating the early stopping that selects the model
     prompts = dataframe["prompt"].drop_duplicates().sample(frac=1.0, random_state=seed)
-    validation_prompts = list(prompts.iloc[: int(len(prompts) * validation_fraction)])
+    # At least one validation prompt even on tiny smoke-test subsets: early
+    # stopping cannot run against an empty validation loader
+    validation_count = max(1, int(len(prompts) * validation_fraction))
+    validation_prompts = list(prompts.iloc[:validation_count])
     in_validation = dataframe["prompt"].isin(validation_prompts)
     train_dataset = PreferencePairDataset(
         dataframe.loc[~in_validation], criterion_columns, augment_presentation_order
