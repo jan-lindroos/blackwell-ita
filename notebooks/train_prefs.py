@@ -886,6 +886,12 @@ def _(
             pairwise_model, criterion_columns, encoder_name, checkpoint_path
         )
         upload_model(checkpoint_path)
+    # Release the GPU for later cells: the model and its leftover gradients
+    # otherwise sit on it for the rest of the session
+    pairwise_model.zero_grad(set_to_none=True)
+    pairwise_model.to("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     mo.md(metrics_markdown(checkpoint_name, pairwise_metrics))
 
 
@@ -946,6 +952,11 @@ def _(score_button):
             upload_tensors(
                 tensors_file, evaluation_prompts, scoring_columns, tensor_arrays
             )
+            if scoring_device.startswith("cuda"):
+                print(
+                    f"prompt {tensor_index + 1}: "
+                    f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB allocated"
+                )
     upload_tensors(tensors_file, evaluation_prompts, scoring_columns, tensor_arrays)
     scoring_model.to("cpu")
     if scoring_device.startswith("cuda"):
