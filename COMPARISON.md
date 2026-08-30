@@ -85,8 +85,11 @@ Both scripts share the notebook's training code (`notebooks/train_prefs.py`):
   the identical example stream).
 - Optimizer: AdamW, lr 1e-5, linear warmup 100 steps, batch of 8 pairs
   (`--batch-size`; the notebook default of 12 exceeds 80GB H100 memory).
-- Schedule: validate every 1/3 epoch ("round"); stop after 2 rounds without
-  a new best validation loss; restore the best checkpoint.
+- Schedule: validate every 1/3 epoch ("round") against the evaluation
+  split; stop after 2 rounds without a new best loss; restore the best
+  checkpoint. `--lr-schedule cosine` instead trains a fixed
+  `--total-rounds` with the learning rate annealed to zero, still keeping
+  the best-scoring weights.
 - Same seed (1810): same head initialization, same batch order, same
   validation pairs.
 
@@ -95,13 +98,23 @@ in the reported metrics is attributable to it.
 
 ## Evaluation sets
 
-- **Validation** (10% of the training half's prompts, ~503 pairs): drives
-  early stopping and checkpoint selection; its metrics are reported but
-  mildly optimistic, since it picked the checkpoint.
-- **Test** (the *other* prompt half, 5,031 pairs): never touched by
-  training or checkpoint selection — the headline numbers. Both models are
-  tested on the identical pairs (per-criterion loss and decisive accuracy;
-  skip with `--skip-test`, subsample with `--test-prompts N`).
+The splits are HelpSteer2's own, not a re-partition of one of them, so no
+prompt can straddle two sets (the two source halves share no prompt at all).
+
+- **Train** (all of HelpSteer2's train half, 10,162 pairs / 10,161
+  prompts): nothing is carved out of it — the model trains on the lot.
+- **Evaluation** (HelpSteer2's validation half less the ITA hold-out, 419
+  pairs): drives early stopping and checkpoint selection, and is what the
+  final per-criterion metrics report. Being the set that picked the
+  checkpoint, those numbers are mildly optimistic — this is not an
+  untouched test set. Periodic `eval/...` curves are logged on the first
+  `--eval-pairs` of it; the final report covers all 419 with the best
+  weights restored (skip with `--skip-test`, subsample with
+  `--test-prompts N`).
+- **ITA hold-out** (`split == "ita_holdout"`, 100 pairs): reserved for the
+  downstream ITA experiment in `notebooks/generate_candidates.py` and never
+  trained or scored here. Drawn only from pairs with a decisive `overall`
+  preference, since `select_anchors` skips missing and tied ones.
 
 ## What the comparison asks
 
@@ -122,6 +135,6 @@ sbatch --gpus=h100-80:1 -t 0:30:00 scripts/psc_train.sbatch \
 - `--max-rounds N` — cap rounds; prints min/round for walltime estimates.
 - No flags — the full experiment.
 
-Outputs: `checkpoints/bt_<half>.pt` / `checkpoints/pairwise_<half>.pt`,
+Outputs: `checkpoints/bt.pt` / `checkpoints/pairwise.pt`,
 live curves in the `blackwell-ita-rm-comparison` wandb project, and final
 per-criterion metrics in the job log.

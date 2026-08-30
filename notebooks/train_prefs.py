@@ -116,15 +116,63 @@ def helpsteer2_pairs(
 
 
 @app.function
-def prompt_splits(
-    prompts: pd.Series, evaluation_count: int = 100, seed: int = 1810
-) -> tuple[list[str], list[str], list[str]]:
-    """Split unique prompts into a held-out evaluation set and two halves."""
-    shuffled = prompts.drop_duplicates().sample(frac=1.0, random_state=seed).tolist()
-    held_out = shuffled[:evaluation_count]
-    remaining = shuffled[evaluation_count:]
-    half = len(remaining) // 2
-    return held_out, remaining[:half], remaining[half:]
+def ita_holdout_prompts(
+    pairs: pd.DataFrame, count: int = 100, seed: int = 1810
+) -> list[str]:
+    """Pick the prompts held out for the downstream ITA experiment.
+
+    Drawn only from pairs carrying a decisive overall preference, because
+    ``generate_candidates.select_anchors`` skips pairs whose overall target is
+    missing or tied: sampling from every pair would silently yield fewer than
+    ``count`` anchors.
+    """
+    decisive = pairs[pairs["overall"].notna() & (pairs["overall"] != 0.5)]
+    prompts = decisive["prompt"].drop_duplicates()
+    if len(prompts) < count:
+        raise ValueError(
+            f"only {len(prompts)} decisive prompts available for a held-out"
+            f" set of {count}"
+        )
+    return sorted(prompts.sample(n=count, random_state=seed))
+
+
+@app.function
+def build_explicit_loaders(
+    train_frame: pd.DataFrame,
+    validation_frame: pd.DataFrame,
+    criterion_columns: list[str],
+    batch_size: int,
+    augment_presentation_order: bool,
+) -> tuple[DataLoader, DataLoader]:
+    """Loaders over two frames that are already disjoint by construction.
+
+    The counterpart of ``build_loaders`` for when validation comes from its own
+    source split rather than a carve-out of the training data. Only the
+    training loader is shuffled and augmented, exactly as in ``build_loaders``.
+    """
+    if train_frame.empty or validation_frame.empty:
+        raise ValueError(
+            f"empty frame: {len(train_frame)} training and"
+            f" {len(validation_frame)} validation pairs"
+        )
+    # Cheap here and catastrophic if missed: a shared prompt would leak
+    # training data into the loss that selects the checkpoint
+    shared = set(train_frame["prompt"]) & set(validation_frame["prompt"])
+    if shared:
+        raise ValueError(f"{len(shared)} prompts appear in both frames")
+    return (
+        DataLoader(
+            PreferencePairDataset(
+                train_frame, criterion_columns, augment_presentation_order
+            ),
+            batch_size=batch_size,
+            shuffle=True,
+        ),
+        DataLoader(
+            PreferencePairDataset(validation_frame, criterion_columns, False),
+            batch_size=batch_size,
+        ),
+    )
 
 
 @app.function
@@ -530,9 +578,12 @@ def train_until_no_improvement(
 
     ``eval_every``, when given with ``log_metrics`` and ``eval_criteria``,
     additionally logs ``eval/...`` pooled and per-criterion metrics every that
-    many steps, scored on ``eval_loader`` (default: the validation loader).
-    This is monitoring only; early stopping still follows the per-round
-    validation loss.
+    many steps, scored on ``eval_loader`` (default: the validation loader),
+    plus one pass at step 0 before any update and one on the restored best
+    weights at the end. The first is the untrained baseline every curve is
+    read against; the last is the checkpoint that actually gets saved, which
+    a periodic tick lands on only by coincidence. This is monitoring only;
+    early stopping still follows the per-round validation loss.
     """
     if eval_every is not None and eval_criteria is None:
         raise ValueError("eval_every requires eval_criteria for metric names")
@@ -552,6 +603,35 @@ def train_until_no_improvement(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
 
+    def log_eval(at_step: int, prefix: str = "eval") -> None:
+        """Score the monitoring loader and log its metrics at ``at_step``.
+
+        ``prefix`` separates the end-of-training pass from the curve: it
+        scores the restored best weights, which the model never held at the
+        step it is logged against, so it must not land on the ``eval/`` line.
+        """
+        eval_loss, logged_metrics = validation_metrics(
+            model,
+            eval_loader if eval_loader is not None else validation_loader,
+            eval_criteria,  # pyright: ignore[reportArgumentType]
+            device,
+        )
+        assert log_metrics is not None
+        log_metrics(
+            {"step": at_step, f"{prefix}/loss": eval_loss}
+            | {
+                f"{prefix}/{criterion}_loss": values["loss"]
+                for criterion, values in logged_metrics.items()
+            }
+            | {
+                f"{prefix}/{criterion}_accuracy": values["decisive_accuracy"]
+                for criterion, values in logged_metrics.items()
+            }
+        )
+        model.train()
+
+    evaluating = eval_every is not None and log_metrics is not None
+
     def cycling_batches() -> Iterator[Batch]:
         while True:
             yield from train_loader
@@ -561,6 +641,10 @@ def train_until_no_improvement(
     best_state: dict[str, torch.Tensor] | None = None
     rounds_without_improvement = 0
     step = 0
+    # The untrained baseline: a randomly initialised head on the pretrained
+    # backbone, which is the floor every later eval point is read against
+    if evaluating:
+        log_eval(0)
     while True:
         model.train()
         with mo.status.progress_bar(
@@ -593,34 +677,21 @@ def train_until_no_improvement(
                             "learning_rate": scheduler.get_last_lr()[0],
                         }
                     )
-                    if (
-                        eval_every is not None
-                        and (step + round_step) % eval_every == 0
-                    ):
-                        eval_loss, eval_metrics = validation_metrics(
-                            model,
-                            eval_loader
-                            if eval_loader is not None
-                            else validation_loader,
-                            eval_criteria,  # pyright: ignore[reportArgumentType]
-                            device,
-                        )
-                        log_metrics(
-                            {"step": step + round_step, "eval/loss": eval_loss}
-                            | {
-                                f"eval/{criterion}_loss": values["loss"]
-                                for criterion, values in eval_metrics.items()
-                            }
-                            | {
-                                f"eval/{criterion}_accuracy": values[
-                                    "decisive_accuracy"
-                                ]
-                                for criterion, values in eval_metrics.items()
-                            }
-                        )
-                        model.train()
+                    if evaluating and (step + round_step) % eval_every == 0:
+                        # step() has consumed the gradients and grad_norm has
+                        # read them, so they are dead weight — but the next
+                        # iteration's zero_grad() is what would free them,
+                        # and that runs after this eval. On a 4B fp32 model
+                        # they are 15 GiB, which is the difference between
+                        # the eval pass fitting and not
+                        optimizer.zero_grad(set_to_none=True)
+                        log_eval(step + round_step)
                 progress.update(subtitle=f"loss={step_loss:.4f}")
         step += steps_per_epoch
+        # Same reason as before the periodic eval, and this pass is the larger
+        # of the two: it covers the whole validation set, not an --eval-pairs
+        # slice of it
+        optimizer.zero_grad(set_to_none=True)
         validation_loss = evaluate_loss(model, validation_loader, device)
         print(f"step {step}: validation_loss={validation_loss:.4f}")
         if log_metrics is not None:
@@ -648,6 +719,10 @@ def train_until_no_improvement(
             f"last validation loss was {validation_loss:.4f}"
         )
     model.load_state_dict(best_state)
+    # The restored best weights, not wherever the last periodic tick landed:
+    # this is the checkpoint that gets written out
+    if evaluating:
+        log_eval(step, prefix="final_eval")
     return best_validation_loss
 
 
@@ -856,11 +931,17 @@ def _():
 
 @app.cell
 def _(datasets):
-    responses_dataframe = datasets.load_dataset(
-        "nvidia/HelpSteer2", split="train"
-    ).to_pandas()
-    responses_dataframe
-    return (responses_dataframe,)
+    # HelpSteer2 ships train and validation only; validation is this project's
+    # evaluation data. Its preference file labels the same two "train"/"val"
+    SOURCE_SPLITS = (("train", "train", "train"), ("validation", "val", "evaluation"))
+    responses_by_split = {
+        label: datasets.load_dataset(
+            "nvidia/HelpSteer2", split=response_split
+        ).to_pandas()
+        for response_split, _, label in SOURCE_SPLITS
+    }
+    responses_by_split
+    return SOURCE_SPLITS, responses_by_split
 
 
 @app.cell
@@ -868,16 +949,24 @@ def _():
     preferences_dataframe = pd.read_json(
         "hf://datasets/nvidia/HelpSteer2/preference/preference.jsonl.gz", lines=True
     )
-    preferences_dataframe = preferences_dataframe[
-        preferences_dataframe["split"] == "train"
-    ]
     preferences_dataframe
     return (preferences_dataframe,)
 
 
 @app.cell
-def _(preferences_dataframe, responses_dataframe):
-    pairs_dataframe = helpsteer2_pairs(responses_dataframe, preferences_dataframe)
+def _(SOURCE_SPLITS, preferences_dataframe, responses_by_split):
+    pairs_dataframe = pd.concat(
+        [
+            helpsteer2_pairs(
+                responses_by_split[label],
+                preferences_dataframe[
+                    preferences_dataframe["split"] == preference_split
+                ],
+            ).assign(split=label)
+            for _, preference_split, label in SOURCE_SPLITS
+        ],
+        ignore_index=True,
+    )
     pairs_dataframe
     return (pairs_dataframe,)
 
@@ -891,16 +980,15 @@ def _():
 
 @app.cell
 def _(pairs_dataframe):
-    held_out_prompts, inference_prompts, evaluate_prompts = prompt_splits(
-        pairs_dataframe["prompt"]
-    )
-    split_labels = (
-        {prompt: "evaluation" for prompt in held_out_prompts}
-        | {prompt: "inference" for prompt in inference_prompts}
-        | {prompt: "evaluate" for prompt in evaluate_prompts}
-    )
+    # HelpSteer2's own train/validation halves are the split: all of train
+    # trains the model, validation is the evaluation set, and the ITA prompts
+    # are carved out of validation so they are never trained on
+    evaluation_rows = pairs_dataframe[pairs_dataframe["split"] == "evaluation"]
+    held_out_prompts = ita_holdout_prompts(evaluation_rows)
     split_pairs_dataframe = pairs_dataframe.assign(
-        split=pairs_dataframe["prompt"].map(split_labels)
+        split=pairs_dataframe["split"].mask(
+            pairs_dataframe["prompt"].isin(set(held_out_prompts)), "ita_holdout"
+        )
     )
     split_pairs_dataframe
     return (split_pairs_dataframe,)
@@ -946,15 +1034,6 @@ def _():
 
 @app.cell
 def _():
-    half_picker = mo.ui.dropdown(
-        options=["inference", "evaluate"], value="inference", label="Training half"
-    )
-    half_picker
-    return (half_picker,)
-
-
-@app.cell
-def _():
     train_button = mo.ui.run_button(label="Train pairwise")
     train_button
     return (train_button,)
@@ -966,16 +1045,14 @@ def _(
     criterion_columns,
     downloaded_pairs,
     encoder_name,
-    half_picker,
     learning_rate,
     max_tokens,
     train_button,
     warmup_steps,
 ):
     mo.stop(not train_button.value)
-    training_half = half_picker.value
     pairwise_model, pairwise_metrics = train_reward_model(
-        downloaded_pairs[downloaded_pairs["split"] == training_half],
+        downloaded_pairs[downloaded_pairs["split"] == "train"],
         criterion_columns,
         max_tokens,
         encoder_name=encoder_name,
@@ -983,7 +1060,7 @@ def _(
         batch_size=batch_size,
         warmup_steps=warmup_steps,
     )
-    checkpoint_name = f"pairwise_{training_half}.pt"
+    checkpoint_name = "pairwise.pt"
     with tempfile.TemporaryDirectory() as checkpoint_temp:
         checkpoint_path = Path(checkpoint_temp) / checkpoint_name
         save_reward_model(
@@ -1027,13 +1104,14 @@ def _(score_button):
     # Row order is the canonical evaluation-prompt order
     evaluation_prompts = candidates_dataframe["prompt"].drop_duplicates().tolist()
     scoring_device = default_device()
-    # Only the inference half precomputes the full tensor: policies are solved
-    # on it. The evaluate-half model scores just the policy support atoms
-    # against the anchor, on demand in the experiments notebook
+    # The full n-by-n tensor is precomputed here because the Blackwell winner
+    # is a max-min over the whole pool. The judging model in the experiments
+    # notebook needs only the policy support atoms against the anchor, so it
+    # scores those on demand instead
     scoring_model, scoring_columns = load_reward_model(
-        model_path("pairwise_inference.pt"), scoring_device
+        model_path("pairwise.pt"), scoring_device
     )
-    tensors_file = "preference_tensors_inference.npz"
+    tensors_file = "preference_tensors.npz"
     tensor_arrays = resume_tensors(tensors_file, evaluation_prompts, scoring_columns)
     for tensor_index, tensor_prompt in enumerate(
         mo.status.progress_bar(evaluation_prompts, title="inference")

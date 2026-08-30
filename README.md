@@ -2,7 +2,7 @@
 
 Multi-preference inference-time alignment on HelpSteer2, built on the Blackwell winner (Bhatia et al. 2021, [arXiv:2105.01850](https://arxiv.org/abs/2105.01850)). Everything lives in self-contained marimo notebooks that hand artifacts to each other through the HF Hub:
 
-1. `notebooks/train_prefs.py` — build preference pairs (5 attributes + overall), split prompts, train the pairwise 6-head model per half, score the inference-half preference tensors (GPU).
+1. `notebooks/train_prefs.py` — build preference pairs (5 attributes + overall) from both HelpSteer2 halves, label them `train` / `evaluation` / `ita_holdout`, train one pairwise 6-head model on the whole train half, score the preference tensors over the ITA hold-out prompts (GPU).
 2. `notebooks/generate_candidates.py` — anchors and N = 128 base-policy candidates per evaluation prompt (GPU).
 3. `notebooks/experiments.py` — best-of-Blackwell (exact and entropic, plus a verbosity-ablation arm over 4 criteria) vs best-of-Nash vs base, held-out worst-criterion win rates (the evaluate-half model scores only policy support atoms against the anchor, on demand; GPU), token efficiency (expected response tokens per policy, the check on verbosity chasing), and a Claude-judged overall win rate (local).
 

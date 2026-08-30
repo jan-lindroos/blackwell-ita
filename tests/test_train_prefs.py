@@ -12,16 +12,17 @@ from train_prefs import (
     Batch,
     PairwisePreferenceModel,
     PreferencePairDataset,
+    build_explicit_loaders,
     build_loaders,
     default_device,
     evaluate_loss,
     graded_target,
     helpsteer2_pairs,
+    ita_holdout_prompts,
     masked_binary_cross_entropy,
     pairwise_text,
     per_criterion_metrics,
     preference_tensor,
-    prompt_splits,
     train_until_no_improvement,
     truncated_pairwise_text,
 )
@@ -103,17 +104,47 @@ def test_helpsteer2_pairs_rejects_misaligned_groups():
         helpsteer2_pairs(responses, preferences)
 
 
-def test_prompt_splits_are_deterministic_and_disjoint():
-    """Splits are reproducible, disjoint, and cover every prompt."""
-    prompts = pd.Series([f"prompt {index}" for index in range(20)] * 3)
-    held_out, first_half, second_half = prompt_splits(prompts, evaluation_count=4)
-    assert (held_out, first_half, second_half) == prompt_splits(
-        prompts, evaluation_count=4
+def test_ita_holdout_prompts_only_draws_decisive_pairs():
+    """Held-out prompts must be usable as anchors: labelled and not tied."""
+    pairs = pd.DataFrame(
+        {
+            "prompt": [f"prompt {index}" for index in range(10)],
+            "overall": [1.0, 0.5, None, 0.0, 0.75, 0.5, None, 0.25, 1.0, 0.0],
+        }
     )
-    assert not set(held_out) & set(first_half)
-    assert not set(held_out) & set(second_half)
-    assert not set(first_half) & set(second_half)
-    assert len(held_out) + len(first_half) + len(second_half) == 20
+    held_out = ita_holdout_prompts(pairs, count=3)
+    assert len(held_out) == 3
+    decisive = set(pairs[pairs["overall"].notna() & (pairs["overall"] != 0.5)]["prompt"])
+    assert set(held_out) <= decisive
+    assert held_out == ita_holdout_prompts(pairs, count=3)
+    # Six decisive prompts exist, so seven cannot be drawn
+    with pytest.raises(ValueError):
+        ita_holdout_prompts(pairs, count=7)
+
+
+def test_build_explicit_loaders_rejects_prompts_shared_between_frames():
+    """A prompt on both sides would leak training data into early stopping."""
+    columns = ["overall"]
+    frame = pd.DataFrame(
+        {
+            "prompt": ["shared", "only train"],
+            "response_a": ["a", "a"],
+            "response_b": ["b", "b"],
+            "overall": [1.0, 0.0],
+        }
+    )
+    validation = pd.DataFrame(
+        {
+            "prompt": ["shared"],
+            "response_a": ["a"],
+            "response_b": ["b"],
+            "overall": [1.0],
+        }
+    )
+    with pytest.raises(ValueError, match="both frames"):
+        build_explicit_loaders(frame, validation, columns, 2, False)
+    with pytest.raises(ValueError, match="empty frame"):
+        build_explicit_loaders(frame, validation.iloc[:0], columns, 2, False)
 
 
 def pairs_frame() -> pd.DataFrame:
@@ -426,7 +457,13 @@ def test_train_until_no_improvement_logs_periodic_eval():
         eval_criteria=["c1", "c2"],
     )
     eval_entries = [entry for entry in logged if "eval/loss" in entry]
-    assert [entry["step"] for entry in eval_entries][:4] == [2, 4, 6, 8]
+    # Step 0 is the untrained baseline, then every eval_every steps
+    assert [entry["step"] for entry in eval_entries][:4] == [0, 2, 4, 6]
+    # One pass on the restored best weights, kept off the eval/ curve because
+    # the model never held those weights at the step it is logged against
+    final_entries = [entry for entry in logged if "final_eval/loss" in entry]
+    assert len(final_entries) == 1
+    assert final_entries[-1]["step"] == eval_entries[-1]["step"]
     expected_pooled = (
         torch.nn.functional.binary_cross_entropy_with_logits(
             torch.tensor([1.0, 1.0]), torch.tensor([1.0, 0.0]), reduction="none"

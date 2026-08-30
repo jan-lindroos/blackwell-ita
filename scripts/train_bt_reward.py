@@ -9,7 +9,7 @@ pair logit is ``r(first) - r(second)``, the (graded) Bradley-Terry likelihood.
 
 Run on a GPU node, monitored by wandb:
 
-    python scripts/train_bt_reward.py --half inference
+    python scripts/train_bt_reward.py --pairs-path data/pairs.parquet
 """
 
 import argparse
@@ -27,6 +27,9 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notebooks"))
 
 import train_prefs as tp
+
+# Held out for the downstream ITA experiment; see notebooks/experiments.py
+ITA_HOLDOUT_COUNT = 100
 
 
 def pointwise_text(prompt: str, response: str) -> str:
@@ -167,30 +170,38 @@ def load_split_pairs(pairs_path: Path | None) -> pd.DataFrame:
         print(f"hub pairs unavailable ({error}); rebuilding from source")
     import datasets
 
-    responses = datasets.load_dataset("nvidia/HelpSteer2", split="train").to_pandas()
     preferences = pd.read_json(
         "hf://datasets/nvidia/HelpSteer2/preference/preference.jsonl.gz", lines=True
     )
-    preferences = preferences[preferences["split"] == "train"]
-    pairs = tp.helpsteer2_pairs(responses, preferences)
-    held_out, inference, evaluate = tp.prompt_splits(pairs["prompt"])
-    labels = (
-        {prompt: "evaluation" for prompt in held_out}
-        | {prompt: "inference" for prompt in inference}
-        | {prompt: "evaluate" for prompt in evaluate}
+    frames = []
+    # HelpSteer2 ships train and validation only; its preference file labels
+    # the same two as "train" and "val". The validation split is this
+    # project's evaluation data, and its prompts are disjoint from train's
+    for response_split, preference_split, label in (
+        ("train", "train", "train"),
+        ("validation", "val", "evaluation"),
+    ):
+        responses = datasets.load_dataset(
+            "nvidia/HelpSteer2", split=response_split
+        ).to_pandas()
+        split_pairs = tp.helpsteer2_pairs(
+            responses, preferences[preferences["split"] == preference_split]
+        )
+        frames.append(split_pairs.assign(split=label))
+    pairs = pd.concat(frames, ignore_index=True)
+    # The ITA prompts are carved out of the evaluation split, not the training
+    # split: they must never be trained on, and they must carry a decisive
+    # overall preference for select_anchors to use them
+    evaluation = pairs[pairs["split"] == "evaluation"]
+    held_out = tp.ita_holdout_prompts(evaluation, ITA_HOLDOUT_COUNT)
+    return pairs.assign(
+        split=pairs["split"].mask(pairs["prompt"].isin(set(held_out)), "ita_holdout")
     )
-    return pairs.assign(split=pairs["prompt"].map(labels))
 
 
 def parse_args() -> argparse.Namespace:
     """Parse the training hyperparameters, defaults matching the notebook."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--half",
-        choices=["inference", "evaluate"],
-        default="inference",
-        help="prompt half to train on; keep identical across compared runs",
-    )
     parser.add_argument(
         "--pairs-path",
         type=Path,
@@ -212,7 +223,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval-every",
         type=int,
-        default=50,
+        default=100,
         help="log eval/... metrics every this many steps (0 disables)",
     )
     parser.add_argument(
@@ -224,16 +235,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-test",
         action="store_true",
-        help="skip the final test evaluation on the untrained prompt half",
+        help="skip the final test evaluation on the untrained prompts",
     )
     parser.add_argument(
         "--test-prompts",
         type=int,
         default=None,
-        help="subsample the test half to this many prompts (smoke tests)",
+        help="subsample the test set to this many prompts (smoke tests)",
     )
     parser.add_argument("--encoder", default="Qwen/Qwen3-4B-Instruct-2507")
-    parser.add_argument("--max-tokens", type=int, default=4000)
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument(
         "--lr-schedule",
@@ -264,7 +275,6 @@ def parse_args() -> argparse.Namespace:
         " independent of the training micro-batch",
     )
     parser.add_argument("--warmup-steps", type=int, default=100)
-    parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1810)
     parser.add_argument("--device", default=None)
@@ -279,7 +289,17 @@ def main() -> None:
     args = parse_args()
     criterion_columns = [*tp.HELPSTEER2_ATTRIBUTES, "overall"]
     pairs = load_split_pairs(args.pairs_path)
-    frame = pairs[pairs["split"] == args.half]
+    # Three disjoint splits, fixed in the pairs artifact rather than derived
+    # here: all of HelpSteer2's train half trains, its validation half is the
+    # evaluation set, and ITA_HOLDOUT_COUNT of the latter is reserved for the
+    # downstream ITA experiment and never scored here
+    frame = pairs[pairs["split"] == "train"]
+    evaluation_frame = pairs[pairs["split"] == "evaluation"]
+    if frame.empty or evaluation_frame.empty:
+        raise RuntimeError(
+            f"expected 'train' and 'evaluation' splits, found"
+            f" {sorted(pairs['split'].unique())}; rebuild the pairs artifact"
+        )
     if args.limit_prompts is not None:
         kept_prompts = (
             frame["prompt"]
@@ -299,11 +319,12 @@ def main() -> None:
         )
     wandb.init(
         project=args.wandb_project,
-        name=args.wandb_run_name or f"bt-reward-{args.half}",
+        name=args.wandb_run_name or "bt-reward",
         config={
             "model_type": "bradley_terry_reward",
             "criterion_columns": criterion_columns,
             "training_pairs": len(frame),
+            "evaluation_pairs": len(evaluation_frame),
             "augment_presentation_order": True,
             "device": device,
         }
@@ -315,13 +336,12 @@ def main() -> None:
     # Seeded before model construction and loader iteration: with the same
     # seed both compared runs share head initialisation and batch order
     torch.manual_seed(args.seed)
-    train_loader, validation_loader = tp.build_loaders(
+    train_loader, validation_loader = tp.build_explicit_loaders(
         frame,
+        evaluation_frame,
         criterion_columns,
         batch_size=args.batch_size,
-        validation_fraction=args.validation_fraction,
         augment_presentation_order=True,
-        seed=args.seed,
     )
     model = BradleyTerryRewardModel(
         args.encoder,
@@ -384,11 +404,11 @@ def main() -> None:
         criterion_columns,
         device,
     )
-    # Final report on the untrained half: untouched by training and by the
-    # early stopping that selected the checkpoint, unlike the validation set
+    # Final report over the whole evaluation split with the best weights
+    # restored, rather than the --eval-pairs subsample the curves are logged
+    # on. It drove early stopping, so it is not an untouched test set
     test_metrics = None
-    test_half = "evaluate" if args.half == "inference" else "inference"
-    test_frame = pairs[pairs["split"] == test_half]
+    test_frame = evaluation_frame
     if not args.skip_test:
         if args.test_prompts is not None:
             kept_test_prompts = (
@@ -411,7 +431,7 @@ def main() -> None:
             device,
         )
     model.to("cpu")
-    checkpoint_path = args.output_dir / f"bt_{args.half}.pt"
+    checkpoint_path = args.output_dir / "bt.pt"
     save_bt_reward_model(model, criterion_columns, args.encoder, checkpoint_path)
     wandb.log(
         {"best_validation_loss": best_validation_loss}
@@ -437,7 +457,7 @@ def main() -> None:
             f"{values['decisive_accuracy']:.1%} over {values['decisive_count']} pairs"
         )
     if test_metrics is not None:
-        print(f"Test metrics on the {test_half} half ({len(test_frame)} pairs):")
+        print(f"Evaluation metrics ({len(test_frame)} pairs):")
         for criterion, values in test_metrics.items():
             print(
                 f"  {criterion}: loss {values['loss']:.4f}, decisive accuracy "
