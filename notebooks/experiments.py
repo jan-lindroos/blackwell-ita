@@ -237,7 +237,9 @@ def blackwell_winner(
         problem.solve(solver=cp.CLARABEL)
     except cp.SolverError as error:
         raise RuntimeError(f"blackwell_winner solve failed: {error}") from error
-    if problem.status != cp.OPTIMAL or policy.value is None:
+    # Clarabel reports optimal_inaccurate on some entropic solves depending
+    # on build; the tolerance slack is far below the 1e-6 support threshold
+    if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or policy.value is None:
         raise RuntimeError(f"blackwell_winner solve failed: {problem.status}")
     return np.asarray(policy.value)
 
