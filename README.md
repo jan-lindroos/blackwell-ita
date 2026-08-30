@@ -16,6 +16,24 @@ The notebook runs `entropic_blackwell` at `beta = 0.05` over the 5 criterion hea
 
 Tests pin the solver from independent angles: the exact variant against a from-scratch von Neumann max-min LP and a grid search on the definition, and the entropic variant on its fixed points (a preference cycle stays uniform at every `beta`), full support, equal mass on duplicated candidates, the excess-value bound `v(pi_beta) <= v(pi_lp) + beta * log n`, and interpolation towards the LP vertex as `beta` shrinks and towards uniform as it grows. Solution tolerances are 1e-6 rather than the old 1e-9 because interior-point solutions land near, not on, the optimal vertex.
 
+## Reward-model vs preference-model comparison
+
+`scripts/train_bt_reward.py` and `scripts/train_pairwise_preference.py` are
+mirror CLI scripts (wandb-monitored, cluster-friendly) that fine-tune a
+pointwise Bradley-Terry reward model and the notebooks' pairwise preference
+model under an identical protocol: same HelpSteer2 pairs and split half, same
+graded targets and masked BCE loss, same Qwen3-4B backbone, head
+initialisation, batch order, optimiser, schedule, and early stopping. The only
+difference is the pair logit: `r(prompt, first) - r(prompt, second)` from two
+independent forwards for BT, versus one joint forward over both responses for
+the pairwise model. Both report the same validation metrics, so their numbers
+compare directly.
+
+On a cluster, work up in stages: upload the folder (with `data/pairs.parquet`),
+smoke-test both scripts with `--limit-prompts 32 --max-rounds 2`, time one full
+round with `--max-rounds 1` (the scripts print min/round), then launch the full
+runs. `scripts/psc_train.sbatch` is a slurm template for all stages.
+
 ## Running
 
 ```sh

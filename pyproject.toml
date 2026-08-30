@@ -15,8 +15,24 @@ dependencies = [
     "pyarrow",
     "scipy",
     "torch",
-    "transformers",
+    # 5.15 predates torch 2.13 and its Qwen3 modeling file fails to import
+    # against it; 5.16.1 is the first version verified compatible
+    "transformers>=5.16.1",
+    "wandb",
 ]
+
+# PSC Bridges-2 H100 nodes run driver 560 (CUDA <= 12.6); the default PyPI
+# torch is a CUDA-13 build that cannot initialize there. Pull torch from the
+# cu126 wheel index on Linux instead; macOS keeps the PyPI build.
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
 
 [dependency-groups]
 dev = [
@@ -44,6 +60,10 @@ reportUnusedExpression = "none"
 
 [[tool.basedpyright.executionEnvironments]]
 root = "tests"
+extraPaths = ["notebooks"]
+
+[[tool.basedpyright.executionEnvironments]]
+root = "scripts"
 extraPaths = ["notebooks"]
 
 [tool.pytest.ini_options]
