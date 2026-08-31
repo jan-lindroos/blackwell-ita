@@ -1,5 +1,6 @@
 """Tests for the train_prefs notebook's preference and training utilities."""
 
+import itertools
 from typing import cast
 
 import numpy as np
@@ -11,16 +12,17 @@ from train_prefs import (
     Batch,
     PairwisePreferenceModel,
     PreferencePairDataset,
+    build_explicit_loaders,
     build_loaders,
     default_device,
     evaluate_loss,
     graded_target,
     helpsteer2_pairs,
+    ita_holdout_prompts,
     masked_binary_cross_entropy,
     pairwise_text,
     per_criterion_metrics,
     preference_tensor,
-    prompt_splits,
     train_until_no_improvement,
     truncated_pairwise_text,
 )
@@ -102,17 +104,47 @@ def test_helpsteer2_pairs_rejects_misaligned_groups():
         helpsteer2_pairs(responses, preferences)
 
 
-def test_prompt_splits_are_deterministic_and_disjoint():
-    """Splits are reproducible, disjoint, and cover every prompt."""
-    prompts = pd.Series([f"prompt {index}" for index in range(20)] * 3)
-    held_out, first_half, second_half = prompt_splits(prompts, evaluation_count=4)
-    assert (held_out, first_half, second_half) == prompt_splits(
-        prompts, evaluation_count=4
+def test_ita_holdout_prompts_only_draws_decisive_pairs():
+    """Held-out prompts must be usable as anchors: labelled and not tied."""
+    pairs = pd.DataFrame(
+        {
+            "prompt": [f"prompt {index}" for index in range(10)],
+            "overall": [1.0, 0.5, None, 0.0, 0.75, 0.5, None, 0.25, 1.0, 0.0],
+        }
     )
-    assert not set(held_out) & set(first_half)
-    assert not set(held_out) & set(second_half)
-    assert not set(first_half) & set(second_half)
-    assert len(held_out) + len(first_half) + len(second_half) == 20
+    held_out = ita_holdout_prompts(pairs, count=3)
+    assert len(held_out) == 3
+    decisive = set(pairs[pairs["overall"].notna() & (pairs["overall"] != 0.5)]["prompt"])
+    assert set(held_out) <= decisive
+    assert held_out == ita_holdout_prompts(pairs, count=3)
+    # Six decisive prompts exist, so seven cannot be drawn
+    with pytest.raises(ValueError):
+        ita_holdout_prompts(pairs, count=7)
+
+
+def test_build_explicit_loaders_rejects_prompts_shared_between_frames():
+    """A prompt on both sides would leak training data into early stopping."""
+    columns = ["overall"]
+    frame = pd.DataFrame(
+        {
+            "prompt": ["shared", "only train"],
+            "response_a": ["a", "a"],
+            "response_b": ["b", "b"],
+            "overall": [1.0, 0.0],
+        }
+    )
+    validation = pd.DataFrame(
+        {
+            "prompt": ["shared"],
+            "response_a": ["a"],
+            "response_b": ["b"],
+            "overall": [1.0],
+        }
+    )
+    with pytest.raises(ValueError, match="both frames"):
+        build_explicit_loaders(frame, validation, columns, 2, False)
+    with pytest.raises(ValueError, match="empty frame"):
+        build_explicit_loaders(frame, validation.iloc[:0], columns, 2, False)
 
 
 def pairs_frame() -> pd.DataFrame:
@@ -242,6 +274,29 @@ def test_build_loaders_splits_by_prompt_and_augments_only_training_data():
     assert len(train_prompts | validation_prompts) == 5
 
 
+def test_build_loaders_keeps_a_validation_prompt_on_tiny_data():
+    """A subset too small for the fraction still gets one validation prompt."""
+    frame = pd.DataFrame(
+        {
+            "prompt": [f"p{index}" for index in range(4)],
+            "response_a": [f"a{index}" for index in range(4)],
+            "response_b": [f"b{index}" for index in range(4)],
+            "first_criterion": [1.0] * 4,
+            "second_criterion": [0.0] * 4,
+        }
+    )
+    train_loader, validation_loader = build_loaders(
+        frame,
+        CRITERION_COLUMNS,
+        batch_size=2,
+        validation_fraction=0.1,
+        augment_presentation_order=False,
+        seed=0,
+    )
+    assert len(validation_loader.dataset) == 1  # pyright: ignore[reportArgumentType]
+    assert len(train_loader.dataset) == 3  # pyright: ignore[reportArgumentType]
+
+
 class FixedLossModel(torch.nn.Module):
     """Model that returns a scripted sequence of losses."""
 
@@ -368,6 +423,154 @@ def test_train_until_no_improvement_cycles_loader_for_longer_rounds():
     assert best == 2.0
     assert model.steps_trained == 9
     assert model.weight.item() == 3.0
+
+
+class ScriptedEvalModel(ScriptedModel):
+    """Scripted model that also returns fixed logits for periodic eval."""
+
+    def batch_logits(self, batch: dict, device: str) -> torch.Tensor:
+        """Return constant logits shaped to the batch targets."""
+        return torch.zeros_like(batch["target"]) + 1.0
+
+
+def test_train_until_no_improvement_logs_periodic_eval():
+    """eval_every logs eval/... metrics at the requested step interval."""
+    eval_batch = cast(
+        Batch,
+        {
+            "target": torch.tensor([[1.0, 0.0]]),
+            "mask": torch.tensor([[1.0, 1.0]]),
+        },
+    )
+    logged = []
+    train_until_no_improvement(
+        cast(PairwisePreferenceModel, ScriptedEvalModel([1.0, 1.1, 1.2])),
+        train_loader=cast(list[Batch], [{}]),
+        validation_loader=cast(list[Batch], [{}]),
+        learning_rate=0.0,
+        warmup_steps=1,
+        device="cpu",
+        steps_per_epoch=4,
+        log_metrics=logged.append,
+        eval_every=2,
+        eval_loader=[eval_batch],
+        eval_criteria=["c1", "c2"],
+    )
+    eval_entries = [entry for entry in logged if "eval/loss" in entry]
+    # Step 0 is the untrained baseline, then every eval_every steps
+    assert [entry["step"] for entry in eval_entries][:4] == [0, 2, 4, 6]
+    # One pass on the restored best weights, kept off the eval/ curve because
+    # the model never held those weights at the step it is logged against
+    final_entries = [entry for entry in logged if "final_eval/loss" in entry]
+    assert len(final_entries) == 1
+    assert final_entries[-1]["step"] == eval_entries[-1]["step"]
+    expected_pooled = (
+        torch.nn.functional.binary_cross_entropy_with_logits(
+            torch.tensor([1.0, 1.0]), torch.tensor([1.0, 0.0]), reduction="none"
+        )
+        .mean()
+        .item()
+    )
+    assert eval_entries[0]["eval/loss"] == pytest.approx(expected_pooled)
+    assert "eval/c1_loss" in eval_entries[0]
+    assert "eval/c2_accuracy" in eval_entries[0]
+
+
+def test_train_until_no_improvement_requires_criteria_for_eval():
+    """eval_every without eval_criteria raises instead of logging nameless heads."""
+    with pytest.raises(ValueError, match="eval_criteria"):
+        train_until_no_improvement(
+            cast(PairwisePreferenceModel, ScriptedModel([1.0])),
+            train_loader=cast(list[Batch], [{}]),
+            validation_loader=cast(list[Batch], [{}]),
+            learning_rate=0.0,
+            warmup_steps=1,
+            device="cpu",
+            steps_per_epoch=1,
+            eval_every=2,
+        )
+
+
+def test_train_until_no_improvement_accumulates_micro_batches():
+    """Each optimizer step consumes accumulation_steps micro-batches, mean loss."""
+
+    class MicroLossModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(0.0))
+            self.train_losses = iter([1.0, 3.0, 5.0, 7.0])
+            self.validation_losses = iter([2.0, 2.5, 2.6])
+
+        def compute_loss(self, batch: dict, device: str) -> torch.Tensor:
+            if self.training:
+                return self.weight * 0.0 + next(self.train_losses)
+            return self.weight * 0.0 + next(self.validation_losses)
+
+    logged = []
+    train_until_no_improvement(
+        cast(PairwisePreferenceModel, MicroLossModel()),
+        train_loader=cast(list[Batch], [{}]),
+        validation_loader=cast(list[Batch], [{}]),
+        learning_rate=0.0,
+        warmup_steps=1,
+        device="cpu",
+        steps_per_epoch=1,
+        max_rounds=2,
+        accumulation_steps=2,
+        log_metrics=logged.append,
+    )
+    train_entries = [entry for entry in logged if "train_loss" in entry]
+    # Two optimizer steps, each averaging two scripted micro-batch losses
+    assert [entry["step"] for entry in train_entries] == [1, 2]
+    assert train_entries[0]["train_loss"] == pytest.approx(2.0)
+    assert train_entries[1]["train_loss"] == pytest.approx(6.0)
+
+
+def test_train_until_no_improvement_cosine_decays_to_zero():
+    """With total_steps the learning rate warms up, decays, and ends near zero."""
+    logged = []
+    train_until_no_improvement(
+        cast(PairwisePreferenceModel, ScriptedModel([1.0, 0.9, 0.8, 0.7])),
+        train_loader=cast(list[Batch], [{}]),
+        validation_loader=cast(list[Batch], [{}]),
+        learning_rate=1.0,
+        warmup_steps=4,
+        device="cpu",
+        steps_per_epoch=4,
+        max_rounds=4,
+        total_steps=16,
+        patience=5,
+        log_metrics=logged.append,
+    )
+    rates = [entry["learning_rate"] for entry in logged if "train_loss" in entry]
+    assert len(rates) == 16
+    # Warmup climbs; afterwards the cosine decays to zero, strictly until the
+    # final clamped step
+    assert rates[0] < rates[3]
+    assert all(early > late for early, late in itertools.pairwise(rates[4:15]))
+    assert all(early >= late for early, late in itertools.pairwise(rates[4:]))
+    assert rates[-1] == pytest.approx(0.0, abs=1e-6)
+    # Halfway through the decay the rate is half the peak, cosine's signature
+    assert rates[8] == pytest.approx(0.5, abs=1e-6)
+
+
+def test_train_until_no_improvement_respects_max_rounds():
+    """max_rounds stops training even while validation is still improving."""
+    model = ScriptedModel([3.0, 2.0, 1.0])
+    best = train_until_no_improvement(
+        cast(PairwisePreferenceModel, model),
+        train_loader=cast(list[Batch], [{}]),
+        validation_loader=cast(list[Batch], [{}]),
+        learning_rate=0.0,
+        warmup_steps=1,
+        device="cpu",
+        steps_per_epoch=1,
+        max_rounds=2,
+    )
+    assert best == 2.0
+    assert model.steps_trained == 2
+    # The best state is round 2's, so the cap keeps the last improvement
+    assert model.weight.item() == 2.0
 
 
 def test_train_until_no_improvement_raises_without_a_best_state():

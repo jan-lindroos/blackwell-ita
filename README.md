@@ -2,7 +2,7 @@
 
 Multi-preference inference-time alignment on HelpSteer2, built on the Blackwell winner (Bhatia et al. 2021, [arXiv:2105.01850](https://arxiv.org/abs/2105.01850)). Everything lives in self-contained marimo notebooks that hand artifacts to each other through the HF Hub:
 
-1. `notebooks/train_prefs.py` — build preference pairs (5 attributes + overall), split prompts, train the pairwise 6-head model per half, score the inference-half preference tensors (GPU).
+1. `notebooks/train_prefs.py` — build preference pairs (5 attributes + overall) from both HelpSteer2 halves, label them `train` / `evaluation` / `ita_holdout`, train one pairwise 6-head model on the whole train half, score the preference tensors over the ITA hold-out prompts (GPU).
 2. `notebooks/generate_candidates.py` — anchors and N = 128 base-policy candidates per evaluation prompt (GPU).
 3. `notebooks/experiments.py` — best-of-Blackwell (exact and entropic, plus a verbosity-ablation arm over 4 criteria) vs best-of-Nash vs base, held-out worst-criterion win rates (the evaluate-half model scores only policy support atoms against the anchor, on demand; GPU), token efficiency (expected response tokens per policy, the check on verbosity chasing), and a Claude-judged overall win rate (local).
 
@@ -15,6 +15,24 @@ At `beta = 0` the objective is `t` and the problem is the exact linear programme
 The notebook runs `entropic_blackwell` at `beta = 0.05` over the 5 criterion heads at every pool size, alongside the exact `best_of_blackwell` and `best_of_nash` (the `beta = 0` solver on the overall head alone). The entropic policy flows into the selections artifact and the held-out worst-criterion plot but is excluded from Claude judging. The KL term forces strictly positive mass on every candidate, so judging its support atoms would cost roughly `n` calls per prompt, and the tensor metric already scores it exactly as an expectation. The accepted optimisation error is `beta * log n`, about 0.24 at `n = 128`.
 
 Tests pin the solver from independent angles: the exact variant against a from-scratch von Neumann max-min LP and a grid search on the definition, and the entropic variant on its fixed points (a preference cycle stays uniform at every `beta`), full support, equal mass on duplicated candidates, the excess-value bound `v(pi_beta) <= v(pi_lp) + beta * log n`, and interpolation towards the LP vertex as `beta` shrinks and towards uniform as it grows. Solution tolerances are 1e-6 rather than the old 1e-9 because interior-point solutions land near, not on, the optimal vertex.
+
+## Reward-model vs preference-model comparison
+
+`scripts/train_bt_reward.py` and `scripts/train_pairwise_preference.py` are
+mirror CLI scripts (wandb-monitored, cluster-friendly) that fine-tune a
+pointwise Bradley-Terry reward model and the notebooks' pairwise preference
+model under an identical protocol: same HelpSteer2 pairs and split half, same
+graded targets and masked BCE loss, same Qwen3-4B backbone, head
+initialisation, batch order, optimiser, schedule, and early stopping. The only
+difference is the pair logit: `r(prompt, first) - r(prompt, second)` from two
+independent forwards for BT, versus one joint forward over both responses for
+the pairwise model. Both report the same validation metrics, so their numbers
+compare directly.
+
+On a cluster, work up in stages: upload the folder (with `data/pairs.parquet`),
+smoke-test both scripts with `--limit-prompts 32 --max-rounds 2`, time one full
+round with `--max-rounds 1` (the scripts print min/round), then launch the full
+runs. `scripts/psc_train.sbatch` is a slurm template for all stages.
 
 ## Running
 

@@ -530,7 +530,7 @@ def _():
 def _():
     candidates_dataframe = pd.read_parquet(artifact_path("candidates.parquet"))
     anchors_dataframe = pd.read_parquet(artifact_path("anchors.parquet"))
-    inference_tensors = np.load(artifact_path("preference_tensors_inference.npz"))
+    preference_tensors = np.load(artifact_path("preference_tensors.npz"))
     prompts = anchors_dataframe["prompt"].tolist()
     anchors = dict(
         zip(anchors_dataframe["prompt"], anchors_dataframe["anchor"], strict=True)
@@ -551,9 +551,9 @@ def _():
     # HEADS and carry the anchor as their last row and column; a prompt-order
     # mismatch would silently score every prompt against another prompt's
     # tensors
-    assert inference_tensors["criteria"].tolist() == HEADS
-    assert inference_tensors["prompts"].tolist() == prompts
-    assert prompt_tensor(inference_tensors, 0).shape == (
+    assert preference_tensors["criteria"].tolist() == HEADS
+    assert preference_tensors["prompts"].tolist() == prompts
+    assert prompt_tensor(preference_tensors, 0).shape == (
         len(HEADS),
         SAMPLES_PER_PROMPT + 1,
         SAMPLES_PER_PROMPT + 1,
@@ -561,7 +561,7 @@ def _():
     len(prompts)
     return (
         anchors,
-        inference_tensors,
+        preference_tensors,
         pool_tokens,
         pools,
         prompts,
@@ -576,9 +576,9 @@ def _():
 
 
 @app.cell
-def _(inference_tensors, pools, prompts, solve_button):
+def _(preference_tensors, pools, prompts, solve_button):
     mo.stop(not solve_button.value)
-    policies = solve_policies(inference_tensors, prompts)
+    policies = solve_policies(preference_tensors, prompts)
     selections_dataframe = selections_frame(policies, pools)
     upload_dataframe("selections.parquet", selections_dataframe)
     selections_dataframe

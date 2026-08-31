@@ -63,7 +63,7 @@ def select_anchors(pairs: pd.DataFrame) -> pd.DataFrame:
     wins. Row order is the canonical evaluation-prompt order.
     """
     anchors: dict[str, str] = {}
-    evaluation = pairs[pairs["split"] == "evaluation"]
+    evaluation = pairs[pairs["split"] == "ita_holdout"]
     # pandas-stubs type itertuples rows as plain tuples without the fields
     for row in evaluation.itertuples():
         if row.prompt in anchors or pd.isna(row.overall) or row.overall == 0.5:  # pyright: ignore[reportAttributeAccessIssue]

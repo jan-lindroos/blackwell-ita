@@ -11,7 +11,7 @@ from generate_candidates import (
 )
 
 
-def pair_row(prompt, response_a, response_b, overall, split="evaluation"):
+def pair_row(prompt, response_a, response_b, overall, split="ita_holdout"):
     """Build a minimal pairs row with the artifact schema."""
     return {
         "prompt": prompt,
@@ -59,12 +59,12 @@ def test_select_anchors_first_decisive_pair_wins():
     assert select_anchors(pairs).to_dict("records") == [{"prompt": "p1", "anchor": "c"}]
 
 
-def test_select_anchors_only_uses_evaluation_split():
-    """Pairs from the inference and evaluate splits never yield anchors."""
+def test_select_anchors_only_uses_the_ita_holdout_split():
+    """Pairs from the train and evaluation splits never yield anchors."""
     pairs = pd.DataFrame(
         [
-            pair_row("p1", "a", "b", 1.0, split="inference"),
-            pair_row("p2", "c", "d", 1.0, split="evaluate"),
+            pair_row("p1", "a", "b", 1.0, split="train"),
+            pair_row("p2", "c", "d", 1.0, split="evaluation"),
             pair_row("p3", "e", "f", 1.0),
         ]
     )
