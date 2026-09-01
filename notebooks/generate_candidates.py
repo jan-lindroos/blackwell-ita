@@ -29,7 +29,7 @@ with app.setup:
     from huggingface_hub import HfApi, hf_hub_download
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    ARTIFACTS_REPO = "jan-lindroos/blackwell-ita-artifacts"
+    ARTIFACTS_REPO = "blackwell-ita/blackwell-ita-artifacts"
 
 
 @app.function
@@ -176,9 +176,18 @@ def _():
 
 @app.cell
 def _():
-    base_model_name = "RLHFlow/LLaMA3-SFT-v2"
+    base_model_dropdown = mo.ui.dropdown(
+        options=[
+            "RLHFlow/LLaMA3-SFT-v2",
+            "google/gemma-2b-it",
+            "mistralai/Mistral-7B-Instruct-v0.3",
+        ],
+        value="RLHFlow/LLaMA3-SFT-v2",
+        label="base model",
+    )
     samples_per_prompt = 128
-    return base_model_name, samples_per_prompt
+    base_model_dropdown
+    return base_model_dropdown, samples_per_prompt
 
 
 @app.cell
@@ -197,8 +206,9 @@ def _():
 
 
 @app.cell
-def _(anchors_dataframe, base_model_name, generate_button, samples_per_prompt):
+def _(anchors_dataframe, base_model_dropdown, generate_button, samples_per_prompt):
     mo.stop(not generate_button.value)
+    base_model_name = base_model_dropdown.value
     raw_candidates = generate_candidates(
         base_model_name,
         anchors_dataframe["prompt"].tolist(),

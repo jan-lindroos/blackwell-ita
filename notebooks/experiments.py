@@ -38,8 +38,8 @@ with app.setup:
     from huggingface_hub import HfApi, hf_hub_download
     from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerBase
 
-    RMS_REPO = "jan-lindroos/blackwell-ita-rms"
-    ARTIFACTS_REPO = "jan-lindroos/blackwell-ita-artifacts"
+    RMS_REPO = "blackwell-ita/blackwell-ita-rms"
+    ARTIFACTS_REPO = "blackwell-ita/blackwell-ita-artifacts"
     DATASET = "helpsteer2"
     HEADS = [
         "helpfulness",
