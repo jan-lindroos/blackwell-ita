@@ -83,20 +83,23 @@ class BradleyTerryRewardModel(torch.nn.Module):
     def batch_logits(self, batch: tp.Batch, device: str) -> torch.Tensor:
         """Bradley-Terry pair logits: pointwise reward difference per criterion.
 
-        The two sides run as separate forwards so each is padded to its own
-        longest member rather than the joint maximum.
+        Both sides go through one forward rather than two. Autocast's bfloat16
+        copies of the fp32 weights are held by the autograd graph until
+        backward, so two graphs mean two copies -- 15 GiB on a 4B model,
+        independent of batch size, which is what made a separate-forwards
+        version run out of memory even at a micro-batch of one. The cost is
+        that the batch now pads to the longest response across both sides
+        instead of each side's own longest.
         """
-        first = self.score(
+        count = len(batch["prompt"])
+        scores = self.score(
             [
                 pointwise_text(prompt, response)
                 for prompt, response in zip(
                     batch["prompt"], batch["first_response"], strict=True
                 )
-            ],
-            device,
-        )
-        second = self.score(
-            [
+            ]
+            + [
                 pointwise_text(prompt, response)
                 for prompt, response in zip(
                     batch["prompt"], batch["second_response"], strict=True
@@ -104,7 +107,7 @@ class BradleyTerryRewardModel(torch.nn.Module):
             ],
             device,
         )
-        return first - second
+        return scores[:count] - scores[count:]
 
     def compute_loss(self, batch: tp.Batch, device: str) -> torch.Tensor:
         """Masked binary cross-entropy between the pair logits and targets."""

@@ -676,6 +676,14 @@ def train_until_no_improvement(
                             "grad_norm": grad_norm.item(),
                             "learning_rate": scheduler.get_last_lr()[0],
                         }
+                        # The peak is what an OOM is decided on, and it is
+                        # reached inside a step rather than between them, so it
+                        # cannot be recovered after the fact
+                        | (
+                            {"peak_gib": torch.cuda.max_memory_allocated() / 1024**3}
+                            if device.startswith("cuda")
+                            else {}
+                        )
                     )
                     if evaluating and (step + round_step) % eval_every == 0:
                         # step() has consumed the gradients and grad_norm has
