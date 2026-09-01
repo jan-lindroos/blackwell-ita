@@ -20,6 +20,7 @@ __generated_with = "0.24.0"
 app = marimo.App()
 
 with app.setup:
+    import os
     import tempfile
     from pathlib import Path
 
@@ -125,6 +126,9 @@ def generate_candidates(
     seed: int = 1810,
 ) -> pd.DataFrame:
     """Sample responses per prompt with vLLM; returns a (prompt, response) dataframe."""
+    # flashinfer's top-k/top-p sampling kernel is JIT-compiled and needs
+    # nvcc, which molab's image lacks; the torch sampler needs no toolkit
+    os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
     # imported lazily: vllm has no macOS wheels, and tests import this module
     from vllm import LLM, SamplingParams  # pyright: ignore[reportMissingImports]
 
