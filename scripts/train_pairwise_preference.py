@@ -41,7 +41,7 @@ def load_split_pairs(pairs_path: Path | None) -> pd.DataFrame:
     if pairs_path is not None:
         return pd.read_parquet(pairs_path)
     try:
-        return pd.read_parquet(tp.artifact_path("pairs.parquet"))
+        return pd.read_parquet(tp.pairs_path())
     except Exception as error:  # noqa: BLE001
         print(f"hub pairs unavailable ({error}); rebuilding from source")
     import datasets

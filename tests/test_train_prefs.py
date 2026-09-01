@@ -12,6 +12,7 @@ from train_prefs import (
     Batch,
     PairwisePreferenceModel,
     PreferencePairDataset,
+    bt_preference_tensor,
     build_explicit_loaders,
     build_loaders,
     default_device,
@@ -22,6 +23,7 @@ from train_prefs import (
     masked_binary_cross_entropy,
     pairwise_text,
     per_criterion_metrics,
+    pointwise_text,
     preference_tensor,
     train_until_no_improvement,
     truncated_pairwise_text,
@@ -632,16 +634,42 @@ def test_preference_tensor_is_skew_symmetric():
     assert np.allclose(tensor[:, 0, 1], expected)
 
 
+def test_pointwise_text_format():
+    """Pointwise texts carry the prompt and the single response marker."""
+    assert pointwise_text("p", "r") == "p\n\n[RESPONSE]\nr"
+
+
+def test_bt_preference_tensor_sigmoid_of_reward_differences():
+    """Entries are sigmoid(r_i - r_j) per head, one pointwise forward each."""
+    model = StubPairwiseModel(head_count=3)
+    responses = ["alpha", "be", "gamma!"]
+    tensor = bt_preference_tensor(model, "p", responses, "cpu", batch_size=2)
+    assert tensor.shape == (3, 3, 3)
+    assert np.allclose(np.diagonal(tensor, axis1=1, axis2=2), 0.5)
+    assert np.allclose(tensor + tensor.transpose(0, 2, 1), 1.0)
+    rewards = model.score(
+        [pointwise_text("p", response) for response in responses], "cpu"
+    )
+    expected = torch.sigmoid(rewards[0] - rewards[1]).numpy()
+    assert np.allclose(tensor[:, 0, 1], expected)
+
+
 def hub_stub(monkeypatch, tmp_path):
     """Route the tensor checkpoint hub calls to a single local file."""
     store = tmp_path / "tensors.npz"
     monkeypatch.setattr(
         train_prefs,
         "upload_artifact",
-        lambda path: store.write_bytes(path.read_bytes()),
+        lambda path, prefix="helpsteer2": store.write_bytes(path.read_bytes()),
     )
-    monkeypatch.setattr(train_prefs, "artifact_exists", lambda filename: store.exists())
-    monkeypatch.setattr(train_prefs, "artifact_path", lambda filename: store)
+    monkeypatch.setattr(
+        train_prefs,
+        "artifact_exists",
+        lambda filename, prefix="helpsteer2": store.exists(),
+    )
+    monkeypatch.setattr(
+        train_prefs, "artifact_path", lambda filename, prefix="helpsteer2": store
+    )
 
 
 def test_upload_and_resume_tensors_round_trip(monkeypatch, tmp_path):

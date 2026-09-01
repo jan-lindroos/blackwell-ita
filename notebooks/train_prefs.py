@@ -37,9 +37,11 @@ with app.setup:
     from torch.utils.data import DataLoader, Dataset
     from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerBase
 
-    RMS_REPO = "blackwell-ita/blackwell-ita-rms"
-    ARTIFACTS_REPO = "blackwell-ita/blackwell-ita-artifacts"
+    RMS_REPO = "blackwell-ita/reward-models"
+    ARTIFACTS_REPO = "blackwell-ita/artifacts"
+    SPLITS_REPO = "blackwell-ita/helpsteer2-splits"
     DATASET = "helpsteer2"
+    DEFAULT_BASE_MODEL = "RLHFlow/LLaMA3-SFT-v2"
 
     HELPSTEER2_ATTRIBUTES = [
         "helpfulness",
@@ -182,17 +184,51 @@ def model_path(filename: str) -> Path:
 
 
 @app.function
-def artifact_path(filename: str) -> Path:
+def pairs_path() -> Path:
+    """Download the canonical split pairs, returning the local cache path."""
+    return Path(hf_hub_download(SPLITS_REPO, "pairs.parquet", repo_type="dataset"))
+
+
+@app.function
+def upload_pairs(dataframe: pd.DataFrame) -> None:
+    """Upload the canonical split pairs to the splits repo."""
+    api = HfApi()
+    with tempfile.TemporaryDirectory() as temp_name:
+        path = Path(temp_name) / "pairs.parquet"
+        dataframe.to_parquet(path)
+        api.upload_file(
+            path_or_fileobj=path,
+            path_in_repo="pairs.parquet",
+            repo_id=SPLITS_REPO,
+            repo_type="dataset",
+        )
+
+
+@app.function
+def pool_prefix(model_name: str) -> str:
+    """Artifact path prefix for a backbone's candidate pools.
+
+    The default backbone keeps the original flat helpsteer2/ layout the hub
+    artifacts already use; other backbones get their own subfolder so runs
+    cannot clobber each other.
+    """
+    if model_name == DEFAULT_BASE_MODEL:
+        return "helpsteer2"
+    return f"helpsteer2/{model_name.split('/')[-1].lower()}"
+
+
+@app.function
+def artifact_path(filename: str, prefix: str = DATASET) -> Path:
     """Download a results artifact, returning its local cache path."""
     return Path(
-        hf_hub_download(ARTIFACTS_REPO, f"{DATASET}/{filename}", repo_type="dataset")
+        hf_hub_download(ARTIFACTS_REPO, f"{prefix}/{filename}", repo_type="dataset")
     )
 
 
 @app.function
-def artifact_exists(filename: str) -> bool:
+def artifact_exists(filename: str, prefix: str = DATASET) -> bool:
     """Check whether a results artifact exists on the hub."""
-    return file_exists(ARTIFACTS_REPO, f"{DATASET}/{filename}", repo_type="dataset")
+    return file_exists(ARTIFACTS_REPO, f"{prefix}/{filename}", repo_type="dataset")
 
 
 @app.function
@@ -208,25 +244,15 @@ def upload_model(local_path: Path) -> None:
 
 
 @app.function
-def upload_artifact(local_path: Path) -> None:
+def upload_artifact(local_path: Path, prefix: str = DATASET) -> None:
     """Upload a results artifact to the hub."""
     api = HfApi()
-    api.create_repo(ARTIFACTS_REPO, repo_type="dataset", exist_ok=True)
     api.upload_file(
         path_or_fileobj=local_path,
-        path_in_repo=f"{DATASET}/{local_path.name}",
+        path_in_repo=f"{prefix}/{local_path.name}",
         repo_id=ARTIFACTS_REPO,
         repo_type="dataset",
     )
-
-
-@app.function
-def upload_dataframe(filename: str, dataframe: pd.DataFrame) -> None:
-    """Upload a dataframe to the artifacts repo as a parquet file."""
-    with tempfile.TemporaryDirectory() as temp_name:
-        path = Path(temp_name) / filename
-        dataframe.to_parquet(path)
-        upload_artifact(path)
 
 
 @app.class_definition
@@ -459,6 +485,134 @@ def load_reward_model(
     """Rebuild a saved pairwise model; returns it with its criterion columns."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     model = PairwisePreferenceModel(
+        checkpoint["encoder_name"],
+        AutoTokenizer.from_pretrained(checkpoint["encoder_name"]),
+        checkpoint["max_tokens"],
+        len(checkpoint["criterion_columns"]),
+    )
+    model.scorer.load_state_dict(checkpoint["state_dict"])
+    if device is not None:
+        model.to(device)
+    model.eval()
+    return model, checkpoint["criterion_columns"]
+
+
+@app.function
+def pointwise_text(prompt: str, response: str) -> str:
+    """Format a prompt with a single response for pointwise reward scoring."""
+    return f"{prompt}\n\n[RESPONSE]\n{response}"
+
+
+@app.class_definition
+class BradleyTerryRewardModel(torch.nn.Module):
+    """Pointwise reward model trained with a graded Bradley-Terry objective.
+
+    Reuses the pairwise model's ``MultiHeadEncoder`` backbone unchanged; only
+    the input format (one response per input) and the logit construction
+    (difference of two pointwise scores) differ. Implements ``batch_logits``
+    and ``compute_loss`` with the ``PairwisePreferenceModel`` signatures so
+    the training loop and metrics work on it unmodified.
+    """
+
+    def __init__(
+        self,
+        encoder_name: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_tokens: int,
+        head_count: int,
+    ) -> None:
+        """Wrap a multi-head encoder with its tokenizer and truncation limit."""
+        super().__init__()
+        self.scorer = MultiHeadEncoder(encoder_name, head_count)
+        self.tokenizer = tokenizer
+        self.max_tokens = max_tokens
+
+    def score(self, texts: list[str], device: str) -> torch.Tensor:
+        """Tokenize texts and return per-criterion pointwise rewards.
+
+        Right truncation cuts an overlong response's tail; both responses of a
+        pair are scored in separate inputs under the same rule, so unlike the
+        joint pairwise format no presentation-order bias can arise.
+        """
+        tokenized = self.tokenizer(
+            texts,
+            truncation=True,
+            max_length=self.max_tokens,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = {key: value.to(device) for key, value in tokenized.items()}
+        if device.startswith("cuda"):
+            with torch.autocast("cuda", torch.bfloat16):
+                return self.scorer(inputs)
+        return self.scorer(inputs)
+
+    def batch_logits(self, batch: Batch, device: str) -> torch.Tensor:
+        """Bradley-Terry pair logits: pointwise reward difference per criterion.
+
+        The two sides run as separate forwards so each is padded to its own
+        longest member rather than the joint maximum.
+        """
+        first = self.score(
+            [
+                pointwise_text(prompt, response)
+                for prompt, response in zip(
+                    batch["prompt"], batch["first_response"], strict=True
+                )
+            ],
+            device,
+        )
+        second = self.score(
+            [
+                pointwise_text(prompt, response)
+                for prompt, response in zip(
+                    batch["prompt"], batch["second_response"], strict=True
+                )
+            ],
+            device,
+        )
+        return first - second
+
+    def compute_loss(self, batch: Batch, device: str) -> torch.Tensor:
+        """Masked binary cross-entropy between the pair logits and targets."""
+        return masked_binary_cross_entropy(
+            self.batch_logits(batch, device), batch, device
+        )
+
+
+@app.function
+def save_bt_reward_model(
+    model: BradleyTerryRewardModel,
+    criterion_columns: list[str],
+    encoder_name: str,
+    path: str | Path,
+) -> None:
+    """Save a checkpoint with everything needed to rebuild the model."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            # The type tag keeps a BT checkpoint from being silently rebuilt
+            # as a pairwise model by load_reward_model
+            "model_type": "bradley_terry",
+            "encoder_name": encoder_name,
+            "criterion_columns": criterion_columns,
+            "max_tokens": model.max_tokens,
+            "state_dict": model.scorer.state_dict(),
+        },
+        path,
+    )
+
+
+@app.function
+def load_bt_reward_model(
+    path: str | Path, device: str | None = None
+) -> tuple[BradleyTerryRewardModel, list[str]]:
+    """Rebuild a saved BT model; returns it with its criterion columns."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    assert checkpoint.get("model_type") == "bradley_terry", checkpoint.get(
+        "model_type"
+    )
+    model = BradleyTerryRewardModel(
         checkpoint["encoder_name"],
         AutoTokenizer.from_pretrained(checkpoint["encoder_name"]),
         checkpoint["max_tokens"],
@@ -873,11 +1027,37 @@ def preference_tensor(
 
 
 @app.function
+def bt_preference_tensor(
+    model,
+    prompt: str,
+    responses: list[str],
+    device: str,
+    batch_size: int = 16,
+) -> np.ndarray:
+    """Bradley-Terry win probabilities, shape (head, response, response).
+
+    One pointwise forward per response; the sigmoid of reward differences is
+    exactly skew-symmetric with a 0.5 diagonal by construction.
+    """
+    texts = [pointwise_text(prompt, response) for response in responses]
+    reward_batches = []
+    with torch.no_grad():
+        for start in range(0, len(texts), batch_size):
+            reward_batches.append(
+                model.score(texts[start : start + batch_size], device).cpu()
+            )
+    rewards = torch.cat(reward_batches).T
+    logits = rewards.unsqueeze(2) - rewards.unsqueeze(1)
+    return torch.sigmoid(logits).double().numpy()
+
+
+@app.function
 def upload_tensors(
     filename: str,
     prompts: list[str],
     criteria: list[str],
     tensor_arrays: dict[str, np.ndarray],
+    prefix: str = DATASET,
 ) -> None:
     """Upload scored tensors, the prompts key covering only scored prompts.
 
@@ -893,17 +1073,17 @@ def upload_tensors(
             criteria=np.array(criteria),
             **tensor_arrays,  # pyright: ignore[reportArgumentType]
         )
-        upload_artifact(path)
+        upload_artifact(path, prefix)
 
 
 @app.function
 def resume_tensors(
-    filename: str, prompts: list[str], criteria: list[str]
+    filename: str, prompts: list[str], criteria: list[str], prefix: str = DATASET
 ) -> dict[str, np.ndarray]:
     """Reload previously scored tensors from a partial hub artifact, if any."""
-    if not artifact_exists(filename):
+    if not artifact_exists(filename, prefix):
         return {}
-    saved = np.load(artifact_path(filename))
+    saved = np.load(artifact_path(filename, prefix))
     saved_prompts = saved["prompts"].tolist()
     assert saved["criteria"].tolist() == criteria
     # A checkpoint from a different prompt order or split must not be resumed:
@@ -1004,7 +1184,7 @@ def _():
 @app.cell
 def _(split_pairs_dataframe, upload_button):
     mo.stop(not upload_button.value)
-    upload_dataframe("pairs.parquet", split_pairs_dataframe)
+    upload_pairs(split_pairs_dataframe)
 
 
 @app.cell(hide_code=True)
@@ -1026,7 +1206,7 @@ def _():
 
 @app.cell
 def _():
-    downloaded_pairs = pd.read_parquet(artifact_path("pairs.parquet"))
+    downloaded_pairs = pd.read_parquet(pairs_path())
     criterion_columns = [*HELPSTEER2_ATTRIBUTES, "overall"]
     criterion_columns
     return criterion_columns, downloaded_pairs
@@ -1081,68 +1261,105 @@ def _():
     mo.md(r"""
     ## Preference tensors
 
-    Scoring checkpoints to the hub every 10 prompts and resumes from the
-    partial artifact, so a run can pick up where a dead session stopped.
+    Scores the selected backbone's pool under both hub checkpoints: the
+    pairwise model into preference_tensors.npz and the Bradley-Terry model
+    into preference_tensors_bt.npz. Scoring checkpoints to the hub every 10
+    prompts and resumes from the partial artifact, so a run can pick up where
+    a dead session stopped.
     """)
 
 
 @app.cell
 def _():
+    score_model_dropdown = mo.ui.dropdown(
+        options=[
+            DEFAULT_BASE_MODEL,
+            "google/gemma-2b-it",
+            "mistralai/Mistral-7B-Instruct-v0.3",
+        ],
+        value=DEFAULT_BASE_MODEL,
+        label="base model",
+    )
     score_button = mo.ui.run_button(label="Score preference tensors")
-    score_button
-    return (score_button,)
+    mo.hstack([score_model_dropdown, score_button], justify="start")
+    return score_button, score_model_dropdown
 
 
 @app.cell
-def _(score_button):
+def _(score_button, score_model_dropdown):
     mo.stop(not score_button.value)
+    scoring_prefix = pool_prefix(score_model_dropdown.value)
     mo.stop(
-        not artifact_exists("candidates.parquet"),
+        not artifact_exists("candidates.parquet", scoring_prefix),
         mo.md("candidates.parquet is not on the hub yet, generate candidates first."),
     )
-    candidates_dataframe = pd.read_parquet(artifact_path("candidates.parquet"))
+    candidates_dataframe = pd.read_parquet(
+        artifact_path("candidates.parquet", scoring_prefix)
+    )
     # Row order is the canonical evaluation-prompt order
     evaluation_prompts = candidates_dataframe["prompt"].drop_duplicates().tolist()
     scoring_device = default_device()
     # The full n-by-n tensor is precomputed here because the Blackwell winner
-    # is a max-min over the whole pool. The judging model in the experiments
-    # notebook needs only the policy support atoms against the anchor, so it
-    # scores those on demand instead
-    scoring_model, scoring_columns = load_reward_model(
-        model_path("pairwise.pt"), scoring_device
-    )
-    tensors_file = "preference_tensors.npz"
-    tensor_arrays = resume_tensors(tensors_file, evaluation_prompts, scoring_columns)
-    for tensor_index, tensor_prompt in enumerate(
-        mo.status.progress_bar(evaluation_prompts, title="inference")
+    # is a max-min over the whole pool; the anchor rides at the last
+    # sample_index and pool prefixes slice past it
+    for checkpoint_file, tensors_file, load_scorer, build_tensor in (
+        (
+            "pairwise_lr5e-6_bf16.pt",
+            "preference_tensors.npz",
+            load_reward_model,
+            preference_tensor,
+        ),
+        (
+            "bt_lr5e-6_bf16.pt",
+            "preference_tensors_bt.npz",
+            load_bt_reward_model,
+            bt_preference_tensor,
+        ),
     ):
-        if f"tensor_{tensor_index}" in tensor_arrays:
-            continue
-        prompt_candidates = candidates_dataframe[
-            candidates_dataframe["prompt"] == tensor_prompt
-        ].sort_values("sample_index")  # pyright: ignore[reportCallIssue]
-        # The anchor rides at the last sample_index; pool prefixes slice
-        # past it
-        tensor_arrays[f"tensor_{tensor_index}"] = preference_tensor(
-            scoring_model,
-            tensor_prompt,
-            prompt_candidates["response"].tolist(),
-            scoring_device,
-            batch_size=16,
+        scoring_model, scoring_columns = load_scorer(
+            model_path(checkpoint_file), scoring_device
         )
-        if (tensor_index + 1) % 10 == 0:
-            upload_tensors(
-                tensors_file, evaluation_prompts, scoring_columns, tensor_arrays
+        tensor_arrays = resume_tensors(
+            tensors_file, evaluation_prompts, scoring_columns, scoring_prefix
+        )
+        for tensor_index, tensor_prompt in enumerate(
+            mo.status.progress_bar(evaluation_prompts, title=checkpoint_file)
+        ):
+            if f"tensor_{tensor_index}" in tensor_arrays:
+                continue
+            prompt_candidates = candidates_dataframe[
+                candidates_dataframe["prompt"] == tensor_prompt
+            ].sort_values("sample_index")  # pyright: ignore[reportCallIssue]
+            tensor_arrays[f"tensor_{tensor_index}"] = build_tensor(
+                scoring_model,
+                tensor_prompt,
+                prompt_candidates["response"].tolist(),
+                scoring_device,
+                batch_size=16,
             )
-            if scoring_device.startswith("cuda"):
-                print(
-                    f"prompt {tensor_index + 1}: "
-                    f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB allocated"
+            if (tensor_index + 1) % 10 == 0:
+                upload_tensors(
+                    tensors_file,
+                    evaluation_prompts,
+                    scoring_columns,
+                    tensor_arrays,
+                    scoring_prefix,
                 )
-    upload_tensors(tensors_file, evaluation_prompts, scoring_columns, tensor_arrays)
-    scoring_model.to("cpu")
-    if scoring_device.startswith("cuda"):
-        torch.cuda.empty_cache()
+                if scoring_device.startswith("cuda"):
+                    print(
+                        f"prompt {tensor_index + 1}: "
+                        f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB allocated"
+                    )
+        upload_tensors(
+            tensors_file,
+            evaluation_prompts,
+            scoring_columns,
+            tensor_arrays,
+            scoring_prefix,
+        )
+        scoring_model.to("cpu")
+        if scoring_device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

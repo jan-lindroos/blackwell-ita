@@ -22,7 +22,7 @@ import pandas as pd
 import torch
 import wandb
 from torch.utils.data import DataLoader, Subset
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notebooks"))
 
@@ -30,130 +30,6 @@ import train_prefs as tp
 
 # Held out for the downstream ITA experiment; see notebooks/experiments.py
 ITA_HOLDOUT_COUNT = 100
-
-
-def pointwise_text(prompt: str, response: str) -> str:
-    """Format a prompt with a single response for pointwise reward scoring."""
-    return f"{prompt}\n\n[RESPONSE]\n{response}"
-
-
-class BradleyTerryRewardModel(torch.nn.Module):
-    """Pointwise reward model trained with a graded Bradley-Terry objective.
-
-    Reuses the pairwise model's ``MultiHeadEncoder`` backbone unchanged; only
-    the input format (one response per input) and the logit construction
-    (difference of two pointwise scores) differ. Implements ``batch_logits``
-    and ``compute_loss`` with the ``PairwisePreferenceModel`` signatures so the
-    notebook's training loop and metrics work on it unmodified.
-    """
-
-    def __init__(
-        self,
-        encoder_name: str,
-        tokenizer: PreTrainedTokenizerBase,
-        max_tokens: int,
-        head_count: int,
-    ) -> None:
-        """Wrap a multi-head encoder with its tokenizer and truncation limit."""
-        super().__init__()
-        self.scorer = tp.MultiHeadEncoder(encoder_name, head_count)
-        self.tokenizer = tokenizer
-        self.max_tokens = max_tokens
-
-    def score(self, texts: list[str], device: str) -> torch.Tensor:
-        """Tokenize texts and return per-criterion pointwise rewards.
-
-        Right truncation cuts an overlong response's tail; both responses of a
-        pair are scored in separate inputs under the same rule, so unlike the
-        joint pairwise format no presentation-order bias can arise.
-        """
-        tokenized = self.tokenizer(
-            texts,
-            truncation=True,
-            max_length=self.max_tokens,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = {key: value.to(device) for key, value in tokenized.items()}
-        if device.startswith("cuda"):
-            with torch.autocast("cuda", torch.bfloat16):
-                return self.scorer(inputs)
-        return self.scorer(inputs)
-
-    def batch_logits(self, batch: tp.Batch, device: str) -> torch.Tensor:
-        """Bradley-Terry pair logits: pointwise reward difference per criterion.
-
-        The two sides run as separate forwards so each is padded to its own
-        longest member rather than the joint maximum.
-        """
-        first = self.score(
-            [
-                pointwise_text(prompt, response)
-                for prompt, response in zip(
-                    batch["prompt"], batch["first_response"], strict=True
-                )
-            ],
-            device,
-        )
-        second = self.score(
-            [
-                pointwise_text(prompt, response)
-                for prompt, response in zip(
-                    batch["prompt"], batch["second_response"], strict=True
-                )
-            ],
-            device,
-        )
-        return first - second
-
-    def compute_loss(self, batch: tp.Batch, device: str) -> torch.Tensor:
-        """Masked binary cross-entropy between the pair logits and targets."""
-        return tp.masked_binary_cross_entropy(
-            self.batch_logits(batch, device), batch, device
-        )
-
-
-def save_bt_reward_model(
-    model: BradleyTerryRewardModel,
-    criterion_columns: list[str],
-    encoder_name: str,
-    path: str | Path,
-) -> None:
-    """Save a checkpoint with everything needed to rebuild the model."""
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            # The type tag keeps a BT checkpoint from being silently rebuilt
-            # as a pairwise model by the notebooks' load_reward_model
-            "model_type": "bradley_terry",
-            "encoder_name": encoder_name,
-            "criterion_columns": criterion_columns,
-            "max_tokens": model.max_tokens,
-            "state_dict": model.scorer.state_dict(),
-        },
-        path,
-    )
-
-
-def load_bt_reward_model(
-    path: str | Path, device: str | None = None
-) -> tuple[BradleyTerryRewardModel, list[str]]:
-    """Rebuild a saved BT model; returns it with its criterion columns."""
-    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    assert checkpoint.get("model_type") == "bradley_terry", checkpoint.get(
-        "model_type"
-    )
-    model = BradleyTerryRewardModel(
-        checkpoint["encoder_name"],
-        AutoTokenizer.from_pretrained(checkpoint["encoder_name"]),
-        checkpoint["max_tokens"],
-        len(checkpoint["criterion_columns"]),
-    )
-    model.scorer.load_state_dict(checkpoint["state_dict"])
-    if device is not None:
-        model.to(device)
-    model.eval()
-    return model, checkpoint["criterion_columns"]
 
 
 def load_split_pairs(pairs_path: Path | None) -> pd.DataFrame:
@@ -165,7 +41,7 @@ def load_split_pairs(pairs_path: Path | None) -> pd.DataFrame:
     if pairs_path is not None:
         return pd.read_parquet(pairs_path)
     try:
-        return pd.read_parquet(tp.artifact_path("pairs.parquet"))
+        return pd.read_parquet(tp.pairs_path())
     except Exception as error:  # noqa: BLE001
         print(f"hub pairs unavailable ({error}); rebuilding from source")
     import datasets
@@ -343,7 +219,7 @@ def main() -> None:
         batch_size=args.batch_size,
         augment_presentation_order=True,
     )
-    model = BradleyTerryRewardModel(
+    model = tp.BradleyTerryRewardModel(
         args.encoder,
         AutoTokenizer.from_pretrained(args.encoder),
         args.max_tokens,
@@ -432,7 +308,7 @@ def main() -> None:
         )
     model.to("cpu")
     checkpoint_path = args.output_dir / "bt.pt"
-    save_bt_reward_model(model, criterion_columns, args.encoder, checkpoint_path)
+    tp.save_bt_reward_model(model, criterion_columns, args.encoder, checkpoint_path)
     wandb.log(
         {"best_validation_loss": best_validation_loss}
         | {

@@ -28,26 +28,39 @@ with app.setup:
     from huggingface_hub import HfApi, hf_hub_download
     from transformers import AutoTokenizer
 
-    ARTIFACTS_REPO = "blackwell-ita/blackwell-ita-artifacts"
+    ARTIFACTS_REPO = "blackwell-ita/artifacts"
+    SPLITS_REPO = "blackwell-ita/helpsteer2-splits"
+    DEFAULT_BASE_MODEL = "RLHFlow/LLaMA3-SFT-v2"
 
 
 @app.function
-def artifact_path(filename: str) -> Path:
-    """Download a helpsteer2 artifact, returning its local cache path."""
-    return Path(
-        hf_hub_download(ARTIFACTS_REPO, f"helpsteer2/{filename}", repo_type="dataset")
-    )
+def pairs_path() -> Path:
+    """Download the canonical split pairs, returning the local cache path."""
+    return Path(hf_hub_download(SPLITS_REPO, "pairs.parquet", repo_type="dataset"))
 
 
 @app.function
-def upload_dataframe(filename: str, dataframe: pd.DataFrame) -> None:
-    """Upload a dataframe to the artifacts repo as a helpsteer2 parquet file."""
+def pool_prefix(model_name: str) -> str:
+    """Artifact path prefix for a backbone's candidate pools.
+
+    The default backbone keeps the original flat helpsteer2/ layout the hub
+    artifacts already use; other backbones get their own subfolder so runs
+    cannot clobber each other.
+    """
+    if model_name == DEFAULT_BASE_MODEL:
+        return "helpsteer2"
+    return f"helpsteer2/{model_name.split('/')[-1].lower()}"
+
+
+@app.function
+def upload_dataframe(filename: str, dataframe: pd.DataFrame, prefix: str) -> None:
+    """Upload a dataframe to the artifacts repo as a parquet file."""
     with tempfile.TemporaryDirectory() as temp_name:
         path = Path(temp_name) / filename
         dataframe.to_parquet(path)
         HfApi().upload_file(
             path_or_fileobj=path,
-            path_in_repo=f"helpsteer2/{filename}",
+            path_in_repo=f"{prefix}/{filename}",
             repo_id=ARTIFACTS_REPO,
             repo_type="dataset",
         )
@@ -143,11 +156,11 @@ def _():
 def _():
     base_model_dropdown = mo.ui.dropdown(
         options=[
-            "RLHFlow/LLaMA3-SFT-v2",
+            DEFAULT_BASE_MODEL,
             "google/gemma-2b-it",
             "mistralai/Mistral-7B-Instruct-v0.3",
         ],
-        value="RLHFlow/LLaMA3-SFT-v2",
+        value=DEFAULT_BASE_MODEL,
         label="base model",
     )
     samples_per_prompt = 128
@@ -157,7 +170,7 @@ def _():
 
 @app.cell
 def _():
-    pairs_dataframe = pd.read_parquet(artifact_path("pairs.parquet"))
+    pairs_dataframe = pd.read_parquet(pairs_path())
     anchors_dataframe = select_anchors(pairs_dataframe)
     len(anchors_dataframe)
     return (anchors_dataframe,)
@@ -188,8 +201,10 @@ def _(anchors_dataframe, base_model_dropdown, generate_button, samples_per_promp
             AutoTokenizer.from_pretrained(base_model_name),
         )
     )
-    upload_dataframe("anchors.parquet", anchors_dataframe)
-    upload_dataframe("candidates.parquet", candidates_dataframe)
+    upload_dataframe("anchors.parquet", anchors_dataframe, pool_prefix(base_model_name))
+    upload_dataframe(
+        "candidates.parquet", candidates_dataframe, pool_prefix(base_model_name)
+    )
     candidates_dataframe
 
 if __name__ == "__main__":
