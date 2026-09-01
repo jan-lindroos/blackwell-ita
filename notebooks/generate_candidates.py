@@ -5,12 +5,12 @@
 #     "huggingface_hub",
 #     "pandas",
 #     "pyarrow",
-#     "torch",
 #     # molab's base image leaks a torchvision built against a different
 #     # torch. Install a matching one so transformers doesn't import the
 #     # broken system copy
 #     "torchvision",
 #     "transformers",
+#     "vllm",
 # ]
 # ///
 
@@ -25,9 +25,8 @@ with app.setup:
 
     import marimo as mo
     import pandas as pd
-    import torch
     from huggingface_hub import HfApi, hf_hub_download
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     ARTIFACTS_REPO = "blackwell-ita/blackwell-ita-artifacts"
 
@@ -73,12 +72,6 @@ def select_anchors(pairs: pd.DataFrame) -> pd.DataFrame:
 
 
 @app.function
-def batch_sizes(total: int, batch_size: int) -> list[int]:
-    """Split a sample count into generate() batch sizes."""
-    return [min(batch_size, total - start) for start in range(0, total, batch_size)]
-
-
-@app.function
 def combine_with_anchors(
     candidates: pd.DataFrame, anchors: pd.DataFrame, samples_per_prompt: int
 ) -> pd.DataFrame:
@@ -110,60 +103,32 @@ def token_counts(texts: list[str], tokenizer) -> list[int]:
 
 
 @app.function
-def default_device() -> str:
-    """Pick the best available torch device: cuda, then mps, then cpu."""
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-@app.function
 def generate_candidates(
     model_name: str,
     prompts: list[str],
     samples_per_prompt: int,
     max_new_tokens: int = 1024,
     temperature: float = 1.0,
-    batch_size: int = 8,
     seed: int = 1810,
-    device: str | None = None,
 ) -> pd.DataFrame:
-    """Sample responses per prompt; returns a (prompt, response) dataframe."""
-    if device is None:
-        device = default_device()
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    # transformers 5 annotates generate()'s self with a ty-only Protocol that
-    # pyright rejects, hence the targeted ignores here and on generate()
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype="auto").to(device)  # pyright: ignore[reportArgumentType]
-    torch.manual_seed(seed)
-    rows = []
-    for prompt in mo.status.progress_bar(prompts, title="prompts"):
-        inputs = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            add_generation_prompt=True,
-            return_tensors="pt",
-        ).to(device)
-        for count in batch_sizes(samples_per_prompt, batch_size):
-            outputs = model.generate(  # pyright: ignore[reportAttributeAccessIssue]
-                **inputs,
-                do_sample=True,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-                num_return_sequences=count,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-            rows.extend(
-                {
-                    "prompt": prompt,
-                    "response": tokenizer.decode(
-                        output[inputs["input_ids"].shape[1] :], skip_special_tokens=True
-                    ),
-                }
-                for output in outputs
-            )
-    return pd.DataFrame(rows)
+    """Sample responses per prompt with vLLM; returns a (prompt, response) dataframe."""
+    # imported lazily: vllm has no macOS wheels, and tests import this module
+    from vllm import LLM, SamplingParams  # pyright: ignore[reportMissingImports]
+
+    llm = LLM(model=model_name)
+    params = SamplingParams(
+        n=samples_per_prompt,
+        temperature=temperature,
+        max_tokens=max_new_tokens,
+        seed=seed,
+    )
+    conversations = [[{"role": "user", "content": prompt}] for prompt in prompts]
+    outputs = llm.chat(conversations, params)
+    return pd.DataFrame(
+        {"prompt": prompt, "response": completion.text}
+        for prompt, output in zip(prompts, outputs, strict=True)
+        for completion in output.outputs
+    )
 
 
 @app.cell(hide_code=True)
