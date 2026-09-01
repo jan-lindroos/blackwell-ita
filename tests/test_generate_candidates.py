@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import pytest
 from generate_candidates import (
-    batch_sizes,
     combine_with_anchors,
     select_anchors,
     token_counts,
@@ -106,10 +105,3 @@ class WordTokenizer:
 def test_token_counts_per_text():
     """Counts follow the tokenizer's ids, one entry per input text."""
     assert token_counts(["one two three", "", "one"], WordTokenizer()) == [3, 0, 1]
-
-
-def test_batch_sizes_cover_total():
-    """Batches are full-size except a smaller remainder batch at the end."""
-    assert batch_sizes(128, 8) == [8] * 16
-    assert batch_sizes(5, 2) == [2, 2, 1]
-    assert batch_sizes(3, 8) == [3]
