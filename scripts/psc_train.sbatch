@@ -24,6 +24,10 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # wandb key; fall back to the one-time key file (create with:
 #   printf '%s\n' "<key>" > ~/.wandb_key && chmod 600 ~/.wandb_key )
 export WANDB_API_KEY="${WANDB_API_KEY:-$(cat ~/.wandb_key 2>/dev/null || true)}"
+# Gated repos (Llama among them) need a token, and HF_HOME points at Ocean
+# below, so a token file written by `hf auth login` in a plain shell lands
+# somewhere the job does not look. The env var wins over the file either way.
+export HF_TOKEN="${HF_TOKEN:-$(cat "$HOME/.hf_token" 2>/dev/null || true)}"
 # Keep model downloads and wandb files on Ocean, not the small home quota
 export HF_HOME="${PROJECT:-$PWD}/hf_cache"
 export WANDB_DIR="${PROJECT:-$PWD}/wandb_logs"

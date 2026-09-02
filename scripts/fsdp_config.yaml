@@ -1,0 +1,32 @@
+# Passed to `accelerate launch --config_file`. The equivalent command-line
+# flags are parsed inconsistently enough that use_orig_params silently stayed
+# false, which flattens every parameter into a 1-D FlatParameter and breaks
+# the embedding lookup with "'weight' must be 2-D".
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+mixed_precision: 'no'          # the encoder is deliberately fp32; see MultiHeadEncoder
+use_cpu: false
+fsdp_config:
+  fsdp_version: 1
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  # Named explicitly rather than left to accelerate's lookup: unset, the
+  # launcher passes the literal string "None" as the class to wrap, nothing
+  # matches, and only the root module gets wrapped. Change this with the
+  # encoder family (Qwen3DecoderLayer, MistralDecoderLayer, ...)
+  fsdp_transformer_layer_cls_to_wrap: LlamaDecoderLayer
+  # FULL_STATE_DICT rather than SHARDED: the sharded path saves and loads
+  # optimizer state through FSDP.optim_state_dict, and a mismatch between the
+  # two contexts loses it -- "Missing key in checkpoint state_dict:
+  # optimizer.param_groups" on the first restore. Gathering the whole model to
+  # rank 0 per snapshot costs a minute on an 8B model, which is the cheaper
+  # side of that trade.
+  fsdp_state_dict_type: FULL_STATE_DICT
+  # Keeps parameters as their own 2-D tensors instead of one flat buffer, so
+  # nn.Embedding and nn.Linear still see the shapes they expect
+  fsdp_use_orig_params: true
+  fsdp_offload_params: false
+  fsdp_cpu_ram_efficient_loading: false
+  fsdp_sync_module_states: true
+  fsdp_forward_prefetch: false
+  fsdp_backward_prefetch: BACKWARD_PRE

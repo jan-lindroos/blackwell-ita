@@ -21,7 +21,7 @@ import pandas as pd
 import torch
 import wandb
 from torch.utils.data import DataLoader, Subset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notebooks"))
 
@@ -29,6 +29,35 @@ import train_prefs as tp
 
 # Held out for the downstream ITA experiment; see notebooks/experiments.py
 ITA_HOLDOUT_COUNT = 100
+
+
+def build_tokenizer(encoder_name: str) -> PreTrainedTokenizerBase:
+    """Load the encoder's tokenizer, giving it a pad token if it has none.
+
+    Llama-3.1 and friends ship without one, and score() pads every batch to
+    its longest sequence.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(encoder_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def gathered_scorer_state(model, accelerator) -> dict | None:
+    """The encoder's full state dict, gathered when the model is sharded.
+
+    Collective, so every rank calls it even though only the main process
+    writes the checkpoint. None when there is nothing to gather.
+    """
+    if accelerator is None:
+        return None
+    prefix = "scorer."
+    return {
+        key.removeprefix(prefix): value
+        for key, value in accelerator.get_state_dict(model).items()
+        if key.startswith(prefix)
+    }
+
 
 
 def load_split_pairs(pairs_path: Path | None) -> pd.DataFrame:
@@ -154,6 +183,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1810)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--distributed",
+        action="store_true",
+        help="shard the model across processes with accelerate/FSDP; launch"
+        " under `accelerate launch` or torchrun. Needed for encoders whose"
+        " fp32 optimiser state alone exceeds one GPU",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints"))
     parser.add_argument("--wandb-project", default="blackwell-ita-rm-comparison")
     parser.add_argument("--wandb-run-name", default=None)
@@ -186,29 +222,41 @@ def main() -> None:
             )
         )
         frame = frame[frame["prompt"].isin(kept_prompts)]
-    device = args.device if args.device else tp.default_device()
-    if device == "cpu" and args.device is None:
+    accelerator = None
+    if args.distributed:
+        from accelerate import Accelerator
+
+        accelerator = Accelerator()
+    device = (
+        str(accelerator.device)
+        if accelerator is not None
+        else (args.device if args.device else tp.default_device())
+    )
+    on_main = accelerator is None or accelerator.is_main_process
+    if device == "cpu" and args.device is None and accelerator is None:
         raise RuntimeError(
             "no GPU is visible to torch (torch.cuda.is_available() is False); "
             "refusing to silently train a 4B model on CPU. "
             "Pass --device cpu to force CPU training."
         )
-    wandb.init(
-        project=args.wandb_project,
-        name=args.wandb_run_name or "pairwise-preference",
-        config={
-            "model_type": "pairwise_preference",
-            "criterion_columns": criterion_columns,
-            "training_pairs": len(frame),
-            "evaluation_pairs": len(evaluation_frame),
-            "augment_presentation_order": True,
-            "device": device,
-        }
-        | {
-            key: str(value) if isinstance(value, Path) else value
-            for key, value in vars(args).items()
-        },
-    )
+    if on_main:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name or "pairwise-preference",
+            config={
+                "model_type": "pairwise_preference",
+                "criterion_columns": criterion_columns,
+                "training_pairs": len(frame),
+                "evaluation_pairs": len(evaluation_frame),
+                "augment_presentation_order": True,
+                "device": device,
+            }
+            | {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in vars(args).items()
+            },
+        )
+
     # Seeded before model construction and loader iteration: with the same
     # seed both compared runs share head initialisation and batch order
     torch.manual_seed(args.seed)
@@ -221,10 +269,21 @@ def main() -> None:
     )
     model = tp.PairwisePreferenceModel(
         args.encoder,
-        AutoTokenizer.from_pretrained(args.encoder),
+        build_tokenizer(args.encoder),
         args.max_tokens,
         len(criterion_columns),
     )
+    if accelerator is not None:
+        # Onto the device before sharding. A transformer-based auto-wrap policy
+        # only wraps the decoder layers, so the embedding, the final norm and
+        # the head sit outside every wrapped unit and FSDP leaves them wherever
+        # they already are — on the CPU, where the first embedding lookup meets
+        # input ids that are not. The full model is resident only until
+        # prepare() shards it away.
+        model.to(accelerator.device)
+        # Prepared here rather than inside the training loop so the caller
+        # keeps the sharded handle it has to save from
+        model = accelerator.prepare(model)
     # Evaluation passes are no-grad and memory-cheap, so they run at their own
     # batch size rather than the training micro-batch
     validation_loader = DataLoader(
@@ -265,10 +324,16 @@ def main() -> None:
         eval_every=args.eval_every if args.eval_every > 0 else None,
         eval_loader=eval_loader,
         eval_criteria=criterion_columns,
+        accelerator=accelerator,
+        # Derived from the arguments rather than created per rank: every rank
+        # parses the same output-dir, so every rank names the same directory,
+        # which is what save_state's one-shard-per-rank layout requires
+        checkpoint_directory=args.output_dir / ".fsdp-best",
     )
     train_minutes = (time.monotonic() - start_time) / 60.0
-    wandb.log({"train_minutes": train_minutes})
-    if args.max_rounds is not None:
+    if on_main:
+        wandb.log({"train_minutes": train_minutes})
+    if args.max_rounds is not None and on_main:
         print(
             f"{args.max_rounds} round(s) took {train_minutes:.1f} min "
             f"(~{train_minutes / args.max_rounds:.1f} min/round with validation); "
@@ -300,12 +365,17 @@ def main() -> None:
         test_metrics = tp.per_criterion_metrics(
             model, test_loader, criterion_columns, device
         )
-    model.to("cpu")
+    scorer_state = gathered_scorer_state(model, accelerator)
+    if accelerator is None:
+        model.to("cpu")
     checkpoint_path = args.output_dir / "pairwise.pt"
     # The existing save format, so the checkpoint drops straight into the
     # notebooks' load_reward_model and the downstream scoring pipeline
-    tp.save_reward_model(model, criterion_columns, args.encoder, checkpoint_path)
-    wandb.log(
+    if on_main:
+        tp.save_reward_model(
+            model, criterion_columns, args.encoder, checkpoint_path, scorer_state
+        )
+    reported = (
         {"best_validation_loss": best_validation_loss}
         | {
             f"{criterion}/{key}": value
@@ -322,6 +392,13 @@ def main() -> None:
             else {}
         )
     )
+    # Every rank reaches the barrier, so none leaves before the gather above
+    # has finished on all of them
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+    if not on_main:
+        return
+    wandb.log(reported)
     print(f"Saved {checkpoint_path} (best validation loss {best_validation_loss:.4f})")
     for criterion, values in metrics.items():
         print(

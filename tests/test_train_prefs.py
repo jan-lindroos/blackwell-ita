@@ -305,7 +305,9 @@ class FixedLossModel(torch.nn.Module):
         super().__init__()
         self.losses = iter(losses)
 
-    def compute_loss(self, batch: dict, device: str) -> torch.Tensor:
+    def forward(
+        self, batch: dict, device: str, *, as_loss: bool = False
+    ) -> torch.Tensor:
         """Return the next scripted loss."""
         return torch.tensor(next(self.losses))
 
@@ -324,7 +326,9 @@ class FixedLogitsModel(torch.nn.Module):
         super().__init__()
         self.logits = iter(logits)
 
-    def batch_logits(self, batch: dict, device: str) -> torch.Tensor:
+    def forward(
+        self, batch: dict, device: str, *, as_loss: bool = False
+    ) -> torch.Tensor:
         """Return the next scripted logits."""
         return next(self.logits)
 
@@ -378,7 +382,9 @@ class ScriptedModel(torch.nn.Module):
         self.validation_losses = iter(validation_losses)
         self.steps_trained = 0
 
-    def compute_loss(self, batch: dict, device: str) -> torch.Tensor:
+    def forward(
+        self, batch: dict, device: str, *, as_loss: bool = False
+    ) -> torch.Tensor:
         """Stamp the step when training; return the next scripted loss otherwise."""
         if self.training:
             self.steps_trained += 1
@@ -428,8 +434,12 @@ def test_train_until_no_improvement_cycles_loader_for_longer_rounds():
 class ScriptedEvalModel(ScriptedModel):
     """Scripted model that also returns fixed logits for periodic eval."""
 
-    def batch_logits(self, batch: dict, device: str) -> torch.Tensor:
-        """Return constant logits shaped to the batch targets."""
+    def forward(
+        self, batch: dict, device: str, *, as_loss: bool = False
+    ) -> torch.Tensor:
+        """Constant logits for the eval passes; the scripted loss otherwise."""
+        if as_loss or "target" not in batch:
+            return super().forward(batch, device, as_loss=as_loss)
         return torch.zeros_like(batch["target"]) + 1.0
 
 
@@ -501,7 +511,9 @@ def test_train_until_no_improvement_accumulates_micro_batches():
             self.train_losses = iter([1.0, 3.0, 5.0, 7.0])
             self.validation_losses = iter([2.0, 2.5, 2.6])
 
-        def compute_loss(self, batch: dict, device: str) -> torch.Tensor:
+        def forward(
+            self, batch: dict, device: str, *, as_loss: bool = False
+        ) -> torch.Tensor:
             if self.training:
                 return self.weight * 0.0 + next(self.train_losses)
             return self.weight * 0.0 + next(self.validation_losses)

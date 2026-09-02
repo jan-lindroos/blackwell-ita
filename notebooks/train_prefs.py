@@ -23,6 +23,7 @@ app = marimo.App(width="medium")
 
 with app.setup:
     import math
+    import shutil
     import tempfile
     from collections.abc import Callable, Iterable, Iterator
     from itertools import islice
@@ -425,6 +426,24 @@ class PairwisePreferenceModel(torch.nn.Module):
         ]
         return self.score(joint_texts, device)
 
+    def forward(
+        self, batch: Batch, device: str, *, as_loss: bool = False
+    ) -> torch.Tensor:
+        """The batch's logits, or its masked loss when ``as_loss``.
+
+        The single entry point a wrapper can hook. FSDP installs its
+        all-gather hooks on forward and nowhere else, so a caller that reaches
+        the model through a custom method instead gets the unwrapped module,
+        its parameters still one-dimensional shards, and an embedding lookup
+        that fails on a 1-D weight. Both the training loss and the metrics
+        need a forward, hence the flag rather than two methods: only one of
+        them would be hooked.
+        """
+        logits = self.batch_logits(batch, device)
+        if not as_loss:
+            return logits
+        return masked_binary_cross_entropy(logits, batch, device)
+
     def compute_loss(self, batch: Batch, device: str) -> torch.Tensor:
         """Masked binary cross-entropy between the batch logits and targets."""
         return masked_binary_cross_entropy(
@@ -438,15 +457,23 @@ def save_reward_model(
     criterion_columns: list[str],
     encoder_name: str,
     path: str | Path,
+    scorer_state: dict | None = None,
 ) -> None:
-    """Save a checkpoint with everything needed to rebuild the model."""
+    """Save a checkpoint with everything needed to rebuild the model.
+
+    ``scorer_state`` overrides the encoder's own state dict, for the gathered
+    copy a model sharded across processes has to be saved from: its local
+    state dict holds only this rank's slice, which nothing can reload alone.
+    """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "encoder_name": encoder_name,
             "criterion_columns": criterion_columns,
             "max_tokens": model.max_tokens,
-            "state_dict": model.scorer.state_dict(),
+            "state_dict": (
+                model.scorer.state_dict() if scorer_state is None else scorer_state
+            ),
         },
         path,
     )
@@ -480,7 +507,9 @@ def evaluate_loss(
     """Average the model's loss over all batches without gradients."""
     model.eval()
     with torch.no_grad():
-        losses = [model.compute_loss(batch, device).item() for batch in data_loader]
+        losses = [
+            model(batch, device, as_loss=True).item() for batch in data_loader
+        ]
     return sum(losses) / len(losses)
 
 
@@ -501,7 +530,7 @@ def validation_metrics(
     logit_batches, target_batches, mask_batches = [], [], []
     with torch.no_grad():
         for batch in validation_loader:
-            logit_batches.append(model.batch_logits(batch, device).cpu())
+            logit_batches.append(model(batch, device).cpu())
             target_batches.append(batch["target"])
             mask_batches.append(batch["mask"])
     logits = torch.cat(logit_batches)
@@ -553,6 +582,8 @@ def train_until_no_improvement(
     eval_every: int | None = None,
     eval_loader: Iterable[Batch] | None = None,
     eval_criteria: list[str] | None = None,
+    accelerator=None,
+    checkpoint_directory: Path | None = None,
 ) -> float:
     """Train in rounds of ``steps_per_epoch`` steps, validating after each round.
 
@@ -584,11 +615,43 @@ def train_until_no_improvement(
     read against; the last is the checkpoint that actually gets saved, which
     a periodic tick lands on only by coincidence. This is monitoring only;
     early stopping still follows the per-round validation loss.
+
+    ``accelerator``, when given, is an ``accelerate.Accelerator`` whose model
+    the caller has already prepared, so the parameters are sharded across
+    processes. Every rank must run the same forward passes — a sharded
+    forward is a collective, and a rank that skips one leaves the others
+    waiting on it — so the eval passes run everywhere and only the logging is
+    confined to the main process. For the same reason ``validation_loader``
+    and ``eval_loader`` must NOT be prepared: run whole on every rank they
+    give every rank the same loss, so every rank picks the same round as best
+    and the shards of the restored weights stay in step.
+
+    ``checkpoint_directory`` is where a sharded model's best weights are kept
+    between rounds, and it is required alongside ``accelerator``: every rank
+    writes one shard of the same checkpoint into it, so a directory each rank
+    names for itself scatters the shards and leaves every copy incomplete. It
+    must therefore be derived from something all ranks agree on, and live
+    somewhere they can all read.
     """
     if eval_every is not None and eval_criteria is None:
         raise ValueError("eval_every requires eval_criteria for metric names")
-    model.to(device)
+    if accelerator is None:
+        model.to(device)
+    else:
+        device = str(accelerator.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    if accelerator is not None:
+        # The loader is prepared; the optimizer deliberately is not. Preparing
+        # it registers it for checkpointing, and a sharded fp32 AdamW's moments
+        # are twice the weights -- 64 GB of the 96 GB a snapshot of an 8B model
+        # would write, for state nothing here ever reads back. The snapshot
+        # exists to restore the best weights at the end, not to resume
+        # training. With use_orig_params the parameters keep their own
+        # identities, so a plain optimizer steps the local shards correctly
+        train_loader = accelerator.prepare(train_loader)
+
+    def on_main() -> bool:
+        return accelerator is None or accelerator.is_main_process
 
     def lr_scale(scheduler_step: int) -> float:
         scale = min(1.0, (scheduler_step + 1) / warmup_steps)
@@ -617,6 +680,9 @@ def train_until_no_improvement(
             device,
         )
         assert log_metrics is not None
+        if not on_main():
+            model.train()
+            return
         log_metrics(
             {"step": at_step, f"{prefix}/loss": eval_loss}
             | {
@@ -639,6 +705,43 @@ def train_until_no_improvement(
     batches = cycling_batches()
     best_validation_loss = float("inf")
     best_state: dict[str, torch.Tensor] | None = None
+    has_best = False
+    # A sharded model's state_dict is not portable between ranks and what it
+    # contains varies with the FSDP state-dict type, so the snapshot goes
+    # through the accelerator's own checkpointing instead of memory
+    if accelerator is not None and checkpoint_directory is None:
+        raise ValueError("a sharded model needs checkpoint_directory to snapshot to")
+    best_directory = str(checkpoint_directory) if accelerator is not None else None
+    if best_directory is not None and on_main():
+        Path(best_directory).mkdir(parents=True, exist_ok=True)
+    if accelerator is not None:
+        # The directory has to exist before any rank writes into it
+        accelerator.wait_for_everyone()
+
+    def snapshot_best() -> None:
+        nonlocal best_state
+        if accelerator is None:
+            # CPU copies, not an on-device deepcopy: a 4B model cannot afford
+            # a second device-resident set of weights
+            best_state = {
+                key: value.detach().to("cpu", copy=True)
+                for key, value in model.state_dict().items()
+            }
+        else:
+            accelerator.save_state(best_directory)
+
+    def restore_best() -> None:
+        if accelerator is None:
+            assert best_state is not None
+            model.load_state_dict(best_state)
+            return
+        accelerator.load_state(best_directory)
+        # Read once and never again: leaving it costs the weights of the model
+        # on a shared filesystem, and a failed run already filled one
+        accelerator.wait_for_everyone()
+        if on_main():
+            shutil.rmtree(best_directory, ignore_errors=True)
+
     rounds_without_improvement = 0
     step = 0
     # The untrained baseline: a randomly initialised head on the pretrained
@@ -658,33 +761,45 @@ def train_until_no_improvement(
                 for batch in islice(batches, accumulation_steps):
                     # Scaling before backward keeps the accumulated gradient
                     # the mean over the effective batch
-                    loss = model.compute_loss(batch, device) / accumulation_steps
-                    loss.backward()
+                    loss = model(batch, device, as_loss=True) / accumulation_steps
+                    if accelerator is None:
+                        loss.backward()
+                    else:
+                        accelerator.backward(loss)
                     step_loss += loss.item()
                 optimizer.step()
                 scheduler.step()
                 if log_metrics is not None:
                     # max_norm=inf computes the total gradient norm without
-                    # clipping anything; gradients are unchanged by step()
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), float("inf")
+                    # clipping anything; gradients are unchanged by step().
+                    # Through the accelerator when sharded, since the plain
+                    # call would only see this rank's slice of them
+                    clip = (
+                        torch.nn.utils.clip_grad_norm_
+                        if accelerator is None
+                        else accelerator.clip_grad_norm_
                     )
-                    log_metrics(
-                        {
-                            "step": step + round_step,
-                            "train_loss": step_loss,
-                            "grad_norm": grad_norm.item(),
-                            "learning_rate": scheduler.get_last_lr()[0],
-                        }
-                        # The peak is what an OOM is decided on, and it is
-                        # reached inside a step rather than between them, so it
-                        # cannot be recovered after the fact
-                        | (
-                            {"peak_gib": torch.cuda.max_memory_allocated() / 1024**3}
-                            if device.startswith("cuda")
-                            else {}
+                    grad_norm = clip(model.parameters(), float("inf"))
+                    if on_main():
+                        log_metrics(
+                            {
+                                "step": step + round_step,
+                                "train_loss": step_loss,
+                                "grad_norm": grad_norm.item(),
+                                "learning_rate": scheduler.get_last_lr()[0],
+                            }
+                            # The peak is what an OOM is decided on, and it is
+                            # reached inside a step rather than between them,
+                            # so it cannot be recovered after the fact
+                            | (
+                                {
+                                    "peak_gib": torch.cuda.max_memory_allocated()
+                                    / 1024**3
+                                }
+                                if device.startswith("cuda")
+                                else {}
+                            )
                         )
-                    )
                     if evaluating and (step + round_step) % eval_every == 0:
                         # step() has consumed the gradients and grad_norm has
                         # read them, so they are dead weight — but the next
@@ -701,18 +816,15 @@ def train_until_no_improvement(
         # slice of it
         optimizer.zero_grad(set_to_none=True)
         validation_loss = evaluate_loss(model, validation_loader, device)
-        print(f"step {step}: validation_loss={validation_loss:.4f}")
-        if log_metrics is not None:
+        if on_main():
+            print(f"step {step}: validation_loss={validation_loss:.4f}")
+        if log_metrics is not None and on_main():
             log_metrics({"step": step, "validation_loss": validation_loss})
         if validation_loss < best_validation_loss:
             rounds_without_improvement = 0
             best_validation_loss = validation_loss
-            # CPU copies, not an on-device deepcopy: a 4B model cannot afford
-            # a second device-resident set of weights
-            best_state = {
-                key: value.detach().to("cpu", copy=True)
-                for key, value in model.state_dict().items()
-            }
+            snapshot_best()
+            has_best = True
         else:
             # A NaN validation loss also lands here, so a diverged run
             # exhausts its patience instead of looping forever on NaN >= best
@@ -721,12 +833,12 @@ def train_until_no_improvement(
                 break
         if max_rounds is not None and step >= max_rounds * steps_per_epoch:
             break
-    if best_state is None:
+    if not has_best:
         raise RuntimeError(
             "training produced no best state to restore; "
             f"last validation loss was {validation_loss:.4f}"
         )
-    model.load_state_dict(best_state)
+    restore_best()
     # The restored best weights, not wherever the last periodic tick landed:
     # this is the checkpoint that gets written out
     if evaluating:

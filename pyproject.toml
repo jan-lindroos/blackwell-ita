@@ -5,6 +5,8 @@ description = "Multi-preference inference-time alignment via the Blackwell winne
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    # FSDP sharding for encoders whose fp32 optimiser state exceeds one GPU
+    "accelerate",
     "cvxpy",
     "datasets",
     "huggingface-hub",
