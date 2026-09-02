@@ -18,11 +18,9 @@ import time
 from pathlib import Path
 from typing import cast
 
-import numpy as np
 import pandas as pd
 import torch
 import wandb
-from scipy.special import expit
 from torch.utils.data import DataLoader, Subset
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
@@ -63,222 +61,6 @@ def gathered_scorer_state(model, accelerator) -> dict | None:
 
 
 
-def pointwise_text(prompt: str, response: str) -> str:
-    """Format a prompt with a single response for pointwise reward scoring."""
-    return f"{prompt}\n\n[RESPONSE]\n{response}"
-
-
-class BradleyTerryRewardModel(torch.nn.Module):
-    """Pointwise reward model trained with a graded Bradley-Terry objective.
-
-    Reuses the pairwise model's ``MultiHeadEncoder`` backbone unchanged; only
-    the input format (one response per input) and the logit construction
-    (difference of two pointwise scores) differ. Implements ``batch_logits``
-    and ``compute_loss`` with the ``PairwisePreferenceModel`` signatures so the
-    notebook's training loop and metrics work on it unmodified.
-    """
-
-    def __init__(
-        self,
-        encoder_name: str,
-        tokenizer: PreTrainedTokenizerBase,
-        max_tokens: int,
-        head_count: int,
-    ) -> None:
-        """Wrap a multi-head encoder with its tokenizer and truncation limit."""
-        super().__init__()
-        self.scorer = tp.MultiHeadEncoder(encoder_name, head_count)
-        self.tokenizer = tokenizer
-        self.max_tokens = max_tokens
-
-    def score(self, texts: list[str], device: str) -> torch.Tensor:
-        """Tokenize texts and return per-criterion pointwise rewards.
-
-        Right truncation cuts an overlong response's tail; both responses of a
-        pair are scored in separate inputs under the same rule, so unlike the
-        joint pairwise format no presentation-order bias can arise.
-        """
-        tokenized = self.tokenizer(
-            texts,
-            truncation=True,
-            max_length=self.max_tokens,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = {key: value.to(device) for key, value in tokenized.items()}
-        if device.startswith("cuda"):
-            with torch.autocast("cuda", torch.bfloat16):
-                return self.scorer(inputs)
-        return self.scorer(inputs)
-
-    def batch_logits(self, batch: tp.Batch, device: str) -> torch.Tensor:
-        """Bradley-Terry pair logits: pointwise reward difference per criterion.
-
-        Both sides go through one forward rather than two. Autocast's bfloat16
-        copies of the fp32 weights are held by the autograd graph until
-        backward, so two graphs mean two copies -- 15 GiB on a 4B model,
-        independent of batch size, which is what made a separate-forwards
-        version run out of memory even at a micro-batch of one. The cost is
-        that the batch now pads to the longest response across both sides
-        instead of each side's own longest.
-        """
-        count = len(batch["prompt"])
-        scores = self.score(
-            [
-                pointwise_text(prompt, response)
-                for prompt, response in zip(
-                    batch["prompt"], batch["first_response"], strict=True
-                )
-            ]
-            + [
-                pointwise_text(prompt, response)
-                for prompt, response in zip(
-                    batch["prompt"], batch["second_response"], strict=True
-                )
-            ],
-            device,
-        )
-        return scores[:count] - scores[count:]
-
-    def forward(
-        self, batch: tp.Batch, device: str, *, as_loss: bool = False
-    ) -> torch.Tensor:
-        """The batch's logits, or its masked loss when ``as_loss``.
-
-        The single entry point a wrapper can hook. FSDP installs its
-        all-gather hooks on forward and nowhere else, so a caller that reaches
-        the model through a custom method instead gets the unwrapped module,
-        its parameters still one-dimensional shards, and an embedding lookup
-        that fails on a 1-D weight. Both the training loss and the metrics
-        need a forward, hence the flag rather than two methods: only one of
-        them would be hooked.
-        """
-        logits = self.batch_logits(batch, device)
-        if not as_loss:
-            return logits
-        return tp.masked_binary_cross_entropy(logits, batch, device)
-
-    def compute_loss(self, batch: tp.Batch, device: str) -> torch.Tensor:
-        """Masked binary cross-entropy between the pair logits and targets."""
-        return tp.masked_binary_cross_entropy(
-            self.batch_logits(batch, device), batch, device
-        )
-
-
-def save_bt_reward_model(
-    model: BradleyTerryRewardModel,
-    criterion_columns: list[str],
-    encoder_name: str,
-    path: str | Path,
-    scorer_state: dict | None = None,
-) -> None:
-    """Save a checkpoint with everything needed to rebuild the model.
-
-    ``scorer_state`` overrides the encoder's own state dict, for the gathered
-    copy a model sharded across processes has to be saved from: its local
-    state dict holds only this rank's slice, which nothing can reload alone.
-    """
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            # The type tag keeps a BT checkpoint from being silently rebuilt
-            # as a pairwise model by the notebooks' load_reward_model
-            "model_type": "bradley_terry",
-            "encoder_name": encoder_name,
-            "criterion_columns": criterion_columns,
-            "max_tokens": model.max_tokens,
-            "state_dict": (
-                model.scorer.state_dict() if scorer_state is None else scorer_state
-            ),
-        },
-        path,
-    )
-
-
-def load_bt_reward_model(
-    path: str | Path, device: str | None = None
-) -> tuple[BradleyTerryRewardModel, list[str]]:
-    """Rebuild a saved BT model; returns it with its criterion columns."""
-    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    assert checkpoint.get("model_type") == "bradley_terry", checkpoint.get(
-        "model_type"
-    )
-    model = BradleyTerryRewardModel(
-        checkpoint["encoder_name"],
-        AutoTokenizer.from_pretrained(checkpoint["encoder_name"]),
-        checkpoint["max_tokens"],
-        len(checkpoint["criterion_columns"]),
-    )
-    model.scorer.load_state_dict(checkpoint["state_dict"])
-    if device is not None:
-        model.to(device)
-    model.eval()
-    return model, checkpoint["criterion_columns"]
-
-
-def bt_preference_tensor(
-    model: BradleyTerryRewardModel,
-    prompt: str,
-    responses: list[str],
-    device: str,
-    batch_size: int = 32,
-) -> np.ndarray:
-    """Win probabilities from pointwise rewards, shape (head, response, response).
-
-    The pointwise counterpart of ``tp.preference_tensor``, and the reason the
-    comparison is worth running: ranking n candidates needs n forwards here
-    against the joint model's n(n-1), because every pair probability follows
-    from the two scalars as ``sigmoid(r_i - r_j)``. That identity also makes
-    the result exactly skew-symmetric and exactly 0.5 on the diagonal, where
-    the joint model has to be symmetrised after the fact.
-    """
-    texts = [pointwise_text(prompt, response) for response in responses]
-    # Length-sorted batches pad to their own longest member rather than the
-    # pool's, as in the joint version
-    order = sorted(range(len(texts)), key=lambda index: len(texts[index]))
-    reward_batches = []
-    with torch.no_grad():
-        for start in range(0, len(order), batch_size):
-            reward_batches.append(
-                model.score(
-                    [texts[index] for index in order[start : start + batch_size]],
-                    device,
-                ).cpu()
-            )
-    rewards = torch.cat(reward_batches).numpy()[np.argsort(order)]
-    # (response, head) -> (head, response), then broadcast the difference
-    rewards = rewards.T
-    return expit(rewards[:, :, None] - rewards[:, None, :])
-
-
-def bt_anchor_preference_rates(
-    model: BradleyTerryRewardModel,
-    prompt: str,
-    responses: list[str],
-    anchor: str,
-    device: str,
-    batch_size: int = 32,
-) -> np.ndarray:
-    """Per-head win probabilities of each response against the anchor.
-
-    The pointwise counterpart of ``experiments.anchor_preference_rates``.
-    Scoring the anchor once alongside the responses gives every probability as
-    ``sigmoid(r_response - r_anchor)``, so n+1 forwards replace the joint
-    model's 2n -- and no symmetrisation is needed, because a difference of
-    scalars is antisymmetric by construction where a joint model has to be
-    averaged over both presentation orders.
-    """
-    texts = [pointwise_text(prompt, response) for response in [*responses, anchor]]
-    reward_batches = []
-    with torch.no_grad():
-        for start in range(0, len(texts), batch_size):
-            reward_batches.append(
-                model.score(texts[start : start + batch_size], device).cpu()
-            )
-    rewards = torch.cat(reward_batches).numpy()
-    return expit(rewards[:-1] - rewards[-1])
-
-
 def load_split_pairs(pairs_path: Path | None) -> pd.DataFrame:
     """Load the split preference pairs: local file, hub artifact, or rebuild.
 
@@ -288,7 +70,7 @@ def load_split_pairs(pairs_path: Path | None) -> pd.DataFrame:
     if pairs_path is not None:
         return pd.read_parquet(pairs_path)
     try:
-        return pd.read_parquet(tp.artifact_path("pairs.parquet"))
+        return pd.read_parquet(tp.pairs_path())
     except Exception as error:  # noqa: BLE001
         print(f"hub pairs unavailable ({error}); rebuilding from source")
     import datasets
@@ -485,7 +267,7 @@ def main() -> None:
         batch_size=args.batch_size,
         augment_presentation_order=True,
     )
-    model = BradleyTerryRewardModel(
+    model = tp.BradleyTerryRewardModel(
         args.encoder,
         build_tokenizer(args.encoder),
         args.max_tokens,
@@ -594,7 +376,7 @@ def main() -> None:
         model.to("cpu")
     checkpoint_path = args.output_dir / "bt.pt"
     if on_main:
-        save_bt_reward_model(
+        tp.save_bt_reward_model(
             model, criterion_columns, args.encoder, checkpoint_path, scorer_state
         )
     reported = (

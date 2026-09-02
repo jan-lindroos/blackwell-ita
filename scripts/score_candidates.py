@@ -25,7 +25,6 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notebooks"))
 
 import train_prefs as tp
-from train_bt_reward import bt_preference_tensor, load_bt_reward_model
 
 DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 
@@ -108,8 +107,8 @@ def main() -> None:
             f" {scorer_kind!r}; the tag is written at save time and is right"
         )
     if scorer_kind == "bradley_terry":
-        model, criteria = load_bt_reward_model(args.checkpoint)
-        build_tensor = bt_preference_tensor
+        model, criteria = tp.load_bt_reward_model(args.checkpoint)
+        build_tensor = tp.bt_preference_tensor
     else:
         model, criteria = tp.load_reward_model(args.checkpoint)
         build_tensor = tp.preference_tensor

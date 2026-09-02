@@ -26,7 +26,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notebooks"))
 
 import experiments as ex
 import train_prefs as tp
-from train_bt_reward import bt_anchor_preference_rates, load_bt_reward_model
 
 DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 
@@ -106,8 +105,8 @@ def main() -> None:
             f" {args.model_type!r}; the tag is written at save time and is right"
         )
     if args.model_type == "bradley_terry":
-        model, criteria = load_bt_reward_model(args.judge)
-        rate_atoms = bt_anchor_preference_rates
+        model, criteria = tp.load_bt_reward_model(args.judge)
+        rate_atoms = tp.bt_anchor_preference_rates
     else:
         model, criteria = tp.load_reward_model(args.judge)
         rate_atoms = ex.anchor_preference_rates

@@ -8,12 +8,6 @@
 #     "numpy",
 #     "pandas",
 #     "pyarrow",
-#     "torch",
-#     # molab's base image ships a torchvision built against a mismatched
-#     # torch. Install a matching one so transformers doesn't import the
-#     # broken system copy
-#     "torchvision",
-#     "transformers",
 # ]
 # ///
 
@@ -34,13 +28,11 @@ with app.setup:
     import marimo as mo
     import numpy as np
     import pandas as pd
-    import torch
     from huggingface_hub import HfApi, hf_hub_download
-    from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerBase
 
-    RMS_REPO = "jan-lindroos/blackwell-ita-rms"
-    ARTIFACTS_REPO = "jan-lindroos/blackwell-ita-artifacts"
+    ARTIFACTS_REPO = "blackwell-ita/artifacts"
     DATASET = "helpsteer2"
+    DEFAULT_BASE_MODEL = "RLHFlow/LLaMA3-SFT-v2"
     HEADS = [
         "helpfulness",
         "correctness",
@@ -68,18 +60,30 @@ with app.setup:
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    Winner policies on HelpSteer2. Candidates, anchors and the inference
-    preference tensors download from the hub on open. Press the solve button
-    to compute policies and upload selections, the score button to score the
-    policy support atoms against the anchor under the held-out model (GPU),
-    then the judge button to spend Claude judge calls on the policy support
-    atoms.
+    Winner policies on HelpSteer2. Candidates, anchors and the preference
+    tensors for the selected backbone download from the hub on open. Press
+    the solve button to compute policies and upload selections, then the
+    judge button to spend Claude judge calls on the policy support atoms.
+    Win rates against the anchor come straight from the tensors.
     """)
     return
 
 
 @app.function
-def artifact_path(filename: str) -> Path:
+def pool_prefix(model_name: str) -> str:
+    """Artifact path prefix for a backbone's candidate pools.
+
+    The default backbone keeps the original flat helpsteer2/ layout the hub
+    artifacts already use; other backbones get their own subfolder so runs
+    cannot clobber each other.
+    """
+    if model_name == DEFAULT_BASE_MODEL:
+        return "helpsteer2"
+    return f"helpsteer2/{model_name.split('/')[-1].lower()}"
+
+
+@app.function
+def artifact_path(filename: str, prefix: str = DATASET) -> Path:
     """Locate an artifact: the local data directory first, then the hub.
 
     The local copy wins because the hub artifacts predate the current prompt
@@ -93,121 +97,23 @@ def artifact_path(filename: str) -> Path:
     if local.is_file():
         return local
     return Path(
-        hf_hub_download(ARTIFACTS_REPO, f"{DATASET}/{filename}", repo_type="dataset")
+        hf_hub_download(ARTIFACTS_REPO, f"{prefix}/{filename}", repo_type="dataset")
     )
 
 
 @app.function
-def upload_dataframe(filename: str, dataframe: pd.DataFrame) -> None:
+def upload_dataframe(filename: str, dataframe: pd.DataFrame, prefix: str) -> None:
     """Upload a dataframe to the artifacts repo as a parquet file."""
     api = HfApi()
-    api.create_repo(ARTIFACTS_REPO, repo_type="dataset", exist_ok=True)
     with tempfile.TemporaryDirectory() as temp_name:
         path = Path(temp_name) / filename
         dataframe.to_parquet(path)
         api.upload_file(
             path_or_fileobj=path,
-            path_in_repo=f"{DATASET}/{filename}",
+            path_in_repo=f"{prefix}/{filename}",
             repo_id=ARTIFACTS_REPO,
             repo_type="dataset",
         )
-
-
-@app.function
-def model_path(filename: str) -> Path:
-    """Download a reward-model artifact, returning its local cache path."""
-    return Path(hf_hub_download(RMS_REPO, f"{DATASET}/{filename}"))
-
-
-@app.function
-def default_device() -> str:
-    """Pick the best available torch device: cuda, then mps, then cpu."""
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-@app.function
-def pairwise_text(prompt: str, first: str, second: str) -> str:
-    """Format a prompt with both responses for joint pairwise scoring."""
-    return f"{prompt}\n\n[RESPONSE 1]\n{first}\n\n[RESPONSE 2]\n{second}"
-
-
-# Inference-only copy of the train_prefs model code: notebooks stay
-# self-contained so each runs standalone on molab
-@app.class_definition
-class MultiHeadEncoder(torch.nn.Module):
-    """Pretrained encoder with a linear head giving one logit per criterion."""
-
-    def __init__(self, encoder_name: str, head_count: int) -> None:
-        """Load the encoder and attach a fresh linear head."""
-        super().__init__()
-        self.encoder = AutoModel.from_pretrained(encoder_name, dtype=torch.float32)
-        self.head = torch.nn.Linear(self.encoder.config.hidden_size, head_count)
-
-    def forward(self, tokenized: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Score tokenized inputs from the last non-padding token's hidden state."""
-        hidden_states = self.encoder(**tokenized).last_hidden_state
-        last_indices = tokenized["attention_mask"].sum(dim=1) - 1
-        pooled = hidden_states[
-            torch.arange(hidden_states.size(0), device=hidden_states.device),
-            last_indices,
-        ]
-        return self.head(pooled).float()
-
-
-@app.class_definition
-class PairwisePreferenceModel(torch.nn.Module):
-    """Preference model scoring both responses jointly in one input."""
-
-    def __init__(
-        self,
-        encoder_name: str,
-        tokenizer: PreTrainedTokenizerBase,
-        max_tokens: int,
-        head_count: int,
-    ) -> None:
-        """Wrap a multi-head encoder with its tokenizer and truncation limit."""
-        super().__init__()
-        self.scorer = MultiHeadEncoder(encoder_name, head_count)
-        self.tokenizer = tokenizer
-        self.max_tokens = max_tokens
-
-    def score(self, texts: list[str], device: str) -> torch.Tensor:
-        """Tokenize texts and return per-criterion logits."""
-        tokenized = self.tokenizer(
-            texts,
-            truncation=True,
-            max_length=self.max_tokens,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = {key: value.to(device) for key, value in tokenized.items()}
-        if device.startswith("cuda"):
-            with torch.autocast("cuda", torch.bfloat16):
-                return self.scorer(inputs)
-        return self.scorer(inputs)
-
-
-@app.function
-def load_reward_model(
-    path: str | Path, device: str | None = None
-) -> tuple[PairwisePreferenceModel, list[str]]:
-    """Rebuild a saved pairwise model; returns it with its criterion columns."""
-    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    model = PairwisePreferenceModel(
-        checkpoint["encoder_name"],
-        AutoTokenizer.from_pretrained(checkpoint["encoder_name"]),
-        checkpoint["max_tokens"],
-        len(checkpoint["criterion_columns"]),
-    )
-    model.scorer.load_state_dict(checkpoint["state_dict"])
-    if device is not None:
-        model.to(device)
-    model.eval()
-    return model, checkpoint["criterion_columns"]
 
 
 @app.function
@@ -248,7 +154,9 @@ def blackwell_winner(
         problem.solve(solver=cp.CLARABEL)
     except cp.SolverError as error:
         raise RuntimeError(f"blackwell_winner solve failed: {error}") from error
-    if problem.status != cp.OPTIMAL or policy.value is None:
+    # Clarabel reports optimal_inaccurate on some entropic solves depending
+    # on build; the tolerance slack is far below the 1e-6 support threshold
+    if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or policy.value is None:
         raise RuntimeError(f"blackwell_winner solve failed: {problem.status}")
     return np.asarray(policy.value)
 
@@ -322,62 +230,25 @@ def selections_frame(policies: dict, pools: dict) -> pd.DataFrame:
 
 
 @app.function
-def anchor_preference_rates(
-    model,
-    prompt: str,
-    responses: list[str],
-    anchor: str,
-    device: str,
-    batch_size: int = 16,
-) -> np.ndarray:
-    """Skew-symmetrised per-head win probabilities of responses vs the anchor."""
-    texts = [pairwise_text(prompt, response, anchor) for response in responses] + [
-        pairwise_text(prompt, anchor, response) for response in responses
-    ]
-    probability_batches = []
-    with torch.no_grad():
-        for start in range(0, len(texts), batch_size):
-            logits = model.score(texts[start : start + batch_size], device)
-            probability_batches.append(torch.sigmoid(logits).cpu())
-    probabilities = torch.cat(probability_batches).numpy()
-    forward, backward = np.split(probabilities, 2)
-    return (forward + 1.0 - backward) / 2.0
+def anchor_win_rates(policies: dict, tensors, prompts: list[str]) -> pd.DataFrame:
+    """Mean per-head win rate of each policy against the anchor.
 
-
-@app.function
-def held_out_win_rates(
-    policies: dict, model, pools: dict, anchors: dict[str, str], device: str
-) -> pd.DataFrame:
-    """Mean per-head win rate against the anchor under the held-out model.
-
-    Rather than precomputing the full preference tensor, each distinct
-    support atom is scored against the anchor once, the cache shared across
-    methods and pool sizes.
+    The tensors carry the anchor as their last row and column, so a support
+    atom's per-head rate is read straight off its prompt's tensor rather
+    than re-scored with the model that produced it.
     """
-    supports = {key: policy_support(policy) for key, policy in policies.items()}
-    needed: dict[str, set[int]] = {}
-    for (prompt, _, _), support in supports.items():
-        needed.setdefault(prompt, set()).update(index for index, _ in support)
-    atom_rates: dict[tuple[str, int], np.ndarray] = {}
-    for prompt in mo.status.progress_bar(needed, title="scoring"):
-        indices = sorted(needed[prompt])
-        rates = anchor_preference_rates(
-            model,
-            prompt,
-            [pools[prompt][index] for index in indices],
-            anchors[prompt],
-            device,
-        )
-        for index, rate in zip(indices, rates, strict=True):
-            atom_rates[(prompt, index)] = rate
+    prompt_indices = {prompt: index for index, prompt in enumerate(prompts)}
     rows = [
         {"method": method, "n": n, "criterion": criterion, "win_rate": float(rate)}
-        for (prompt, method, n), support in supports.items()
+        for (prompt, method, n), policy in policies.items()
         for criterion, rate in zip(
             HEADS,
             # A support is never empty, so sum() cannot fall through to its
             # integer start value
-            sum(weight * atom_rates[(prompt, index)] for index, weight in support),  # pyright: ignore[reportArgumentType]
+            sum(
+                weight * prompt_tensor(tensors, prompt_indices[prompt])[:, index, -1]
+                for index, weight in policy_support(policy)
+            ),  # pyright: ignore[reportArgumentType]
             strict=True,
         )
     ]
@@ -537,9 +408,25 @@ def _():
 
 @app.cell
 def _():
-    candidates_dataframe = pd.read_parquet(artifact_path("candidates.parquet"))
-    anchors_dataframe = pd.read_parquet(artifact_path("anchors.parquet"))
-    preference_tensors = np.load(artifact_path("preference_tensors.npz"))
+    base_model_dropdown = mo.ui.dropdown(
+        options=[
+            DEFAULT_BASE_MODEL,
+            "google/gemma-2b-it",
+            "mistralai/Mistral-7B-Instruct-v0.3",
+        ],
+        value=DEFAULT_BASE_MODEL,
+        label="base model",
+    )
+    base_model_dropdown
+    return (base_model_dropdown,)
+
+
+@app.cell
+def _(base_model_dropdown):
+    prefix = pool_prefix(base_model_dropdown.value)
+    candidates_dataframe = pd.read_parquet(artifact_path("candidates.parquet", prefix))
+    anchors_dataframe = pd.read_parquet(artifact_path("anchors.parquet", prefix))
+    preference_tensors = np.load(artifact_path("preference_tensors.npz", prefix))
     prompts = anchors_dataframe["prompt"].tolist()
     anchors = dict(
         zip(anchors_dataframe["prompt"], anchors_dataframe["anchor"], strict=True)
@@ -573,6 +460,7 @@ def _():
         preference_tensors,
         pool_tokens,
         pools,
+        prefix,
         prompts,
     )
 
@@ -585,36 +473,18 @@ def _():
 
 
 @app.cell
-def _(preference_tensors, pools, prompts, solve_button):
+def _(preference_tensors, pools, prefix, prompts, solve_button):
     mo.stop(not solve_button.value)
     policies = solve_policies(preference_tensors, prompts)
     selections_dataframe = selections_frame(policies, pools)
-    upload_dataframe("selections.parquet", selections_dataframe)
+    upload_dataframe("selections.parquet", selections_dataframe, prefix)
     selections_dataframe
     return policies, selections_dataframe
 
 
 @app.cell
-def _():
-    score_button = mo.ui.run_button(label="Score held-out win rates")
-    score_button
-    return (score_button,)
-
-
-@app.cell
-def _(anchors, policies, pools, score_button):
-    mo.stop(not score_button.value)
-    scoring_device = default_device()
-    evaluate_model, evaluate_columns = load_reward_model(
-        model_path("pairwise_evaluate.pt"), scoring_device
-    )
-    assert evaluate_columns == HEADS
-    win_rates_dataframe = held_out_win_rates(
-        policies, evaluate_model, pools, anchors, scoring_device
-    )
-    evaluate_model.to("cpu")
-    if scoring_device.startswith("cuda"):
-        torch.cuda.empty_cache()
+def _(policies, preference_tensors, prompts):
+    win_rates_dataframe = anchor_win_rates(policies, preference_tensors, prompts)
     win_rates_dataframe
     return (win_rates_dataframe,)
 
@@ -709,7 +579,7 @@ def _():
 
 
 @app.cell
-def _(anchors, judge_button, selections_dataframe):
+def _(anchors, judge_button, prefix, selections_dataframe):
     mo.stop(not judge_button.value)
     # Expectation scoring: judge each distinct support atom once against the
     # anchor, then average atom scores under each policy's weights, so the
@@ -729,7 +599,7 @@ def _(anchors, judge_button, selections_dataframe):
         for comparison, judgement in zip(comparisons, outcomes(comparisons), strict=True)
     }
     judge_scores_dataframe = expected_scores(judged_selections, atom_scores)
-    upload_dataframe("judge_scores.parquet", judge_scores_dataframe)
+    upload_dataframe("judge_scores.parquet", judge_scores_dataframe, prefix)
     judge_scores_dataframe
     return (judge_scores_dataframe,)
 

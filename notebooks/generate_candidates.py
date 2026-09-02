@@ -5,12 +5,12 @@
 #     "huggingface_hub",
 #     "pandas",
 #     "pyarrow",
-#     "torch",
 #     # molab's base image leaks a torchvision built against a different
 #     # torch. Install a matching one so transformers doesn't import the
 #     # broken system copy
 #     "torchvision",
 #     "transformers",
+#     "vllm",
 # ]
 # ///
 
@@ -20,35 +20,48 @@ __generated_with = "0.24.0"
 app = marimo.App()
 
 with app.setup:
+    import os
     import tempfile
     from pathlib import Path
 
     import marimo as mo
     import pandas as pd
-    import torch
     from huggingface_hub import HfApi, hf_hub_download
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
-    ARTIFACTS_REPO = "jan-lindroos/blackwell-ita-artifacts"
-
-
-@app.function
-def artifact_path(filename: str) -> Path:
-    """Download a helpsteer2 artifact, returning its local cache path."""
-    return Path(
-        hf_hub_download(ARTIFACTS_REPO, f"helpsteer2/{filename}", repo_type="dataset")
-    )
+    ARTIFACTS_REPO = "blackwell-ita/artifacts"
+    SPLITS_REPO = "blackwell-ita/helpsteer2-splits"
+    DEFAULT_BASE_MODEL = "RLHFlow/LLaMA3-SFT-v2"
 
 
 @app.function
-def upload_dataframe(filename: str, dataframe: pd.DataFrame) -> None:
-    """Upload a dataframe to the artifacts repo as a helpsteer2 parquet file."""
+def pairs_path() -> Path:
+    """Download the canonical split pairs, returning the local cache path."""
+    return Path(hf_hub_download(SPLITS_REPO, "pairs.parquet", repo_type="dataset"))
+
+
+@app.function
+def pool_prefix(model_name: str) -> str:
+    """Artifact path prefix for a backbone's candidate pools.
+
+    The default backbone keeps the original flat helpsteer2/ layout the hub
+    artifacts already use; other backbones get their own subfolder so runs
+    cannot clobber each other.
+    """
+    if model_name == DEFAULT_BASE_MODEL:
+        return "helpsteer2"
+    return f"helpsteer2/{model_name.split('/')[-1].lower()}"
+
+
+@app.function
+def upload_dataframe(filename: str, dataframe: pd.DataFrame, prefix: str) -> None:
+    """Upload a dataframe to the artifacts repo as a parquet file."""
     with tempfile.TemporaryDirectory() as temp_name:
         path = Path(temp_name) / filename
         dataframe.to_parquet(path)
         HfApi().upload_file(
             path_or_fileobj=path,
-            path_in_repo=f"helpsteer2/{filename}",
+            path_in_repo=f"{prefix}/{filename}",
             repo_id=ARTIFACTS_REPO,
             repo_type="dataset",
         )
@@ -70,12 +83,6 @@ def select_anchors(pairs: pd.DataFrame) -> pd.DataFrame:
             continue
         anchors[row.prompt] = row.response_a if row.overall > 0.5 else row.response_b  # pyright: ignore[reportAttributeAccessIssue]
     return pd.DataFrame({"prompt": list(anchors), "anchor": list(anchors.values())})
-
-
-@app.function
-def batch_sizes(total: int, batch_size: int) -> list[int]:
-    """Split a sample count into generate() batch sizes."""
-    return [min(batch_size, total - start) for start in range(0, total, batch_size)]
 
 
 @app.function
@@ -110,60 +117,35 @@ def token_counts(texts: list[str], tokenizer) -> list[int]:
 
 
 @app.function
-def default_device() -> str:
-    """Pick the best available torch device: cuda, then mps, then cpu."""
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-@app.function
 def generate_candidates(
     model_name: str,
     prompts: list[str],
     samples_per_prompt: int,
     max_new_tokens: int = 1024,
     temperature: float = 1.0,
-    batch_size: int = 8,
     seed: int = 1810,
-    device: str | None = None,
 ) -> pd.DataFrame:
-    """Sample responses per prompt; returns a (prompt, response) dataframe."""
-    if device is None:
-        device = default_device()
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    # transformers 5 annotates generate()'s self with a ty-only Protocol that
-    # pyright rejects, hence the targeted ignores here and on generate()
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype="auto").to(device)  # pyright: ignore[reportArgumentType]
-    torch.manual_seed(seed)
-    rows = []
-    for prompt in mo.status.progress_bar(prompts, title="prompts"):
-        inputs = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            add_generation_prompt=True,
-            return_tensors="pt",
-        ).to(device)
-        for count in batch_sizes(samples_per_prompt, batch_size):
-            outputs = model.generate(  # pyright: ignore[reportAttributeAccessIssue]
-                **inputs,
-                do_sample=True,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-                num_return_sequences=count,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-            rows.extend(
-                {
-                    "prompt": prompt,
-                    "response": tokenizer.decode(
-                        output[inputs["input_ids"].shape[1] :], skip_special_tokens=True
-                    ),
-                }
-                for output in outputs
-            )
-    return pd.DataFrame(rows)
+    """Sample responses per prompt with vLLM; returns a (prompt, response) dataframe."""
+    # flashinfer's top-k/top-p sampling kernel is JIT-compiled and needs
+    # nvcc, which molab's image lacks; the torch sampler needs no toolkit
+    os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+    # imported lazily: vllm has no macOS wheels, and tests import this module
+    from vllm import LLM, SamplingParams  # pyright: ignore[reportMissingImports]
+
+    llm = LLM(model=model_name)
+    params = SamplingParams(
+        n=samples_per_prompt,
+        temperature=temperature,
+        max_tokens=max_new_tokens,
+        seed=seed,
+    )
+    conversations = [[{"role": "user", "content": prompt}] for prompt in prompts]
+    outputs = llm.chat(conversations, params)
+    return pd.DataFrame(
+        {"prompt": prompt, "response": completion.text}
+        for prompt, output in zip(prompts, outputs, strict=True)
+        for completion in output.outputs
+    )
 
 
 @app.cell(hide_code=True)
@@ -176,14 +158,23 @@ def _():
 
 @app.cell
 def _():
-    base_model_name = "RLHFlow/LLaMA3-SFT-v2"
+    base_model_dropdown = mo.ui.dropdown(
+        options=[
+            DEFAULT_BASE_MODEL,
+            "google/gemma-2b-it",
+            "mistralai/Mistral-7B-Instruct-v0.3",
+        ],
+        value=DEFAULT_BASE_MODEL,
+        label="base model",
+    )
     samples_per_prompt = 128
-    return base_model_name, samples_per_prompt
+    base_model_dropdown
+    return base_model_dropdown, samples_per_prompt
 
 
 @app.cell
 def _():
-    pairs_dataframe = pd.read_parquet(artifact_path("pairs.parquet"))
+    pairs_dataframe = pd.read_parquet(pairs_path())
     anchors_dataframe = select_anchors(pairs_dataframe)
     len(anchors_dataframe)
     return (anchors_dataframe,)
@@ -197,8 +188,9 @@ def _():
 
 
 @app.cell
-def _(anchors_dataframe, base_model_name, generate_button, samples_per_prompt):
+def _(anchors_dataframe, base_model_dropdown, generate_button, samples_per_prompt):
     mo.stop(not generate_button.value)
+    base_model_name = base_model_dropdown.value
     raw_candidates = generate_candidates(
         base_model_name,
         anchors_dataframe["prompt"].tolist(),
@@ -213,8 +205,10 @@ def _(anchors_dataframe, base_model_name, generate_button, samples_per_prompt):
             AutoTokenizer.from_pretrained(base_model_name),
         )
     )
-    upload_dataframe("anchors.parquet", anchors_dataframe)
-    upload_dataframe("candidates.parquet", candidates_dataframe)
+    upload_dataframe("anchors.parquet", anchors_dataframe, pool_prefix(base_model_name))
+    upload_dataframe(
+        "candidates.parquet", candidates_dataframe, pool_prefix(base_model_name)
+    )
     candidates_dataframe
 
 if __name__ == "__main__":

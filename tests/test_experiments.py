@@ -7,17 +7,14 @@ import experiments
 import numpy as np
 import pandas as pd
 import pytest
-import torch
 from experiments import (
     HEADS,
-    anchor_preference_rates,
+    anchor_win_rates,
     best_of_nash,
     blackwell_winner,
     comparison_prompt,
     expected_scores,
     expected_token_counts,
-    held_out_win_rates,
-    pairwise_text,
     policy_support,
     prompt_tensor,
 )
@@ -245,58 +242,20 @@ def test_prompt_tensor_reads_the_key_scheme():
         prompt_tensor({"tensor_1": array}, 0)
 
 
-def stub_scorer(logits_by_text: dict[str, list[float]], scored_texts: list[str]):
-    """Stand-in model returning fixed per-head logits for known pairwise texts."""
-
-    def score(texts: list[str], device: str) -> torch.Tensor:
-        scored_texts.extend(texts)
-        return torch.tensor([logits_by_text[text] for text in texts])
-
-    return SimpleNamespace(score=score)
-
-
-def test_anchor_preference_rates_skew_symmetrises_both_orders():
-    """Rates average the forward and complemented backward pass per head."""
-    logit = float(np.log(3.0))
-    logits_by_text = {
-        pairwise_text("p", "r", "a"): [0.0, logit],
-        pairwise_text("p", "a", "r"): [0.0, -logit],
-    }
-    rates = anchor_preference_rates(
-        stub_scorer(logits_by_text, []), "p", ["r"], "a", "cpu"
-    )
-    np.testing.assert_allclose(rates, [[0.5, 0.75]], atol=1e-6)
-
-
-def test_held_out_win_rates_scores_atoms_once_and_averages():
-    """Distinct atoms score once; win rates weight supports and average prompts."""
-    atom_rates = {("p", "p0"): 0.8, ("p", "p1"): 0.4, ("q", "q0"): 0.6}
-    anchors = {"p": "ap", "q": "aq"}
-    logits_by_text = {}
-    for (prompt, response), rate in atom_rates.items():
-        logit = float(np.log(rate / (1.0 - rate)))
-        logits_by_text[pairwise_text(prompt, response, anchors[prompt])] = [
-            logit
-        ] * len(HEADS)
-        logits_by_text[pairwise_text(prompt, anchors[prompt], response)] = [
-            -logit
-        ] * len(HEADS)
+def test_anchor_win_rates_reads_anchor_column_and_averages():
+    """Win rates weight each atom's tensor-vs-anchor rate and average prompts."""
+    p_tensor = np.full((len(HEADS), 3, 3), 0.5)
+    p_tensor[:, 0, -1] = 0.8
+    p_tensor[:, 1, -1] = 0.4
+    q_tensor = np.full((len(HEADS), 2, 2), 0.5)
+    q_tensor[:, 0, -1] = 0.6
+    tensors = {"tensor_0": p_tensor, "tensor_1": q_tensor}
     policies = {
         ("p", "base", 1): np.array([1.0]),
         ("p", "blackwell", 2): np.array([0.5, 0.5]),
         ("q", "base", 1): np.array([1.0]),
     }
-    scored_texts: list[str] = []
-    frame = held_out_win_rates(
-        policies,
-        stub_scorer(logits_by_text, scored_texts),
-        {"p": ["p0", "p1"], "q": ["q0"]},
-        anchors,
-        "cpu",
-    )
-    # Both p policies share atom p0, so only 3 atoms score, in both orders
-    assert len(scored_texts) == 6
-    assert len(scored_texts) == len(set(scored_texts))
+    frame = anchor_win_rates(policies, tensors, ["p", "q"])
     assert list(frame.columns) == ["method", "n", "criterion", "win_rate"]
     rates = {
         (row["method"], row["n"], row["criterion"]): row["win_rate"]

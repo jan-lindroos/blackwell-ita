@@ -4,8 +4,8 @@ import numpy as np
 import pandas as pd
 import pytest
 from generate_candidates import (
-    batch_sizes,
     combine_with_anchors,
+    pool_prefix,
     select_anchors,
     token_counts,
 )
@@ -108,8 +108,11 @@ def test_token_counts_per_text():
     assert token_counts(["one two three", "", "one"], WordTokenizer()) == [3, 0, 1]
 
 
-def test_batch_sizes_cover_total():
-    """Batches are full-size except a smaller remainder batch at the end."""
-    assert batch_sizes(128, 8) == [8] * 16
-    assert batch_sizes(5, 2) == [2, 2, 1]
-    assert batch_sizes(3, 8) == [3]
+def test_pool_prefix_keeps_default_flat_and_slugs_other_backbones():
+    """The default backbone keeps the flat layout; others get a subfolder."""
+    assert pool_prefix("RLHFlow/LLaMA3-SFT-v2") == "helpsteer2"
+    assert pool_prefix("google/gemma-2b-it") == "helpsteer2/gemma-2b-it"
+    assert (
+        pool_prefix("mistralai/Mistral-7B-Instruct-v0.3")
+        == "helpsteer2/mistral-7b-instruct-v0.3"
+    )
