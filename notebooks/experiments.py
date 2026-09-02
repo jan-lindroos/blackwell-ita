@@ -80,7 +80,18 @@ def _():
 
 @app.function
 def artifact_path(filename: str) -> Path:
-    """Download an artifact from the hub, returning its local cache path."""
+    """Locate an artifact: the local data directory first, then the hub.
+
+    The local copy wins because the hub artifacts predate the current prompt
+    splits. Their candidate pools and preference tensors cover 69 prompts that
+    are now training data, and reaching for them silently would produce an ITA
+    result measured on prompts the model was trained on. A missing local file
+    still falls through to the hub, so nothing that legitimately lives only
+    there stops working.
+    """
+    local = Path("data") / filename
+    if local.is_file():
+        return local
     return Path(
         hf_hub_download(ARTIFACTS_REPO, f"{DATASET}/{filename}", repo_type="dataset")
     )

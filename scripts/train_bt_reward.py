@@ -18,9 +18,11 @@ import time
 from pathlib import Path
 from typing import cast
 
+import numpy as np
 import pandas as pd
 import torch
 import wandb
+from scipy.special import expit
 from torch.utils.data import DataLoader, Subset
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
@@ -212,6 +214,69 @@ def load_bt_reward_model(
         model.to(device)
     model.eval()
     return model, checkpoint["criterion_columns"]
+
+
+def bt_preference_tensor(
+    model: BradleyTerryRewardModel,
+    prompt: str,
+    responses: list[str],
+    device: str,
+    batch_size: int = 32,
+) -> np.ndarray:
+    """Win probabilities from pointwise rewards, shape (head, response, response).
+
+    The pointwise counterpart of ``tp.preference_tensor``, and the reason the
+    comparison is worth running: ranking n candidates needs n forwards here
+    against the joint model's n(n-1), because every pair probability follows
+    from the two scalars as ``sigmoid(r_i - r_j)``. That identity also makes
+    the result exactly skew-symmetric and exactly 0.5 on the diagonal, where
+    the joint model has to be symmetrised after the fact.
+    """
+    texts = [pointwise_text(prompt, response) for response in responses]
+    # Length-sorted batches pad to their own longest member rather than the
+    # pool's, as in the joint version
+    order = sorted(range(len(texts)), key=lambda index: len(texts[index]))
+    reward_batches = []
+    with torch.no_grad():
+        for start in range(0, len(order), batch_size):
+            reward_batches.append(
+                model.score(
+                    [texts[index] for index in order[start : start + batch_size]],
+                    device,
+                ).cpu()
+            )
+    rewards = torch.cat(reward_batches).numpy()[np.argsort(order)]
+    # (response, head) -> (head, response), then broadcast the difference
+    rewards = rewards.T
+    return expit(rewards[:, :, None] - rewards[:, None, :])
+
+
+def bt_anchor_preference_rates(
+    model: BradleyTerryRewardModel,
+    prompt: str,
+    responses: list[str],
+    anchor: str,
+    device: str,
+    batch_size: int = 32,
+) -> np.ndarray:
+    """Per-head win probabilities of each response against the anchor.
+
+    The pointwise counterpart of ``experiments.anchor_preference_rates``.
+    Scoring the anchor once alongside the responses gives every probability as
+    ``sigmoid(r_response - r_anchor)``, so n+1 forwards replace the joint
+    model's 2n -- and no symmetrisation is needed, because a difference of
+    scalars is antisymmetric by construction where a joint model has to be
+    averaged over both presentation orders.
+    """
+    texts = [pointwise_text(prompt, response) for response in [*responses, anchor]]
+    reward_batches = []
+    with torch.no_grad():
+        for start in range(0, len(texts), batch_size):
+            reward_batches.append(
+                model.score(texts[start : start + batch_size], device).cpu()
+            )
+    rewards = torch.cat(reward_batches).numpy()
+    return expit(rewards[:-1] - rewards[-1])
 
 
 def load_split_pairs(pairs_path: Path | None) -> pd.DataFrame:
