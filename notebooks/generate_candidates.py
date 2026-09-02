@@ -5,12 +5,12 @@
 #     "huggingface_hub",
 #     "pandas",
 #     "pyarrow",
+#     "torch",
 #     # molab's base image leaks a torchvision built against a different
 #     # torch. Install a matching one so transformers doesn't import the
 #     # broken system copy
 #     "torchvision",
 #     "transformers",
-#     "vllm",
 # ]
 # ///
 
@@ -20,14 +20,14 @@ __generated_with = "0.24.0"
 app = marimo.App()
 
 with app.setup:
-    import os
     import tempfile
     from pathlib import Path
 
     import marimo as mo
     import pandas as pd
+    import torch
     from huggingface_hub import HfApi, hf_hub_download
-    from transformers import AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     ARTIFACTS_REPO = "blackwell-ita/artifacts"
     SPLITS_REPO = "blackwell-ita/helpsteer2-splits"
@@ -111,6 +111,12 @@ def combine_with_anchors(
 
 
 @app.function
+def batch_sizes(total: int, batch_size: int) -> list[int]:
+    """Split a sample count into generate() batch sizes."""
+    return [min(batch_size, total - start) for start in range(0, total, batch_size)]
+
+
+@app.function
 def token_counts(texts: list[str], tokenizer) -> list[int]:
     """Token count per text under the base policy tokenizer."""
     return [len(ids) for ids in tokenizer(texts)["input_ids"]]
@@ -123,29 +129,43 @@ def generate_candidates(
     samples_per_prompt: int,
     max_new_tokens: int = 1024,
     temperature: float = 1.0,
+    batch_size: int = 32,
     seed: int = 1810,
+    device: str = "cuda",
 ) -> pd.DataFrame:
-    """Sample responses per prompt with vLLM; returns a (prompt, response) dataframe."""
-    # flashinfer's top-k/top-p sampling kernel is JIT-compiled and needs
-    # nvcc, which molab's image lacks; the torch sampler needs no toolkit
-    os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
-    # imported lazily: vllm has no macOS wheels, and tests import this module
-    from vllm import LLM, SamplingParams  # pyright: ignore[reportMissingImports]
-
-    llm = LLM(model=model_name)
-    params = SamplingParams(
-        n=samples_per_prompt,
-        temperature=temperature,
-        max_tokens=max_new_tokens,
-        seed=seed,
-    )
-    conversations = [[{"role": "user", "content": prompt}] for prompt in prompts]
-    outputs = llm.chat(conversations, params)
-    return pd.DataFrame(
-        {"prompt": prompt, "response": completion.text}
-        for prompt, output in zip(prompts, outputs, strict=True)
-        for completion in output.outputs
-    )
+    """Sample responses per prompt; returns a (prompt, response) dataframe."""
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # transformers 5 annotates generate()'s self with a ty-only Protocol that
+    # pyright rejects, hence the targeted ignores here and on generate()
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype="auto").to(device)  # pyright: ignore[reportArgumentType]
+    torch.manual_seed(seed)
+    rows = []
+    for prompt in mo.status.progress_bar(prompts, title="prompts"):
+        inputs = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        ).to(device)
+        for count in batch_sizes(samples_per_prompt, batch_size):
+            outputs = model.generate(  # pyright: ignore[reportAttributeAccessIssue]
+                **inputs,
+                do_sample=True,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+                num_return_sequences=count,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+            rows.extend(
+                {
+                    "prompt": prompt,
+                    "response": tokenizer.decode(
+                        output[inputs["input_ids"].shape[1] :], skip_special_tokens=True
+                    ),
+                }
+                for output in outputs
+            )
+    return pd.DataFrame(rows)
 
 
 @app.cell(hide_code=True)

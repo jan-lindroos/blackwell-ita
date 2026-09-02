@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from generate_candidates import (
+    batch_sizes,
     combine_with_anchors,
     pool_prefix,
     select_anchors,
@@ -116,3 +117,9 @@ def test_pool_prefix_keeps_default_flat_and_slugs_other_backbones():
         pool_prefix("mistralai/Mistral-7B-Instruct-v0.3")
         == "helpsteer2/mistral-7b-instruct-v0.3"
     )
+
+
+def test_batch_sizes_covers_total_with_partial_last_batch():
+    assert batch_sizes(128, 32) == [32, 32, 32, 32]
+    assert batch_sizes(10, 4) == [4, 4, 2]
+    assert batch_sizes(3, 8) == [3]
