@@ -21,6 +21,7 @@ with app.setup:
     import subprocess
     import tempfile
     import time
+    from collections.abc import Callable
     from concurrent.futures import ThreadPoolExecutor
     from pathlib import Path
 
@@ -53,15 +54,29 @@ with app.setup:
     SAMPLES_PER_PROMPT = 128
     N_VALUES = [1, 4, 16, 64, 128]
     BETA = 0.05
-    TAUS = [round(0.5 + 0.05 * step, 2) for step in range(10)]
+    # The main Blackwell arm: the four quality attributes plus overall as a
+    # fifth criterion, all at tau = 1/2. Any tau above 1/2 on overall reduces
+    # to best-of-Nash on 97+ of 100 prompts (the shared shortfall relaxes the
+    # other heads by the same amount), so there is no sweep
+    QUALITY_HEADS = NO_VERBOSITY_HEADS + [OVERALL_INDEX]
     # Length-head scales as multiples of the pool's mean length: small is a
     # strong preference for concision, large is near indifference
     SCALES = [0.25, 0.5, 1.0, 2.0, 4.0]
+    # Scalarised baseline weights: best-of-Nash on (1 - w) overall + w length
+    WEIGHTS = [0.1, 0.25, 0.5]
     # Verbosity is a descriptive rating, not a quality criterion (it agrees
     # with helpfulness on 54% of decisive pairs, a coin flip), so the reported
     # welfare and worst-criterion metrics run over the four quality heads;
     # the 5-head arm stays as the demonstration that chasing it fails
     WELFARE_HEADS = [HEADS[head] for head in NO_VERBOSITY_HEADS]
+    # Chart palette (validated categorical slots) and the neutral for base/Nash
+    BLUE, ORANGE, YELLOW, MAGENTA, GREY = (
+        "#2a78d6",
+        "#eb6834",
+        "#eda100",
+        "#e87ba4",
+        "#8a8983",
+    )
     # Pinned full model ID: a floating alias like "sonnet" can silently resolve
     # to a different model between judging runs
     JUDGE_MODEL = "claude-sonnet-5"
@@ -219,12 +234,11 @@ def policy_support(
 def solve_policies(tensors, prompts: list[str], pool_tokens: dict) -> dict:
     """Winner policies over pool prefixes, keyed (prompt, method, n).
 
-    Tau-sweep arms add the overall head to the four no-verbosity criteria and
-    carry its threshold after an @ in the method name; tokens arms stack the
-    length head onto the criteria as one more head at threshold 1/2 and carry
-    its scale (a multiple of the pool's mean length) after the @.
+    Length arms stack the length head onto the quality criteria as one more
+    head at threshold 1/2 and carry its scale (a multiple of the pool's mean
+    length) after the @; nash_length arms are the scalarised baseline, the
+    von Neumann winner of (1 - w) overall + w length, with w after the @.
     """
-    overall_heads = NO_VERBOSITY_HEADS + [OVERALL_INDEX]
     policies = {}
     for prompt_index, prompt in enumerate(
         mo.status.progress_bar(prompts, title="solving")
@@ -234,96 +248,173 @@ def solve_policies(tensors, prompts: list[str], pool_tokens: dict) -> dict:
         policies[(prompt, "base", 1)] = np.array([1.0])
         for n in N_VALUES:
             mean_length = float(tokens[:n].mean())
-            length = length_preference(tokens[:n], mean_length)[None]
-            policies[(prompt, "best_of_blackwell", n)] = blackwell_winner(
-                tensor[:OVERALL_INDEX, :n, :n]
+            overall = tensor[OVERALL_INDEX, :n, :n]
+            quality = tensor[QUALITY_HEADS, :n, :n]
+            policies[(prompt, "best_of_nash", n)] = best_of_nash(overall)
+            policies[(prompt, "blackwell_all_heads", n)] = blackwell_winner(
+                tensor[:, :n, :n]
             )
-            policies[(prompt, "blackwell_no_verbosity", n)] = blackwell_winner(
+            policies[(prompt, "blackwell_quality", n)] = blackwell_winner(quality)
+            policies[(prompt, "blackwell_attributes", n)] = blackwell_winner(
                 tensor[NO_VERBOSITY_HEADS, :n, :n]
             )
             policies[(prompt, "entropic_blackwell", n)] = blackwell_winner(
-                tensor[:OVERALL_INDEX, :n, :n], beta=BETA
-            )
-            policies[(prompt, "best_of_nash", n)] = best_of_nash(
-                tensor[OVERALL_INDEX, :n, :n]
+                quality, beta=BETA
             )
             for scale in SCALES:
-                policies[(prompt, f"blackwell_no_verbosity_tokens@{scale:g}", n)] = (
-                    blackwell_winner(
-                        np.concatenate(
-                            [
-                                tensor[NO_VERBOSITY_HEADS, :n, :n],
-                                length_preference(tokens[:n], scale * mean_length)[None],
-                            ]
-                        )
-                    )
+                length = length_preference(tokens[:n], scale * mean_length)
+                policies[(prompt, f"blackwell_quality_length@{scale:g}", n)] = (
+                    blackwell_winner(np.concatenate([quality, length[None]]))
                 )
-            for tau in TAUS:
-                thresholds = [0.5] * len(NO_VERBOSITY_HEADS) + [tau]
-                policies[(prompt, f"blackwell_no_verbosity_overall@{tau:.2f}", n)] = (
-                    blackwell_winner(tensor[overall_heads, :n, :n], thresholds)
-                )
-                policies[
-                    (prompt, f"blackwell_no_verbosity_overall_tokens@{tau:.2f}", n)
-                ] = blackwell_winner(
-                    np.concatenate([tensor[overall_heads, :n, :n], length]),
-                    thresholds + [0.5],
+            length = length_preference(tokens[:n], mean_length)
+            for weight in WEIGHTS:
+                policies[(prompt, f"nash_length@{weight:g}", n)] = best_of_nash(
+                    (1.0 - weight) * overall + weight * length
                 )
     return policies
 
 
 @app.function
-def frontier_methods(win_rates: pd.DataFrame) -> list[str]:
-    """Methods on the frontier chart.
+def prompt_results(
+    policies: dict, tensors, prompts: list[str], pool_tokens: dict
+) -> pd.DataFrame:
+    """Per (prompt, method, n): expected per-head win rate vs the anchor and tokens.
 
-    The fixed arms, the whole length-scale sweep, each tau-sweep family at
-    tau = 0.5, and each tau family's best tau by the tensor's own overall win
-    rate against the anchor at the largest N, so no judge calls are spent
-    selecting tau.
+    The tensors carry the anchor as their last row and column, so a support
+    atom's per-head rate is read straight off its prompt's tensor.
     """
-    methods = win_rates["method"]
-    scales = sorted(
-        set(methods[methods.str.startswith("blackwell_no_verbosity_tokens@")]),
-        key=lambda method: float(method.split("@")[1]),
-    )
-    sweep = win_rates[
-        methods.str.contains("overall@")
-        & (win_rates["criterion"] == "overall")
-        & (win_rates["n"] == N_VALUES[-1])
-    ]
-    families = sweep["method"].str.split("@").str[0]  # pyright: ignore[reportAttributeAccessIssue]
-    best = sweep.loc[sweep.groupby(families)["win_rate"].idxmax(), "method"]
-    return list(
-        dict.fromkeys(
-            [
-                "base",
-                "best_of_nash",
-                "best_of_blackwell",
-                "blackwell_no_verbosity",
-                *scales,
-                "blackwell_no_verbosity_overall@0.50",
-                "blackwell_no_verbosity_overall_tokens@0.50",
-                *best.tolist(),
-            ]
+    prompt_indices = {prompt: index for index, prompt in enumerate(prompts)}
+    rows = []
+    for (prompt, method, n), policy in policies.items():
+        support = policy_support(policy)
+        tensor = prompt_tensor(tensors, prompt_indices[prompt])
+        rates = sum(weight * tensor[:, index, -1] for index, weight in support)
+        tokens = sum(weight * pool_tokens[prompt][index] for index, weight in support)
+        rows.append(
+            {
+                "prompt": prompt,
+                "method": method,
+                "n": n,
+                **dict(zip(HEADS, np.asarray(rates, dtype=float), strict=True)),
+                "tokens": float(tokens),
+            }
         )
+    return pd.DataFrame(rows)
+
+
+@app.function
+def anchor_win_rates(policies: dict, tensors, prompts: list[str]) -> pd.DataFrame:
+    """Mean per-head win rate of each policy against the anchor."""
+    pool_tokens = {prompt: np.zeros(SAMPLES_PER_PROMPT + 1) for prompt in prompts}
+    results = prompt_results(policies, tensors, prompts, pool_tokens)
+    return (  # pyright: ignore[reportReturnType]
+        results.melt(
+            id_vars=["method", "n"],
+            value_vars=HEADS,
+            var_name="criterion",
+            value_name="win_rate",
+        )
+        .groupby(["method", "n", "criterion"], as_index=False)["win_rate"]
+        .mean()
     )
 
 
 @app.function
-def welfare_frame(win_rates: pd.DataFrame) -> pd.DataFrame:
-    """Rawlsian (minimum) and Nash (geometric mean) welfare per (method, n).
+def summarise(
+    results: pd.DataFrame, draws: int = 2000, seed: int = 1810
+) -> pd.DataFrame:
+    """Mean and 95% band over prompts of each metric per (method, n).
 
-    Both aggregate the mean criterion win rates against the anchor over the
-    four quality heads (WELFARE_HEADS); verbosity and overall are left out.
+    Metrics: judged overall (score), Rawlsian and Nash welfare over
+    WELFARE_HEADS, expected tokens and wins per kilotoken. Bands come from
+    multinomial prompt weights shared across arms, so they are paired.
     """
-    criteria = win_rates[win_rates["criterion"].isin(WELFARE_HEADS)]
-    grouped = criteria.groupby(["method", "n"])["win_rate"]
-    return pd.DataFrame(
-        {
-            "rawlsian": grouped.min(),
-            "nash": grouped.agg(lambda rates: float(np.exp(np.log(rates).mean()))),
+    prompts = sorted(results["prompt"].unique())
+    count = len(prompts)
+    weights = (
+        np.random.default_rng(seed).multinomial(
+            count, np.full(count, 1.0 / count), size=draws
+        )
+        / count
+    )
+    columns = ["score", *WELFARE_HEADS, "tokens"]
+
+    def statistics(means: np.ndarray) -> dict[str, np.ndarray]:
+        score = means[..., 0]
+        heads = means[..., 1 : 1 + len(WELFARE_HEADS)]
+        tokens = means[..., -1]
+        return {
+            "overall": score,
+            "rawlsian": heads.min(axis=-1),
+            "nash_welfare": np.exp(np.log(heads).mean(axis=-1)),
+            "tokens": tokens,
+            "wins_per_ktoken": score / (tokens / 1000.0),
         }
-    ).reset_index()
+
+    rows = []
+    for (method, n), group in results.groupby(["method", "n"]):  # pyright: ignore[reportGeneralTypeIssues]
+        matrix = (
+            group.set_index("prompt").reindex(prompts)[columns].to_numpy(dtype=float)
+        )
+        point = statistics(matrix.mean(axis=0))
+        band = statistics(weights @ matrix)
+        for metric, value in point.items():
+            if np.isnan(value):
+                continue
+            rows.append(
+                {
+                    "method": method,
+                    "n": n,
+                    "metric": metric,
+                    "mean": float(value),
+                    "lo": float(np.percentile(band[metric], 2.5)),
+                    "hi": float(np.percentile(band[metric], 97.5)),
+                }
+            )
+    return pd.DataFrame(rows, columns=["method", "n", "metric", "mean", "lo", "hi"])
+
+
+@app.function
+def cyclic_triad_fraction(
+    matrix: np.ndarray, samples: int = 2000, seed: int = 1810
+) -> float:
+    """Fraction of sampled candidate triads that form a preference cycle."""
+    count = matrix.shape[0]
+    if count < 3:
+        return 0.0
+    rng = np.random.default_rng(seed)
+    triads = rng.integers(0, count, size=(samples, 3))
+    distinct = (
+        (triads[:, 0] != triads[:, 1])
+        & (triads[:, 1] != triads[:, 2])
+        & (triads[:, 0] != triads[:, 2])
+    )
+    a, b, c = triads[distinct].T
+    forward = (matrix[a, b] > 0.5) & (matrix[b, c] > 0.5) & (matrix[c, a] > 0.5)
+    backward = (matrix[b, a] > 0.5) & (matrix[c, b] > 0.5) & (matrix[a, c] > 0.5)
+    return float((forward | backward).mean())
+
+
+@app.function
+def triad_fractions(tensors, prompts: list[str]) -> pd.DataFrame:
+    """Mean cyclic-triad fraction of the overall head per pool size."""
+    rows = [
+        {
+            "n": n,
+            "fraction": float(
+                np.mean(
+                    [
+                        cyclic_triad_fraction(
+                            prompt_tensor(tensors, index)[OVERALL_INDEX, :n, :n]
+                        )
+                        for index in range(len(prompts))
+                    ]
+                )
+            ),
+        }
+        for n in N_VALUES
+    ]
+    return pd.DataFrame(rows)
 
 
 @app.function
@@ -343,36 +434,6 @@ def selections_frame(policies: dict, pools: dict) -> pd.DataFrame:
     ]
     return pd.DataFrame(
         rows, columns=["prompt", "method", "n", "sample_index", "weight", "response"]
-    )
-
-
-@app.function
-def anchor_win_rates(policies: dict, tensors, prompts: list[str]) -> pd.DataFrame:
-    """Mean per-head win rate of each policy against the anchor.
-
-    The tensors carry the anchor as their last row and column, so a support
-    atom's per-head rate is read straight off its prompt's tensor rather
-    than re-scored with the model that produced it.
-    """
-    prompt_indices = {prompt: index for index, prompt in enumerate(prompts)}
-    rows = [
-        {"method": method, "n": n, "criterion": criterion, "win_rate": float(rate)}
-        for (prompt, method, n), policy in policies.items()
-        for criterion, rate in zip(
-            HEADS,
-            # A support is never empty, so sum() cannot fall through to its
-            # integer start value
-            sum(
-                weight * prompt_tensor(tensors, prompt_indices[prompt])[:, index, -1]
-                for index, weight in policy_support(policy)
-            ),  # pyright: ignore[reportArgumentType]
-            strict=True,
-        )
-    ]
-    return (  # pyright: ignore[reportReturnType]
-        pd.DataFrame(rows)
-        .groupby(["method", "n", "criterion"], as_index=False)["win_rate"]
-        .mean()
     )
 
 
@@ -435,7 +496,7 @@ Reply with exactly one word: FIRST or SECOND."""
 
 
 @app.function
-def claude_pick(prompt: str, model: str, attempts: int = 3) -> str | None:
+def claude_pick(prompt: str, model: str, attempts: int = 5) -> str | None:
     """Ask the Claude CLI to pick FIRST or SECOND; None if unparseable."""
     stderr = ""
     for attempt in range(attempts):
@@ -527,12 +588,18 @@ def load_atom_judgements(prefix: str) -> pd.DataFrame:
 
 @app.function
 def judge_atoms(
-    comparisons: list[dict], cache: pd.DataFrame, model: str = JUDGE_MODEL
+    comparisons: list[dict],
+    cache: pd.DataFrame,
+    model: str = JUDGE_MODEL,
+    chunk: int = 64,
+    checkpoint: Callable[[pd.DataFrame], None] | None = None,
 ) -> pd.DataFrame:
     """Judge the comparisons the cache lacks for this model; return the merged cache.
 
     Atoms are keyed on (instruction, response, model): the anchor is fixed
     per instruction, so a judgement carries over between scorers and runs.
+    Judging goes in chunks and ``checkpoint`` receives the merged cache after
+    each, so a judge outage part-way loses at most one chunk.
     """
     seen = set(zip(cache["instruction"], cache["response"], cache["model"], strict=True))
     fresh = [
@@ -540,20 +607,162 @@ def judge_atoms(
         for comparison in comparisons
         if (comparison["instruction"], comparison["response"], model) not in seen
     ]
-    rows = [
-        {
-            "instruction": comparison["instruction"],
-            "response": comparison["response"],
-            "model": model,
-            **judgement,
-        }
-        for comparison, judgement in zip(
-            fresh, outcomes(fresh, model=model), strict=True
+    for start in range(0, len(fresh), chunk):
+        batch = fresh[start : start + chunk]
+        rows = [
+            {
+                "instruction": comparison["instruction"],
+                "response": comparison["response"],
+                "model": model,
+                **judgement,
+            }
+            for comparison, judgement in zip(
+                batch, outcomes(batch, model=model), strict=True
+            )
+        ]
+        cache = pd.concat(
+            [cache, pd.DataFrame(rows, columns=ATOM_COLUMNS)], ignore_index=True
         )
+        if checkpoint is not None:
+            checkpoint(cache)
+    return cache
+
+
+@app.function
+def draw_metric(axes, summary: pd.DataFrame, metric: str, arms: list[tuple]) -> None:
+    """Lines with 95% bands over N for the given (method, colour, style, label, alpha) arms."""
+    for method, colour, style, label, alpha in arms:
+        stats = summary[(summary["method"] == method) & (summary["metric"] == metric)]
+        stats = stats.sort_values("n")  # pyright: ignore[reportCallIssue]
+        if stats.empty:
+            continue
+        axes.plot(
+            stats["n"],
+            stats["mean"],
+            color=colour,
+            linestyle=style,
+            linewidth=2,
+            marker="o",
+            markersize=4,
+            alpha=alpha,
+            label=label,
+        )
+        axes.fill_between(
+            stats["n"], stats["lo"], stats["hi"], color=colour, alpha=0.12 * alpha, linewidth=0
+        )
+    base = summary[(summary["method"] == "base") & (summary["metric"] == metric)]["mean"]
+    if not base.empty:  # pyright: ignore[reportAttributeAccessIssue]
+        axes.axhline(base.item(), color=GREY, linestyle=":", linewidth=1, label="base")
+    axes.set_xscale("log", base=2)
+    axes.set_xticks(N_VALUES)
+    axes.set_xticklabels([str(n) for n in N_VALUES])
+    axes.set_xlabel("N (pool size)")
+    axes.spines[["top", "right"]].set_visible(False)
+
+
+@app.function
+def chart_verbosity(summary: pd.DataFrame):
+    """Chart 1: the verbosity head makes the max-min policy chase length."""
+    figure, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+    arms = [
+        ("blackwell_all_heads", BLUE, "-", "Blackwell, all 6 heads (with verbosity)", 1.0),
+        ("blackwell_quality", ORANGE, "-", "Blackwell, 5 quality heads", 1.0),
+        ("best_of_nash", GREY, "-", "best-of-Nash", 1.0),
     ]
-    return pd.concat(
-        [cache, pd.DataFrame(rows, columns=ATOM_COLUMNS)], ignore_index=True
-    )
+    draw_metric(axes[0], summary, "overall", arms)
+    draw_metric(axes[1], summary, "tokens", arms)
+    axes[0].set_ylabel("Judged overall win rate vs anchor")
+    axes[1].set_ylabel("Expected response tokens")
+    axes[1].legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    return figure
+
+
+@app.function
+def chart_quality(summary: pd.DataFrame, grader: str):
+    """Chart 2: on quality criteria Blackwell matches Nash and guards the worst one."""
+    figure, axes = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
+    arms = [
+        ("blackwell_quality", ORANGE, "-", "Blackwell, 5 quality heads", 1.0),
+        ("blackwell_attributes", ORANGE, "--", "Blackwell, 4 attributes (no overall)", 0.5),
+        ("best_of_nash", GREY, "-", "best-of-Nash", 1.0),
+    ]
+    for panel, metric, label in zip(
+        axes,
+        ("overall", "rawlsian", "nash_welfare"),
+        (
+            "Judged overall win rate vs anchor",
+            f"Rawlsian welfare, worst attribute ({grader})",
+            f"Nash welfare, geometric mean ({grader})",
+        ),
+        strict=True,
+    ):
+        draw_metric(panel, summary, metric, arms)
+        panel.set_ylabel(label)
+    axes[2].legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    return figure
+
+
+@app.function
+def matched_weight(summary: pd.DataFrame) -> str:
+    """The nash_length arm whose tokens at the largest N are closest to the scale-1 length arm's."""
+    at_max = summary[(summary["n"] == N_VALUES[-1]) & (summary["metric"] == "tokens")]
+    target = at_max.loc[at_max["method"] == "blackwell_quality_length@1", "mean"].item()
+    baselines = at_max[at_max["method"].str.startswith("nash_length@")]  # pyright: ignore[reportAttributeAccessIssue]
+    return baselines.loc[(baselines["mean"] - target).abs().idxmin(), "method"]  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@app.function
+def chart_length(summary: pd.DataFrame):
+    """Chart 3: conciseness as a criterion, against Nash and a scalarised baseline."""
+    figure, axes = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
+    baseline = matched_weight(summary)
+    arms = [
+        ("best_of_nash", GREY, "-", "best-of-Nash", 1.0),
+        ("blackwell_quality", ORANGE, "-", "Blackwell, 5 quality heads", 1.0),
+        ("blackwell_quality_length@1", YELLOW, "-", "Blackwell + length head (scale 1)", 1.0),
+        (baseline, MAGENTA, "--", f"scalarised Nash, {baseline.split('@')[1]} length", 1.0),
+    ]
+    scales = [
+        (f"blackwell_quality_length@{scale:g}", YELLOW, "-", f"length head, scale {scale:g}", 0.35)
+        for scale in SCALES
+        if scale != 1.0
+    ]
+    draw_metric(axes[0], summary, "overall", arms)
+    draw_metric(axes[1], summary, "tokens", arms + scales)
+    draw_metric(axes[2], summary, "wins_per_ktoken", arms)
+    axes[0].set_ylabel("Judged overall win rate vs anchor")
+    axes[1].set_ylabel("Expected response tokens")
+    axes[2].set_ylabel("Judged wins per kilotoken")
+    axes[1].legend(frameon=False, fontsize=7, loc="upper left")
+    axes[2].legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    return figure
+
+
+@app.function
+def chart_scorers(
+    pairwise: pd.DataFrame, bradley_terry: pd.DataFrame, triads: pd.DataFrame, grader: str
+):
+    """Chart 4: joint vs pointwise scoring as the pool grows."""
+    figure, axes = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
+    for summary, style, scorer in ((pairwise, "-", "pairwise"), (bradley_terry, "--", "BT")):
+        arms = [
+            ("blackwell_quality", ORANGE, style, f"Blackwell, 5 quality heads ({scorer})", 1.0),
+            ("best_of_nash", GREY, style, f"best-of-Nash ({scorer})", 1.0),
+        ]
+        draw_metric(axes[0], summary, "overall", arms)
+        draw_metric(axes[1], summary, "rawlsian", arms)
+    axes[0].set_ylabel("Judged overall win rate vs anchor")
+    axes[1].set_ylabel(f"Rawlsian welfare, worst attribute ({grader})")
+    axes[2].plot(triads["n"], triads["fraction"], color=BLUE, marker="o", linewidth=2, label="pairwise tensors")
+    axes[2].axhline(0.0, color=GREY, linestyle="--", linewidth=1, label="BT (transitive)")
+    axes[2].set_xscale("log", base=2)
+    axes[2].set_xticks(N_VALUES)
+    axes[2].set_xticklabels([str(n) for n in N_VALUES])
+    axes[2].set_xlabel("N (pool size)")
+    axes[2].set_ylabel("Cyclic triads in the overall head")
+    axes[2].spines[["top", "right"]].set_visible(False)
+    axes[2].legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    return figure
 
 
 @app.cell
@@ -670,100 +879,7 @@ def _(
 @app.cell
 def _(evaluation_tensors, policies, prompts):
     win_rates_dataframe = anchor_win_rates(policies, evaluation_tensors, prompts)
-    win_rates_dataframe
-    return (win_rates_dataframe,)
-
-
-@app.cell
-def _(policies, preference_tensors, prompts):
-    # Tau is chosen on the selector's own tensors, so the evaluation model
-    # never touches selection
-    frontier_arms = frontier_methods(
-        anchor_win_rates(policies, preference_tensors, prompts)
-    )
-    frontier_arms
-    return (frontier_arms,)
-
-
-@app.cell
-def _(win_rates_dataframe):
-    worst_rates = (
-        win_rates_dataframe[win_rates_dataframe["criterion"].isin(WELFARE_HEADS)]
-        .groupby(["method", "n"], as_index=False)["win_rate"]
-        .min()
-    )
-    metric_figure, metric_axes = plt.subplots(figsize=(5, 3.2))
-    metric_axes.axhline(
-        worst_rates.loc[worst_rates["method"] == "base", "win_rate"].item(),
-        color="grey",
-        linestyle=":",
-        linewidth=1,
-        label="base",
-    )
-    for line_method in (
-        "best_of_nash",
-        "best_of_blackwell",
-        "blackwell_no_verbosity",
-        "entropic_blackwell",
-    ):
-        line_stats = worst_rates[worst_rates["method"] == line_method].sort_values("n")
-        metric_axes.plot(
-            line_stats["n"], line_stats["win_rate"], marker="o", label=line_method
-        )
-    metric_axes.set_xscale("log", base=2)
-    metric_axes.set_xlabel("N (pool size)")
-    metric_axes.set_ylabel("Worst-criterion win rate")
-    metric_axes.legend(frameon=False)
-    metric_axes.spines[["top", "right"]].set_visible(False)
-    metric_figure
-    return (worst_rates,)
-
-
-@app.cell
-def _(policies, pool_tokens, worst_rates):
-    # Token efficiency: exact counts from the base tokenizer, no annotation.
-    # A method whose expected tokens climb with N while its win rate does not
-    # is chasing the raw verbosity head rather than quality
-    efficiency_dataframe = worst_rates.merge(
-        expected_token_counts(policies, pool_tokens), on=["method", "n"]
-    )
-    efficiency_dataframe["win_rate_per_ktoken"] = efficiency_dataframe["win_rate"] / (
-        efficiency_dataframe["tokens"] / 1000.0
-    )
-    efficiency_dataframe
-    return (efficiency_dataframe,)
-
-
-@app.cell
-def _(efficiency_dataframe):
-    tokens_figure, tokens_axes = plt.subplots(figsize=(5, 3.2))
-    tokens_axes.axhline(
-        efficiency_dataframe.loc[
-            efficiency_dataframe["method"] == "base", "tokens"
-        ].item(),
-        color="grey",
-        linestyle=":",
-        linewidth=1,
-        label="base",
-    )
-    for tokens_method in (
-        "best_of_nash",
-        "best_of_blackwell",
-        "blackwell_no_verbosity",
-        "entropic_blackwell",
-    ):
-        tokens_stats = efficiency_dataframe[
-            efficiency_dataframe["method"] == tokens_method
-        ].sort_values("n")
-        tokens_axes.plot(
-            tokens_stats["n"], tokens_stats["tokens"], marker="o", label=tokens_method
-        )
-    tokens_axes.set_xscale("log", base=2)
-    tokens_axes.set_xlabel("N (pool size)")
-    tokens_axes.set_ylabel("Expected response tokens")
-    tokens_axes.legend(frameon=False)
-    tokens_axes.spines[["top", "right"]].set_visible(False)
-    tokens_figure
+    win_rates_dataframe.pivot(index=["method", "n"], columns="criterion", values="win_rate").round(3)
     return
 
 
@@ -775,26 +891,28 @@ def _():
 
 
 @app.cell
-def _(anchors, frontier_arms, judge_button, prefix, selections_dataframe, suffix):
+def _(anchors, judge_button, prefix, selections_dataframe, suffix):
     mo.stop(not judge_button.value)
     # Expectation scoring: judge each distinct support atom once against the
     # anchor, then average atom scores under each policy's weights. The hub's
-    # atom cache is upserted, so atoms already judged by this model in an
-    # earlier run or under the other scorer are not re-judged. Only the
-    # frontier arms are judged: the entropic policy has full support, so
-    # judging it would cost ~n calls per prompt, and the off-chart tau
-    # variants would multiply the atom count; both are scored on the tensor
-    # metric only
+    # atom cache is upserted after every chunk, so atoms already judged by
+    # this model in an earlier run or under the other scorer are not
+    # re-judged and an outage loses at most one chunk. The entropic policy
+    # has full support (~n calls per prompt) and is scored on the tensor
+    # metrics only
     judged_selections = selections_dataframe[
-        selections_dataframe["method"].isin(frontier_arms)
+        selections_dataframe["method"] != "entropic_blackwell"
     ]
     atoms = judged_selections[["prompt", "response"]].drop_duplicates()
     comparisons = [
         {"instruction": prompt, "response": response, "anchor": anchors[prompt]}
         for prompt, response in zip(atoms["prompt"], atoms["response"], strict=True)
     ]
-    atom_cache = judge_atoms(comparisons, load_atom_judgements(prefix))
-    upload_dataframe("atom_judgements.parquet", atom_cache, prefix)
+    atom_cache = judge_atoms(
+        comparisons,
+        load_atom_judgements(prefix),
+        checkpoint=lambda cache: upload_dataframe("atom_judgements.parquet", cache, prefix),
+    )
     judged_atoms = atom_cache[atom_cache["model"] == JUDGE_MODEL]
     atom_scores = dict(
         zip(
@@ -810,135 +928,68 @@ def _(anchors, frontier_arms, judge_button, prefix, selections_dataframe, suffix
 
 
 @app.cell
-def _(judge_scores_dataframe):
-    judge_summary = judge_scores_dataframe.groupby(["method", "n"], as_index=False)[
-        "score"
-    ].mean()
-    judge_summary.pivot(index="n", columns="method", values="score").round(3)
-    return (judge_summary,)
+def _(
+    evaluation_tensors,
+    judge_scores_dataframe,
+    policies,
+    pool_tokens,
+    prefix,
+    prompts,
+    suffix,
+):
+    # Per-prompt table behind every chart: per-head win rates vs the anchor
+    # (evaluation tensors), expected tokens and the judged score
+    results_dataframe = prompt_results(
+        policies, evaluation_tensors, prompts, pool_tokens
+    ).merge(judge_scores_dataframe, on=["prompt", "method", "n"], how="left")
+    upload_dataframe(f"results{suffix}.parquet", results_dataframe, prefix)
+    summary_dataframe = summarise(results_dataframe)
+    summary_dataframe.pivot(index=["method", "n"], columns="metric", values="mean").round(3)
+    return (summary_dataframe,)
 
 
 @app.cell
-def _(judge_summary):
-    judge_figure, judge_axes = plt.subplots(figsize=(5, 3.2))
-    judge_axes.axhline(
-        judge_summary.loc[judge_summary["method"] == "base", "score"].item(),
-        color="grey",
-        linestyle=":",
-        linewidth=1,
-        label="base",
-    )
-    for curve_method in ("best_of_nash", "best_of_blackwell", "blackwell_no_verbosity"):
-        curve_stats = judge_summary[judge_summary["method"] == curve_method].sort_values(
-            "n"
-        )
-        judge_axes.plot(
-            curve_stats["n"], curve_stats["score"], marker="o", label=curve_method
-        )
-    judge_axes.set_xscale("log", base=2)
-    judge_axes.set_xlabel("N (pool size)")
-    judge_axes.set_ylabel("Expected overall win rate vs anchor")
-    judge_axes.legend(frameon=False)
-    judge_axes.spines[["top", "right"]].set_visible(False)
-    judge_figure
+def _(summary_dataframe):
+    chart_verbosity(summary_dataframe)
     return
 
 
-@app.function
-def frontier_figure(frontier: pd.DataFrame, arms: list[str], grader: str):
-    """Judged overall against Rawlsian welfare, Nash welfare and expected tokens.
-
-    One colour per criterion ablation, traced over N with markers growing
-    with N; a tau family's best tau is dashed next to its solid tau = 0.5
-    line; the length-scale sweep draws only scale 1 over N and the other
-    scales as a dotted trace at the largest N.
-    """
-    colours = {
-        "best_of_blackwell": "#2a78d6",
-        "blackwell_no_verbosity": "#eb6834",
-        "blackwell_no_verbosity_overall": "#1baf7a",
-        "blackwell_no_verbosity_tokens": "#eda100",
-        "blackwell_no_verbosity_overall_tokens": "#e87ba4",
-        "best_of_nash": "#8a8983",
-        "base": "#8a8983",
-    }
-    figure, axes = plt.subplots(
-        1, 3, figsize=(15, 4.8), sharey=True, constrained_layout=True
-    )
-    panels = (
-        ("rawlsian", "Rawlsian welfare (worst quality criterion)"),
-        ("nash", "Nash welfare (geometric mean of quality criteria)"),
-        ("tokens", "Expected response tokens"),
-    )
-    scale_arms = [
-        arm
-        for arm in arms
-        if arm.startswith("blackwell_no_verbosity_tokens@")
-        and float(arm.split("@")[1]) != 1.0
-    ]
-    for panel_axes, (column, label) in zip(axes, panels, strict=True):
-        for arm in arms:
-            if arm in scale_arms:
-                continue
-            stats = frontier[frontier["method"] == arm].sort_values("n")  # pyright: ignore[reportCallIssue]
-            family, _, suffix = arm.partition("@")
-            dashed = "overall" in family and suffix not in ("", "0.50")
-            panel_axes.plot(
-                stats[column],
-                stats["overall"],
-                color=colours[family],
-                linestyle="--" if dashed else "-",
-                linewidth=2,
-                label=arm,
-            )
-            panel_axes.scatter(
-                stats[column],
-                stats["overall"],
-                s=20 + 12 * np.log2(stats["n"]),
-                color=colours[family],
-                edgecolor="white",
-                linewidth=1,
-                zorder=3,
-            )
-        if scale_arms:
-            trace = frontier[
-                frontier["method"].isin(scale_arms + ["blackwell_no_verbosity_tokens@1"])
-                & (frontier["n"] == N_VALUES[-1])
-            ].copy()
-            trace["scale"] = trace["method"].str.split("@").str[1].astype(float)  # pyright: ignore[reportAttributeAccessIssue]
-            trace = trace.sort_values("scale")  # pyright: ignore[reportCallIssue]
-            panel_axes.plot(
-                trace[column],
-                trace["overall"],
-                color=colours["blackwell_no_verbosity_tokens"],
-                linestyle=":",
-                linewidth=1.5,
-                marker="s",
-                markersize=5,
-                label=f"tokens scale sweep at N = {N_VALUES[-1]}",
-            )
-        panel_axes.set_xlabel(label)
-        panel_axes.spines[["top", "right"]].set_visible(False)
-    axes[0].set_ylabel("Expected overall win rate vs anchor")
-    figure.suptitle(f"Welfare graded by the {grader}", fontsize=10)
-    axes[2].legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
-    return figure
+@app.cell
+def _(evaluation_label, summary_dataframe):
+    chart_quality(summary_dataframe, evaluation_label)
+    return
 
 
 @app.cell
-def _(judge_summary, policies, pool_tokens, win_rates_dataframe):
-    frontier_dataframe = (
-        welfare_frame(win_rates_dataframe)
-        .merge(expected_token_counts(policies, pool_tokens), on=["method", "n"])
-        .merge(judge_summary.rename(columns={"score": "overall"}), on=["method", "n"])
-    )
-    frontier_dataframe.round(3)
-    return (frontier_dataframe,)
+def _(summary_dataframe):
+    chart_length(summary_dataframe)
+    return
 
 
 @app.cell
-def _(evaluation_label, frontier_arms, frontier_dataframe):
-    frontier_figure(frontier_dataframe, frontier_arms, evaluation_label)
+def _(evaluation_label, prefix, summary_dataframe, suffix):
+    # The other scorer's results table comes from the hub, so both scorers
+    # appear without solving twice; the triad diagnostic reads the pairwise
+    # tensors, which are the only ones that can hold cycles
+    other_suffix = "_bt" if suffix == "" else ""
+    other_file = f"results{other_suffix}.parquet"
+    if file_exists(ARTIFACTS_REPO, f"{prefix}/{other_file}", repo_type="dataset"):
+        other_summary = summarise(pd.read_parquet(artifact_path(other_file, prefix)))
+        pairwise_summary, bt_summary = (
+            (summary_dataframe, other_summary)
+            if suffix == ""
+            else (other_summary, summary_dataframe)
+        )
+        pairwise_tensors = np.load(artifact_path("preference_tensors.npz", prefix))
+        scorer_chart = chart_scorers(
+            pairwise_summary,
+            bt_summary,
+            triad_fractions(pairwise_tensors, pairwise_tensors["prompts"].tolist()),
+            evaluation_label,
+        )
+    else:
+        scorer_chart = mo.md(f"{other_file} is not on the hub yet; run the other scorer first.")
+    scorer_chart
     return
 
 

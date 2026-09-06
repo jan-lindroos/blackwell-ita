@@ -13,13 +13,15 @@ from experiments import (
     best_of_nash,
     blackwell_winner,
     comparison_prompt,
+    cyclic_triad_fraction,
     expected_scores,
     expected_token_counts,
-    frontier_methods,
     length_preference,
+    matched_weight,
     policy_support,
+    prompt_results,
     prompt_tensor,
-    welfare_frame,
+    summarise,
 )
 from scipy.optimize import linprog
 
@@ -214,68 +216,76 @@ def test_length_head_dilutes_a_long_dominant_candidate_by_scale():
     assert flat[0] > 0.9
 
 
-def test_frontier_methods_picks_best_tau_per_family_at_largest_n():
-    """Each sweep family keeps tau = 0.5 plus its best tau on overall at N max."""
-    rows = []
-    for family, best in (
-        ("blackwell_no_verbosity_overall", "0.80"),
-        ("blackwell_no_verbosity_overall_tokens", "0.50"),
-    ):
-        for tau in ("0.50", "0.65", "0.80"):
-            for n in (16, 128):
-                for criterion in HEADS:
-                    rate = 0.9 if (tau == best and n == 128) else 0.5
-                    # A decoy: the wrong tau leads on a criterion head and at
-                    # the smaller N, neither of which should drive selection
-                    if criterion != "overall" or n != 128:
-                        rate = 0.95 if tau == "0.65" else 0.5
-                    rows.append(
-                        {
-                            "method": f"{family}@{tau}",
-                            "n": n,
-                            "criterion": criterion,
-                            "win_rate": rate,
-                        }
-                    )
-    for scale in ("4", "0.25", "1"):
-        rows.append(
-            {
-                "method": f"blackwell_no_verbosity_tokens@{scale}",
-                "n": 128,
-                "criterion": "overall",
-                "win_rate": 0.99,
-            }
-        )
-    methods = frontier_methods(pd.DataFrame(rows))
-    assert methods == [
-        "base",
-        "best_of_nash",
-        "best_of_blackwell",
-        "blackwell_no_verbosity",
-        "blackwell_no_verbosity_tokens@0.25",
-        "blackwell_no_verbosity_tokens@1",
-        "blackwell_no_verbosity_tokens@4",
-        "blackwell_no_verbosity_overall@0.50",
-        "blackwell_no_verbosity_overall_tokens@0.50",
-        "blackwell_no_verbosity_overall@0.80",
-    ]
+def test_prompt_results_reads_anchor_column_and_expected_tokens():
+    """Per-prompt rows carry each head's rate vs the anchor and expected tokens."""
+    p_tensor = np.full((len(HEADS), 3, 3), 0.5)
+    p_tensor[:, 0, -1] = 0.8
+    p_tensor[:, 1, -1] = 0.4
+    policies = {("p", "m", 2): np.array([0.5, 0.5]), ("p", "base", 1): np.array([1.0])}
+    frame = prompt_results(policies, {"tensor_0": p_tensor}, ["p"], {"p": [100, 300, 999]})
+    rows = frame.set_index(["method", "n"])
+    assert rows.loc[("m", 2), "helpfulness"] == pytest.approx(0.6)
+    assert rows.loc[("m", 2), "tokens"] == pytest.approx(200.0)
+    assert rows.loc[("base", 1), "overall"] == pytest.approx(0.8)
+    assert rows.loc[("base", 1), "tokens"] == pytest.approx(100.0)
 
 
-def test_welfare_frame_takes_min_and_geometric_mean_over_quality_criteria():
-    """Rawlsian is the minimum, Nash the geometric mean; verbosity and overall excluded."""
-    rates = {"helpfulness": 0.8, "correctness": 0.2, "coherence": 0.5}
-    rows = [
-        {"method": "m", "n": 4, "criterion": criterion, "win_rate": rate}
-        for criterion, rate in rates.items()
-    ] + [
-        {"method": "m", "n": 4, "criterion": "complexity", "win_rate": 0.5},
-        {"method": "m", "n": 4, "criterion": "verbosity", "win_rate": 0.01},
-        {"method": "m", "n": 4, "criterion": "overall", "win_rate": 0.01},
-    ]
-    frame = welfare_frame(pd.DataFrame(rows))
-    assert list(frame.columns) == ["method", "n", "rawlsian", "nash"]
-    assert frame["rawlsian"].item() == pytest.approx(0.2)
-    assert frame["nash"].item() == pytest.approx((0.8 * 0.2 * 0.5 * 0.5) ** (1 / 4))
+def test_summarise_computes_metrics_with_paired_bands():
+    """Means match the definitions and bands bracket them; missing scores drop overall."""
+    heads = {head: [0.6, 0.6, 0.6] for head in experiments.WELFARE_HEADS}
+    heads["correctness"] = [0.2, 0.4, 0.6]
+    results = pd.DataFrame(
+        {
+            "prompt": ["a", "b", "c"],
+            "method": ["m"] * 3,
+            "n": [4] * 3,
+            "score": [1.0, 0.0, 0.5],
+            "verbosity": [0.9] * 3,
+            "overall": [0.9] * 3,
+            "tokens": [100.0, 200.0, 300.0],
+            **heads,
+        }
+    )
+    summary = summarise(results, draws=200)
+    assert list(summary.columns) == ["method", "n", "metric", "mean", "lo", "hi"]
+    means = summary.set_index("metric")["mean"]
+    assert means["overall"] == pytest.approx(0.5)
+    assert means["rawlsian"] == pytest.approx(0.4)
+    assert means["nash_welfare"] == pytest.approx((0.6**3 * 0.4) ** 0.25)
+    assert means["tokens"] == pytest.approx(200.0)
+    assert means["wins_per_ktoken"] == pytest.approx(2.5)
+    assert (summary["lo"] <= summary["mean"] + 1e-9).all()
+    assert (summary["hi"] >= summary["mean"] - 1e-9).all()
+    unjudged = summarise(results.assign(score=np.nan), draws=50)
+    assert "overall" not in set(unjudged["metric"])
+    assert "rawlsian" in set(unjudged["metric"])
+
+
+def test_cyclic_triad_fraction_detects_cycles():
+    """A rock-paper-scissors matrix is all cycles; a dominant one has none."""
+    assert cyclic_triad_fraction(CYCLE) == 1.0
+    assert cyclic_triad_fraction(DOMINANT) == 0.0
+    assert cyclic_triad_fraction(np.full((2, 2), 0.5)) == 0.0
+
+
+def test_matched_weight_picks_the_closest_token_count():
+    """The scalarised baseline shown is the weight matching the length arm's tokens."""
+    summary = pd.DataFrame(
+        {
+            "method": [
+                "blackwell_quality_length@1",
+                "nash_length@0.1",
+                "nash_length@0.25",
+                "nash_length@0.5",
+            ],
+            "n": [128] * 4,
+            "metric": ["tokens"] * 4,
+            "mean": [270.0, 380.0, 280.0, 200.0],
+            "lo": [0.0] * 4,
+            "hi": [0.0] * 4,
+        }
+    )
+    assert matched_weight(summary) == "nash_length@0.25"
 
 
 def test_policy_support_drops_dust_and_renormalises():
@@ -458,9 +468,9 @@ def test_claude_pick_raises_after_exhausting_attempts(monkeypatch):
 
     monkeypatch.setattr(experiments.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(experiments.subprocess, "run", failing_run)
-    with pytest.raises(RuntimeError, match=r"3 attempts.*boom"):
+    with pytest.raises(RuntimeError, match=r"5 attempts.*boom"):
         experiments.claude_pick("prompt", "claude-sonnet-5")
-    assert calls["count"] == 3
+    assert calls["count"] == 5
 
 
 def test_entropic_solve_falls_back_to_scs_when_clarabel_fails(monkeypatch):
@@ -521,6 +531,27 @@ def test_judge_atoms_only_judges_cache_misses_for_the_model(monkeypatch):
     # A different judge model re-judges the same atom
     experiments.judge_atoms(comparisons[:1], merged, model="other")
     assert judged[-1] == ("i", "old", "other")
+
+
+def test_judge_atoms_checkpoints_after_every_chunk(monkeypatch):
+    """The checkpoint sees the growing cache once per chunk and never on a no-op."""
+    monkeypatch.setattr(
+        experiments,
+        "outcomes",
+        lambda comparisons, model=None: [
+            {"score": 0.5, "forward": None, "backward": None} for _ in comparisons
+        ],
+    )
+    empty = pd.DataFrame(columns=experiments.ATOM_COLUMNS)
+    comparisons = [{"instruction": "i", "response": r, "anchor": "a"} for r in "xyz"]
+    sizes = []
+    merged = experiments.judge_atoms(
+        comparisons, empty, chunk=2, checkpoint=lambda cache: sizes.append(len(cache))
+    )
+    assert sizes == [2, 3]
+    assert len(merged) == 3
+    experiments.judge_atoms(comparisons, merged, chunk=2, checkpoint=lambda cache: sizes.append(-1))
+    assert sizes == [2, 3]
 
 
 def test_outcomes_preserves_order_and_forwards_arguments(monkeypatch):
