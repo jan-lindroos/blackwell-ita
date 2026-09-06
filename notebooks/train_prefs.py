@@ -1451,7 +1451,7 @@ def _(score_button, score_model_dropdown):
                 tensor_prompt,
                 prompt_candidates["response"].tolist(),
                 scoring_device,
-                batch_size=16,
+                batch_size=64,
             )
             if (tensor_index + 1) % 10 == 0:
                 upload_tensors(
