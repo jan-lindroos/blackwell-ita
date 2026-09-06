@@ -15,8 +15,10 @@ from experiments import (
     comparison_prompt,
     expected_scores,
     expected_token_counts,
+    frontier_methods,
     policy_support,
     prompt_tensor,
+    welfare_frame,
 )
 from scipy.optimize import linprog
 
@@ -178,6 +180,72 @@ def test_entropic_blackwell_interpolates_between_lp_and_uniform():
     assert blackwell_winner(DOMINANT[None], beta=0.01)[0] > 0.9
     np.testing.assert_allclose(
         blackwell_winner(DOMINANT[None], beta=5.0), np.full(3, 1 / 3), atol=0.05
+    )
+
+
+def test_blackwell_token_cap_binds_at_the_pool_mean():
+    """A long dominant candidate is diluted until expected tokens hit the mean."""
+    tokens = np.array([300.0, 100.0, 100.0])
+    np.testing.assert_allclose(
+        blackwell_winner(DOMINANT[None]), [1.0, 0.0, 0.0], atol=1e-6
+    )
+    capped = blackwell_winner(DOMINANT[None], tokens=tokens)
+    assert tokens @ capped <= tokens.mean() + 1e-6
+    assert capped[0] == pytest.approx(1 / 3, abs=1e-6)
+
+
+def test_frontier_methods_picks_best_tau_per_family_at_largest_n():
+    """Each sweep family keeps tau = 0.5 plus its best tau on overall at N max."""
+    rows = []
+    for family, best in (
+        ("blackwell_no_verbosity_overall", "0.80"),
+        ("blackwell_no_verbosity_overall_tokens", "0.50"),
+    ):
+        for tau in ("0.50", "0.65", "0.80"):
+            for n in (16, 128):
+                for criterion in HEADS:
+                    rate = 0.9 if (tau == best and n == 128) else 0.5
+                    # A decoy: the wrong tau leads on a criterion head and at
+                    # the smaller N, neither of which should drive selection
+                    if criterion != "overall" or n != 128:
+                        rate = 0.95 if tau == "0.65" else 0.5
+                    rows.append(
+                        {
+                            "method": f"{family}@{tau}",
+                            "n": n,
+                            "criterion": criterion,
+                            "win_rate": rate,
+                        }
+                    )
+    methods = frontier_methods(pd.DataFrame(rows))
+    assert methods[:7] == [
+        "base",
+        "best_of_nash",
+        "best_of_blackwell",
+        "blackwell_no_verbosity",
+        "blackwell_no_verbosity_tokens",
+        "blackwell_no_verbosity_overall@0.50",
+        "blackwell_no_verbosity_overall_tokens@0.50",
+    ]
+    assert methods[7:] == ["blackwell_no_verbosity_overall@0.80"]
+
+
+def test_welfare_frame_takes_min_and_geometric_mean_over_criteria():
+    """Rawlsian is the criterion minimum, Nash the geometric mean, overall excluded."""
+    rates = {"helpfulness": 0.8, "correctness": 0.2, "coherence": 0.5}
+    rows = [
+        {"method": "m", "n": 4, "criterion": criterion, "win_rate": rate}
+        for criterion, rate in rates.items()
+    ] + [
+        {"method": "m", "n": 4, "criterion": "complexity", "win_rate": 0.5},
+        {"method": "m", "n": 4, "criterion": "verbosity", "win_rate": 0.5},
+        {"method": "m", "n": 4, "criterion": "overall", "win_rate": 0.01},
+    ]
+    frame = welfare_frame(pd.DataFrame(rows))
+    assert list(frame.columns) == ["method", "n", "rawlsian", "nash"]
+    assert frame["rawlsian"].item() == pytest.approx(0.2)
+    assert frame["nash"].item() == pytest.approx(
+        (0.8 * 0.2 * 0.5 * 0.5 * 0.5) ** (1 / 5)
     )
 
 
@@ -364,6 +432,66 @@ def test_claude_pick_raises_after_exhausting_attempts(monkeypatch):
     with pytest.raises(RuntimeError, match=r"3 attempts.*boom"):
         experiments.claude_pick("prompt", "claude-sonnet-5")
     assert calls["count"] == 3
+
+
+def test_entropic_solve_falls_back_to_scs_when_clarabel_fails(monkeypatch):
+    """A Clarabel failure on an entropic solve retries with SCS; an LP does not."""
+    original_solve = experiments.cp.Problem.solve
+    solvers = []
+
+    def flaky_solve(self, *args, **kwargs):
+        solvers.append(kwargs.get("solver"))
+        if kwargs.get("solver") == experiments.cp.CLARABEL:
+            raise experiments.cp.SolverError("boom")
+        return original_solve(self, *args, **kwargs)
+
+    monkeypatch.setattr(experiments.cp.Problem, "solve", flaky_solve)
+    np.testing.assert_allclose(
+        blackwell_winner(CYCLE[None], beta=0.05), np.full(3, 1 / 3), atol=1e-3
+    )
+    assert solvers == [experiments.cp.CLARABEL, experiments.cp.SCS]
+    with pytest.raises(RuntimeError, match="solve failed"):
+        blackwell_winner(CYCLE[None])
+
+
+def test_judge_atoms_only_judges_cache_misses_for_the_model(monkeypatch):
+    """Cached (instruction, response, model) atoms are skipped; misses are appended."""
+    judged = []
+
+    def fake_outcomes(comparisons, model=None):
+        judged.extend((c["instruction"], c["response"], model) for c in comparisons)
+        return [
+            {"score": 1.0, "forward": "FIRST", "backward": "SECOND"} for _ in comparisons
+        ]
+
+    monkeypatch.setattr(experiments, "outcome", None)
+    monkeypatch.setattr(experiments, "outcomes", fake_outcomes)
+    cache = pd.DataFrame(
+        [
+            {
+                "instruction": "i",
+                "response": "old",
+                "model": "m",
+                "score": 0.0,
+                "forward": "SECOND",
+                "backward": "FIRST",
+            }
+        ],
+        columns=experiments.ATOM_COLUMNS,
+    )
+    comparisons = [
+        {"instruction": "i", "response": "old", "anchor": "a"},
+        {"instruction": "i", "response": "new", "anchor": "a"},
+    ]
+    merged = experiments.judge_atoms(comparisons, cache, model="m")
+    assert judged == [("i", "new", "m")]
+    assert list(merged.columns) == experiments.ATOM_COLUMNS
+    assert len(merged) == 2
+    assert merged.loc[merged["response"] == "old", "score"].item() == 0.0
+    assert merged.loc[merged["response"] == "new", "score"].item() == 1.0
+    # A different judge model re-judges the same atom
+    experiments.judge_atoms(comparisons[:1], merged, model="other")
+    assert judged[-1] == ("i", "old", "other")
 
 
 def test_outcomes_preserves_order_and_forwards_arguments(monkeypatch):

@@ -42,6 +42,13 @@ with app.setup:
     SPLITS_REPO = "blackwell-ita/helpsteer2-splits"
     DATASET = "helpsteer2"
     DEFAULT_BASE_MODEL = "RLHFlow/LLaMA3-SFT-v2"
+    SELECTOR_ENCODER = "Qwen/Qwen3-4B-Instruct-2507"
+    # The evaluation model: same recipe on a backbone outside the policies'
+    # and the selector's families, so the welfare metrics are not read off the
+    # tensors the LP optimised against
+    EVALUATION_ENCODER = "microsoft/Phi-4-mini-instruct"
+    EVALUATION_CHECKPOINT = "pairwise_phi4mini.pt"
+    EVALUATION_TENSORS = "preference_tensors_eval.npz"
 
     HELPSTEER2_ATTRIBUTES = [
         "helpfulness",
@@ -232,6 +239,12 @@ def artifact_exists(filename: str, prefix: str = DATASET) -> bool:
 
 
 @app.function
+def model_exists(filename: str) -> bool:
+    """Check whether a reward-model checkpoint exists on the hub."""
+    return file_exists(RMS_REPO, f"{DATASET}/{filename}")
+
+
+@app.function
 def upload_model(local_path: Path) -> None:
     """Upload a reward-model artifact to the hub."""
     api = HfApi()
@@ -336,6 +349,15 @@ def masked_binary_cross_entropy(
     return (losses * mask).sum() / mask.sum()
 
 
+@app.function
+def last_token_indices(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Index of each row's last attended token, whichever side is padded."""
+    # Granite's tokenizer pads on the left, where mask.sum() - 1 would land
+    # mid-sequence; the largest attended position is right for both sides
+    positions = torch.arange(attention_mask.size(1), device=attention_mask.device)
+    return (attention_mask * positions).argmax(dim=1)
+
+
 @app.class_definition
 class MultiHeadEncoder(torch.nn.Module):
     """Pretrained encoder with a linear head giving one logit per criterion."""
@@ -356,7 +378,7 @@ class MultiHeadEncoder(torch.nn.Module):
     def forward(self, tokenized: dict[str, torch.Tensor]) -> torch.Tensor:
         """Score tokenized inputs from the last non-padding token's hidden state."""
         hidden_states = self.encoder(**tokenized).last_hidden_state
-        last_indices = tokenized["attention_mask"].sum(dim=1) - 1
+        last_indices = last_token_indices(tokenized["attention_mask"])
         pooled = hidden_states[
             torch.arange(hidden_states.size(0), device=hidden_states.device),
             last_indices,
@@ -1196,12 +1218,36 @@ def _():
 
 @app.cell
 def _():
-    encoder_name = "Qwen/Qwen3-4B-Instruct-2507"
+    encoder_dropdown = mo.ui.dropdown(
+        options={
+            "selector (Qwen3-4B)": SELECTOR_ENCODER,
+            "evaluation (Phi-4-mini)": EVALUATION_ENCODER,
+        },
+        value="selector (Qwen3-4B)",
+        label="encoder",
+    )
+    encoder_dropdown
+    return (encoder_dropdown,)
+
+
+@app.cell
+def _(encoder_dropdown):
+    encoder_name = encoder_dropdown.value
+    checkpoint_name = (
+        "pairwise.pt" if encoder_name == SELECTOR_ENCODER else EVALUATION_CHECKPOINT
+    )
     max_tokens = 4000
     learning_rate = 1e-5
     batch_size = 12
     warmup_steps = 100
-    return batch_size, encoder_name, learning_rate, max_tokens, warmup_steps
+    return (
+        batch_size,
+        checkpoint_name,
+        encoder_name,
+        learning_rate,
+        max_tokens,
+        warmup_steps,
+    )
 
 
 @app.cell
@@ -1222,6 +1268,7 @@ def _():
 @app.cell
 def _(
     batch_size,
+    checkpoint_name,
     criterion_columns,
     downloaded_pairs,
     encoder_name,
@@ -1240,7 +1287,6 @@ def _(
         batch_size=batch_size,
         warmup_steps=warmup_steps,
     )
-    checkpoint_name = "pairwise.pt"
     with tempfile.TemporaryDirectory() as checkpoint_temp:
         checkpoint_path = Path(checkpoint_temp) / checkpoint_name
         save_reward_model(
@@ -1261,11 +1307,12 @@ def _():
     mo.md(r"""
     ## Preference tensors
 
-    Scores the selected backbone's pool under both hub checkpoints: the
-    pairwise model into preference_tensors.npz and the Bradley-Terry model
-    into preference_tensors_bt.npz. Scoring checkpoints to the hub every 10
-    prompts and resumes from the partial artifact, so a run can pick up where
-    a dead session stopped.
+    Scores the selected backbone's pool under the hub checkpoints: the
+    pairwise model into preference_tensors.npz, the Bradley-Terry model
+    into preference_tensors_bt.npz and the Phi-4-mini evaluation model into
+    preference_tensors_eval.npz (skipped until its checkpoint is trained).
+    Scoring checkpoints to the hub every 10 prompts and resumes from the
+    partial artifact, so a run can pick up where a dead session stopped.
     """)
 
 
@@ -1315,7 +1362,16 @@ def _(score_button, score_model_dropdown):
             load_bt_reward_model,
             bt_preference_tensor,
         ),
+        (
+            EVALUATION_CHECKPOINT,
+            EVALUATION_TENSORS,
+            load_reward_model,
+            preference_tensor,
+        ),
     ):
+        if not model_exists(checkpoint_file):
+            print(f"{checkpoint_file} is not on the hub yet, skipping")
+            continue
         scoring_model, scoring_columns = load_scorer(
             model_path(checkpoint_file), scoring_device
         )

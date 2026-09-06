@@ -28,7 +28,8 @@ with app.setup:
     import marimo as mo
     import numpy as np
     import pandas as pd
-    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub import HfApi, file_exists, hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError
 
     ARTIFACTS_REPO = "blackwell-ita/artifacts"
     DATASET = "helpsteer2"
@@ -45,12 +46,17 @@ with app.setup:
     NO_VERBOSITY_HEADS = [
         head for head in range(OVERALL_INDEX) if HEADS[head] != "verbosity"
     ]
+    # Scored by the Phi-4-mini evaluation model; the welfare metrics read from
+    # these so no arm is graded by the tensors its LP optimised against
+    EVALUATION_TENSORS = "preference_tensors_eval.npz"
     SAMPLES_PER_PROMPT = 128
     N_VALUES = [1, 4, 16, 64, 128]
     BETA = 0.05
+    TAUS = [round(0.5 + 0.05 * step, 2) for step in range(10)]
     # Pinned full model ID: a floating alias like "sonnet" can silently resolve
     # to a different model between judging runs
     JUDGE_MODEL = "claude-sonnet-5"
+    ATOM_COLUMNS = ["instruction", "response", "model", "score", "forward", "backward"]
     SYSTEM_PROMPT = (
         "You compare two responses to an instruction and pick the better one. "
         "Reply with exactly one word: FIRST or SECOND."
@@ -116,12 +122,15 @@ def blackwell_winner(
     preference_tensor: np.ndarray,
     thresholds: list[float] | None = None,
     beta: float = 0.0,
+    tokens: np.ndarray | None = None,
 ) -> np.ndarray:
     """Blackwell winner policy minimising the worst per-criterion shortfall.
 
     beta > 0 adds the entropic regularisation beta * KL(pi || uniform),
     making the objective strictly convex with a unique full-support
-    minimiser; beta = 0 is the exact linear programme.
+    minimiser; beta = 0 is the exact linear programme. tokens caps the
+    policy's expected response tokens at the pool mean, the base policy's
+    expected tokens over the same pool.
     """
     # Orthant target set S = {z : z_j >= tau_j}, tau = 1/2 per head by default:
     # minimise the worst clipped shortfall max_{i,j} (tau_j - P_j(pi, e_i))
@@ -138,11 +147,22 @@ def blackwell_winner(
         preference_tensor[head].T @ policy + shortfall >= thresholds[head]  # pyright: ignore[reportOptionalSubscript]
         for head in range(head_count)
     ]
+    if tokens is not None:
+        constraints.append(tokens @ policy <= float(np.mean(tokens)))
     problem = cp.Problem(cp.Minimize(objective), constraints)  # pyright: ignore[reportArgumentType]
     try:
         problem.solve(solver=cp.CLARABEL)
     except cp.SolverError as error:
-        raise RuntimeError(f"blackwell_winner solve failed: {error}") from error
+        if beta == 0:
+            raise RuntimeError(f"blackwell_winner solve failed: {error}") from error
+        # Clarabel breaks down on a few n = 128 entropic instances; SCS solves
+        # them to well within the support threshold
+        try:
+            problem.solve(solver=cp.SCS)
+        except cp.SolverError as scs_error:
+            raise RuntimeError(
+                f"blackwell_winner solve failed: {scs_error}"
+            ) from scs_error
     # Clarabel reports optimal_inaccurate on some entropic solves depending
     # on build; the tolerance slack is far below the 1e-6 support threshold
     if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or policy.value is None:
@@ -174,13 +194,19 @@ def policy_support(
 
 
 @app.function
-def solve_policies(tensors, prompts: list[str]) -> dict:
-    """Winner policies over pool prefixes, keyed (prompt, method, n)."""
+def solve_policies(tensors, prompts: list[str], pool_tokens: dict) -> dict:
+    """Winner policies over pool prefixes, keyed (prompt, method, n).
+
+    Tau-sweep arms add the overall head to the four no-verbosity criteria and
+    carry its threshold after an @ in the method name.
+    """
+    overall_heads = NO_VERBOSITY_HEADS + [OVERALL_INDEX]
     policies = {}
     for prompt_index, prompt in enumerate(
         mo.status.progress_bar(prompts, title="solving")
     ):
         tensor = prompt_tensor(tensors, prompt_index)
+        tokens = np.asarray(pool_tokens[prompt], dtype=float)
         policies[(prompt, "base", 1)] = np.array([1.0])
         for n in N_VALUES:
             policies[(prompt, "best_of_blackwell", n)] = blackwell_winner(
@@ -195,7 +221,68 @@ def solve_policies(tensors, prompts: list[str]) -> dict:
             policies[(prompt, "best_of_nash", n)] = best_of_nash(
                 tensor[OVERALL_INDEX, :n, :n]
             )
+            policies[(prompt, "blackwell_no_verbosity_tokens", n)] = blackwell_winner(
+                tensor[NO_VERBOSITY_HEADS, :n, :n], tokens=tokens[:n]
+            )
+            for tau in TAUS:
+                thresholds = [0.5] * len(NO_VERBOSITY_HEADS) + [tau]
+                policies[(prompt, f"blackwell_no_verbosity_overall@{tau:.2f}", n)] = (
+                    blackwell_winner(tensor[overall_heads, :n, :n], thresholds)
+                )
+                policies[
+                    (prompt, f"blackwell_no_verbosity_overall_tokens@{tau:.2f}", n)
+                ] = blackwell_winner(
+                    tensor[overall_heads, :n, :n], thresholds, tokens=tokens[:n]
+                )
     return policies
+
+
+@app.function
+def frontier_methods(win_rates: pd.DataFrame) -> list[str]:
+    """Methods on the frontier chart.
+
+    The fixed arms, each tau-sweep family at tau = 0.5, and each family's best
+    tau by the tensor's own overall win rate against the anchor at the largest
+    N, so no judge calls are spent selecting tau.
+    """
+    sweep = win_rates[
+        win_rates["method"].str.contains("@")
+        & (win_rates["criterion"] == "overall")
+        & (win_rates["n"] == N_VALUES[-1])
+    ]
+    families = sweep["method"].str.split("@").str[0]  # pyright: ignore[reportAttributeAccessIssue]
+    best = sweep.loc[sweep.groupby(families)["win_rate"].idxmax(), "method"]
+    return list(
+        dict.fromkeys(
+            [
+                "base",
+                "best_of_nash",
+                "best_of_blackwell",
+                "blackwell_no_verbosity",
+                "blackwell_no_verbosity_tokens",
+                "blackwell_no_verbosity_overall@0.50",
+                "blackwell_no_verbosity_overall_tokens@0.50",
+                *best.tolist(),
+            ]
+        )
+    )
+
+
+@app.function
+def welfare_frame(win_rates: pd.DataFrame) -> pd.DataFrame:
+    """Rawlsian (minimum) and Nash (geometric mean) welfare per (method, n).
+
+    Both aggregate the mean criterion win rates against the anchor over the
+    five HelpSteer2 heads; the overall head is left out.
+    """
+    criteria = win_rates[win_rates["criterion"].isin(HEADS[:OVERALL_INDEX])]
+    grouped = criteria.groupby(["method", "n"])["win_rate"]
+    return pd.DataFrame(
+        {
+            "rawlsian": grouped.min(),
+            "nash": grouped.agg(lambda rates: float(np.exp(np.log(rates).mean()))),
+        }
+    ).reset_index()
 
 
 @app.function
@@ -388,6 +475,46 @@ def outcomes(
         )
 
 
+@app.function
+def load_atom_judgements(prefix: str) -> pd.DataFrame:
+    """A backbone's atom judgement cache from the hub, empty if none exists."""
+    try:
+        return pd.read_parquet(artifact_path("atom_judgements.parquet", prefix))
+    except EntryNotFoundError:
+        return pd.DataFrame(columns=ATOM_COLUMNS)
+
+
+@app.function
+def judge_atoms(
+    comparisons: list[dict], cache: pd.DataFrame, model: str = JUDGE_MODEL
+) -> pd.DataFrame:
+    """Judge the comparisons the cache lacks for this model; return the merged cache.
+
+    Atoms are keyed on (instruction, response, model): the anchor is fixed
+    per instruction, so a judgement carries over between scorers and runs.
+    """
+    seen = set(zip(cache["instruction"], cache["response"], cache["model"], strict=True))
+    fresh = [
+        comparison
+        for comparison in comparisons
+        if (comparison["instruction"], comparison["response"], model) not in seen
+    ]
+    rows = [
+        {
+            "instruction": comparison["instruction"],
+            "response": comparison["response"],
+            "model": model,
+            **judgement,
+        }
+        for comparison, judgement in zip(
+            fresh, outcomes(fresh, model=model), strict=True
+        )
+    ]
+    return pd.concat(
+        [cache, pd.DataFrame(rows, columns=ATOM_COLUMNS)], ignore_index=True
+    )
+
+
 @app.cell
 def _():
     import matplotlib.pyplot as plt
@@ -411,11 +538,40 @@ def _():
 
 
 @app.cell
-def _(base_model_dropdown):
+def _():
+    # The value is the filename suffix shared by the scorer's tensors and the
+    # selections and judge scores derived from them
+    scorer_dropdown = mo.ui.dropdown(
+        options={"pairwise": "", "bradley-terry": "_bt"},
+        value="pairwise",
+        label="scorer",
+    )
+    scorer_dropdown
+    return (scorer_dropdown,)
+
+
+@app.cell
+def _(base_model_dropdown, scorer_dropdown):
     prefix = pool_prefix(base_model_dropdown.value)
+    suffix = scorer_dropdown.value
     candidates_dataframe = pd.read_parquet(artifact_path("candidates.parquet", prefix))
     anchors_dataframe = pd.read_parquet(artifact_path("anchors.parquet", prefix))
-    preference_tensors = np.load(artifact_path("preference_tensors.npz", prefix))
+    preference_tensors = np.load(
+        artifact_path(f"preference_tensors{suffix}.npz", prefix)
+    )
+    has_evaluation = file_exists(
+        ARTIFACTS_REPO, f"{prefix}/{EVALUATION_TENSORS}", repo_type="dataset"
+    )
+    # Until the evaluation model has scored this backbone's pool the selector's
+    # own tensors stand in, and the metrics are self-graded
+    evaluation_tensors = (
+        np.load(artifact_path(EVALUATION_TENSORS, prefix))
+        if has_evaluation
+        else preference_tensors
+    )
+    evaluation_label = (
+        "Phi-4-mini evaluation model" if has_evaluation else "selector (self-graded)"
+    )
     prompts = anchors_dataframe["prompt"].tolist()
     anchors = dict(
         zip(anchors_dataframe["prompt"], anchors_dataframe["anchor"], strict=True)
@@ -436,21 +592,25 @@ def _(base_model_dropdown):
     # HEADS and carry the anchor as their last row and column; a prompt-order
     # mismatch would silently score every prompt against another prompt's
     # tensors
-    assert preference_tensors["criteria"].tolist() == HEADS
-    assert preference_tensors["prompts"].tolist() == prompts
-    assert prompt_tensor(preference_tensors, 0).shape == (
-        len(HEADS),
-        SAMPLES_PER_PROMPT + 1,
-        SAMPLES_PER_PROMPT + 1,
-    )
-    len(prompts)
+    for tensors in (preference_tensors, evaluation_tensors):
+        assert tensors["criteria"].tolist() == HEADS
+        assert tensors["prompts"].tolist() == prompts
+        assert prompt_tensor(tensors, 0).shape == (
+            len(HEADS),
+            SAMPLES_PER_PROMPT + 1,
+            SAMPLES_PER_PROMPT + 1,
+        )
+    mo.md(f"{len(prompts)} prompts, metrics graded by the {evaluation_label}")
     return (
         anchors,
-        preference_tensors,
+        evaluation_label,
+        evaluation_tensors,
         pool_tokens,
         pools,
+        preference_tensors,
         prefix,
         prompts,
+        suffix,
     )
 
 
@@ -462,20 +622,33 @@ def _():
 
 
 @app.cell
-def _(preference_tensors, pools, prefix, prompts, solve_button):
+def _(
+    pool_tokens, preference_tensors, pools, prefix, prompts, solve_button, suffix
+):
     mo.stop(not solve_button.value)
-    policies = solve_policies(preference_tensors, prompts)
+    policies = solve_policies(preference_tensors, prompts, pool_tokens)
     selections_dataframe = selections_frame(policies, pools)
-    upload_dataframe("selections.parquet", selections_dataframe, prefix)
+    upload_dataframe(f"selections{suffix}.parquet", selections_dataframe, prefix)
     selections_dataframe
     return policies, selections_dataframe
 
 
 @app.cell
-def _(policies, preference_tensors, prompts):
-    win_rates_dataframe = anchor_win_rates(policies, preference_tensors, prompts)
+def _(evaluation_tensors, policies, prompts):
+    win_rates_dataframe = anchor_win_rates(policies, evaluation_tensors, prompts)
     win_rates_dataframe
     return (win_rates_dataframe,)
+
+
+@app.cell
+def _(policies, preference_tensors, prompts):
+    # Tau is chosen on the selector's own tensors, so the evaluation model
+    # never touches selection
+    frontier_arms = frontier_methods(
+        anchor_win_rates(policies, preference_tensors, prompts)
+    )
+    frontier_arms
+    return (frontier_arms,)
 
 
 @app.cell
@@ -568,27 +741,36 @@ def _():
 
 
 @app.cell
-def _(anchors, judge_button, prefix, selections_dataframe):
+def _(anchors, frontier_arms, judge_button, prefix, selections_dataframe, suffix):
     mo.stop(not judge_button.value)
     # Expectation scoring: judge each distinct support atom once against the
-    # anchor, then average atom scores under each policy's weights, so the
-    # atom cache is shared across methods and pool sizes. The entropic policy
-    # has full support, so judging it would cost ~n calls per prompt; it is
-    # scored on the tensor metric only
+    # anchor, then average atom scores under each policy's weights. The hub's
+    # atom cache is upserted, so atoms already judged by this model in an
+    # earlier run or under the other scorer are not re-judged. Only the
+    # frontier arms are judged: the entropic policy has full support, so
+    # judging it would cost ~n calls per prompt, and the off-chart tau
+    # variants would multiply the atom count; both are scored on the tensor
+    # metric only
     judged_selections = selections_dataframe[
-        selections_dataframe["method"] != "entropic_blackwell"
+        selections_dataframe["method"].isin(frontier_arms)
     ]
     atoms = judged_selections[["prompt", "response"]].drop_duplicates()
     comparisons = [
         {"instruction": prompt, "response": response, "anchor": anchors[prompt]}
         for prompt, response in zip(atoms["prompt"], atoms["response"], strict=True)
     ]
-    atom_scores = {
-        (comparison["instruction"], comparison["response"]): judgement["score"]
-        for comparison, judgement in zip(comparisons, outcomes(comparisons), strict=True)
-    }
+    atom_cache = judge_atoms(comparisons, load_atom_judgements(prefix))
+    upload_dataframe("atom_judgements.parquet", atom_cache, prefix)
+    judged_atoms = atom_cache[atom_cache["model"] == JUDGE_MODEL]
+    atom_scores = dict(
+        zip(
+            zip(judged_atoms["instruction"], judged_atoms["response"], strict=True),
+            judged_atoms["score"],
+            strict=True,
+        )
+    )
     judge_scores_dataframe = expected_scores(judged_selections, atom_scores)
-    upload_dataframe("judge_scores.parquet", judge_scores_dataframe, prefix)
+    upload_dataframe(f"judge_scores{suffix}.parquet", judge_scores_dataframe, prefix)
     judge_scores_dataframe
     return (judge_scores_dataframe,)
 
@@ -625,6 +807,70 @@ def _(judge_summary, plt):
     judge_axes.legend(frameon=False)
     judge_axes.spines[["top", "right"]].set_visible(False)
     judge_figure
+    return
+
+
+@app.cell
+def _(judge_summary, win_rates_dataframe):
+    frontier_dataframe = welfare_frame(win_rates_dataframe).merge(
+        judge_summary.rename(columns={"score": "overall"}), on=["method", "n"]
+    )
+    frontier_dataframe.round(3)
+    return (frontier_dataframe,)
+
+
+@app.cell
+def _(evaluation_label, frontier_arms, frontier_dataframe, plt):
+    # One colour per criterion ablation; a tau-sweep family's best tau is
+    # dashed next to its solid tau = 0.5 line. Marker size grows with N
+    colours = {
+        "best_of_blackwell": "#2a78d6",
+        "blackwell_no_verbosity": "#eb6834",
+        "blackwell_no_verbosity_overall": "#1baf7a",
+        "blackwell_no_verbosity_tokens": "#eda100",
+        "blackwell_no_verbosity_overall_tokens": "#e87ba4",
+        "best_of_nash": "#8a8983",
+        "base": "#8a8983",
+    }
+    frontier_figure, frontier_axes = plt.subplots(
+        1, 2, figsize=(11, 4.8), sharey=True, constrained_layout=True
+    )
+    for welfare_axes, welfare, welfare_label in zip(
+        frontier_axes,
+        ("rawlsian", "nash"),
+        ("Rawlsian welfare (worst criterion)", "Nash welfare (geometric mean)"),
+        strict=True,
+    ):
+        for arm in frontier_arms:
+            arm_stats = frontier_dataframe[
+                frontier_dataframe["method"] == arm
+            ].sort_values("n")
+            family, _, tau = arm.partition("@")
+            welfare_axes.plot(
+                arm_stats[welfare],
+                arm_stats["overall"],
+                color=colours[family],
+                linestyle="--" if tau and tau != "0.50" else "-",
+                linewidth=2,
+                label=arm,
+            )
+            welfare_axes.scatter(
+                arm_stats[welfare],
+                arm_stats["overall"],
+                s=20 + 12 * np.log2(arm_stats["n"]),
+                color=colours[family],
+                edgecolor="white",
+                linewidth=1,
+                zorder=3,
+            )
+        welfare_axes.set_xlabel(welfare_label)
+        welfare_axes.spines[["top", "right"]].set_visible(False)
+    frontier_axes[0].set_ylabel("Expected overall win rate vs anchor")
+    frontier_figure.suptitle(f"Welfare graded by the {evaluation_label}", fontsize=10)
+    frontier_axes[1].legend(
+        frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0)
+    )
+    frontier_figure
     return
 
 

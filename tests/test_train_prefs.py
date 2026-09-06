@@ -20,6 +20,7 @@ from train_prefs import (
     graded_target,
     helpsteer2_pairs,
     ita_holdout_prompts,
+    last_token_indices,
     masked_binary_cross_entropy,
     pairwise_text,
     per_criterion_metrics,
@@ -700,3 +701,11 @@ def test_resume_tensors_rejects_stale_checkpoints(monkeypatch, tmp_path):
         train_prefs.resume_tensors("tensors.npz", ["p1", "p0", "p2"], criteria)
     with pytest.raises(AssertionError):
         train_prefs.resume_tensors("tensors.npz", prompts, ["c0"])
+
+
+def test_last_token_indices_handles_both_padding_sides():
+    """The pooled position is the last attended token under left or right padding."""
+    right = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0], [1, 1, 1, 1]])
+    left = torch.tensor([[0, 1, 1, 1], [0, 0, 1, 1], [1, 1, 1, 1]])
+    assert last_token_indices(right).tolist() == [2, 1, 3]
+    assert last_token_indices(left).tolist() == [3, 3, 3]
