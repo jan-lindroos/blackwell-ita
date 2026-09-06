@@ -18,6 +18,7 @@ from experiments import (
     expected_token_counts,
     length_preference,
     matched_weight,
+    policies_from_selections,
     policy_support,
     prompt_results,
     prompt_tensor,
@@ -583,3 +584,18 @@ def test_comparison_prompt_orders_sections():
         < prompt.index("response B")
     )
     assert "FIRST or SECOND" in prompt
+
+
+def test_policies_round_trip_through_selections():
+    """Selections rebuild the policies exactly, up to the support threshold."""
+    policies = {
+        ("p", "m", 4): np.array([0.25, 0.0, 0.75, 1e-9]),
+        ("p", "base", 1): np.array([1.0]),
+        ("q", "m", 4): np.array([0.0, 1.0, 0.0, 0.0]),
+    }
+    pools = {"p": ["a", "b", "c", "d"], "q": ["e", "f", "g", "h"]}
+    rebuilt = policies_from_selections(experiments.selections_frame(policies, pools))
+    assert set(rebuilt) == set(policies)
+    np.testing.assert_allclose(rebuilt[("p", "m", 4)], [0.25, 0.0, 0.75, 0.0])
+    np.testing.assert_allclose(rebuilt[("q", "m", 4)], [0.0, 1.0, 0.0, 0.0])
+    np.testing.assert_allclose(rebuilt[("p", "base", 1)], [1.0])

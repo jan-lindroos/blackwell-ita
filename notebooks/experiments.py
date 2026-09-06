@@ -418,6 +418,22 @@ def triad_fractions(tensors, prompts: list[str]) -> pd.DataFrame:
 
 
 @app.function
+def policies_from_selections(selections: pd.DataFrame) -> dict:
+    """Rebuild policies, keyed (prompt, method, n), from a selections table.
+
+    Selections hold every support atom with its weight, so this reproduces
+    the solved policies up to the support threshold and a hub download
+    stands in for a fresh solve.
+    """
+    policies = {}
+    for (prompt, method, n), group in selections.groupby(["prompt", "method", "n"]):  # pyright: ignore[reportGeneralTypeIssues]
+        policy = np.zeros(int(n))
+        policy[group["sample_index"].to_numpy()] = group["weight"].to_numpy()
+        policies[(prompt, method, int(n))] = policy
+    return policies
+
+
+@app.function
 def selections_frame(policies: dict, pools: dict) -> pd.DataFrame:
     """Support atoms of every policy as one tidy selections dataframe."""
     rows = [
@@ -859,7 +875,7 @@ def _(base_model_dropdown, scorer_dropdown):
 
 @app.cell
 def _():
-    solve_button = mo.ui.run_button(label="Compute policies and upload selections")
+    solve_button = mo.ui.run_button(label="Recompute policies and upload selections")
     solve_button
     return (solve_button,)
 
@@ -868,10 +884,21 @@ def _():
 def _(
     pool_tokens, preference_tensors, pools, prefix, prompts, solve_button, suffix
 ):
-    mo.stop(not solve_button.value)
-    policies = solve_policies(preference_tensors, prompts, pool_tokens)
-    selections_dataframe = selections_frame(policies, pools)
-    upload_dataframe(f"selections{suffix}.parquet", selections_dataframe, prefix)
+    # Hub selections reproduce the solved policies exactly, so opening the
+    # notebook shows results without the solve; the button forces a re-solve
+    selections_file = f"selections{suffix}.parquet"
+    on_hub = file_exists(ARTIFACTS_REPO, f"{prefix}/{selections_file}", repo_type="dataset")
+    if solve_button.value or not on_hub:
+        mo.stop(
+            not solve_button.value,
+            mo.md("No selections on the hub for this backbone and scorer yet; press the button."),
+        )
+        policies = solve_policies(preference_tensors, prompts, pool_tokens)
+        selections_dataframe = selections_frame(policies, pools)
+        upload_dataframe(selections_file, selections_dataframe, prefix)
+    else:
+        selections_dataframe = pd.read_parquet(artifact_path(selections_file, prefix))
+        policies = policies_from_selections(selections_dataframe)
     selections_dataframe
     return policies, selections_dataframe
 
@@ -885,14 +912,24 @@ def _(evaluation_tensors, policies, prompts):
 
 @app.cell
 def _():
-    judge_button = mo.ui.run_button(label="Judge with Claude")
+    judge_button = mo.ui.run_button(label="Re-judge with Claude")
     judge_button
     return (judge_button,)
 
 
 @app.cell
 def _(anchors, judge_button, prefix, selections_dataframe, suffix):
-    mo.stop(not judge_button.value)
+    # Hub judge scores stand in unless the button forces a re-judge; scores
+    # for arms missing from a stale file simply leave those arms unjudged
+    judge_file = f"judge_scores{suffix}.parquet"
+    judged_on_hub = file_exists(ARTIFACTS_REPO, f"{prefix}/{judge_file}", repo_type="dataset")
+    if not judge_button.value and judged_on_hub:
+        judge_scores_dataframe = pd.read_parquet(artifact_path(judge_file, prefix))
+        mo.stop(True, judge_scores_dataframe)
+    mo.stop(
+        not judge_button.value,
+        mo.md("No judge scores on the hub for this backbone and scorer yet; press the button."),
+    )
     # Expectation scoring: judge each distinct support atom once against the
     # anchor, then average atom scores under each policy's weights. The hub's
     # atom cache is upserted after every chunk, so atoms already judged by
@@ -922,7 +959,7 @@ def _(anchors, judge_button, prefix, selections_dataframe, suffix):
         )
     )
     judge_scores_dataframe = expected_scores(judged_selections, atom_scores)
-    upload_dataframe(f"judge_scores{suffix}.parquet", judge_scores_dataframe, prefix)
+    upload_dataframe(judge_file, judge_scores_dataframe, prefix)
     judge_scores_dataframe
     return (judge_scores_dataframe,)
 
