@@ -636,6 +636,19 @@ def test_preference_tensor_is_skew_symmetric():
     assert np.allclose(tensor[:, 0, 1], expected)
 
 
+def test_preference_tensor_anchor_only_scores_just_the_anchor_pairs():
+    """Anchor row and column match the full tensor; the interior stays half."""
+    model = StubPairwiseModel(head_count=3)
+    responses = ["alpha", "be", "gamma!", "delta"]
+    full = preference_tensor(model, "p", responses, "cpu", batch_size=2)
+    partial = preference_tensor(
+        model, "p", responses, "cpu", batch_size=2, anchor_only=True
+    )
+    assert np.allclose(partial[:, :, -1], full[:, :, -1])
+    assert np.allclose(partial[:, -1, :], full[:, -1, :])
+    assert np.allclose(partial[:, :-1, :-1], 0.5)
+
+
 def test_pointwise_text_format():
     """Pointwise texts carry the prompt and the single response marker."""
     assert pointwise_text("p", "r") == "p\n\n[RESPONSE]\nr"

@@ -26,6 +26,7 @@ with app.setup:
 
     import cvxpy as cp
     import marimo as mo
+    import matplotlib.pyplot as plt
     import numpy as np
     import pandas as pd
     from huggingface_hub import HfApi, file_exists, hf_hub_download
@@ -53,6 +54,14 @@ with app.setup:
     N_VALUES = [1, 4, 16, 64, 128]
     BETA = 0.05
     TAUS = [round(0.5 + 0.05 * step, 2) for step in range(10)]
+    # Length-head scales as multiples of the pool's mean length: small is a
+    # strong preference for concision, large is near indifference
+    SCALES = [0.25, 0.5, 1.0, 2.0, 4.0]
+    # Verbosity is a descriptive rating, not a quality criterion (it agrees
+    # with helpfulness on 54% of decisive pairs, a coin flip), so the reported
+    # welfare and worst-criterion metrics run over the four quality heads;
+    # the 5-head arm stays as the demonstration that chasing it fails
+    WELFARE_HEADS = [HEADS[head] for head in NO_VERBOSITY_HEADS]
     # Pinned full model ID: a floating alias like "sonnet" can silently resolve
     # to a different model between judging runs
     JUDGE_MODEL = "claude-sonnet-5"
@@ -122,15 +131,12 @@ def blackwell_winner(
     preference_tensor: np.ndarray,
     thresholds: list[float] | None = None,
     beta: float = 0.0,
-    tokens: np.ndarray | None = None,
 ) -> np.ndarray:
     """Blackwell winner policy minimising the worst per-criterion shortfall.
 
     beta > 0 adds the entropic regularisation beta * KL(pi || uniform),
     making the objective strictly convex with a unique full-support
-    minimiser; beta = 0 is the exact linear programme. tokens caps the
-    policy's expected response tokens at the pool mean, the base policy's
-    expected tokens over the same pool.
+    minimiser; beta = 0 is the exact linear programme.
     """
     # Orthant target set S = {z : z_j >= tau_j}, tau = 1/2 per head by default:
     # minimise the worst clipped shortfall max_{i,j} (tau_j - P_j(pi, e_i))
@@ -147,8 +153,6 @@ def blackwell_winner(
         preference_tensor[head].T @ policy + shortfall >= thresholds[head]  # pyright: ignore[reportOptionalSubscript]
         for head in range(head_count)
     ]
-    if tokens is not None:
-        constraints.append(tokens @ policy <= float(np.mean(tokens)))
     problem = cp.Problem(cp.Minimize(objective), constraints)  # pyright: ignore[reportArgumentType]
     try:
         problem.solve(solver=cp.CLARABEL)
@@ -168,6 +172,24 @@ def blackwell_winner(
     if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or policy.value is None:
         raise RuntimeError(f"blackwell_winner solve failed: {problem.status}")
     return np.asarray(policy.value)
+
+
+@app.function
+def length_preference(tokens: np.ndarray, scale: float | None = None) -> np.ndarray:
+    """Pairwise "shorter is better" head: sigmoid of the token difference.
+
+    Entry (a, b) is the probability a beats b, so it is skew-symmetric with
+    1/2 on the diagonal like the reward-model heads. A Bradley-Terry
+    preference with reward -tokens / scale; scale defaults to the pool's
+    mean length, so a gap of one mean length gives sigmoid(1) ~ 0.73. A hard
+    0/1 head would be unattainable against the pool's shortest candidate
+    and its shortfall would swamp the criteria; the sigmoid keeps it bounded
+    """
+    lengths = np.asarray(tokens, dtype=float)
+    if scale is None:
+        scale = float(lengths.mean())
+    difference = (lengths[None, :] - lengths[:, None]) / scale
+    return 1.0 / (1.0 + np.exp(-difference))
 
 
 @app.function
@@ -198,7 +220,9 @@ def solve_policies(tensors, prompts: list[str], pool_tokens: dict) -> dict:
     """Winner policies over pool prefixes, keyed (prompt, method, n).
 
     Tau-sweep arms add the overall head to the four no-verbosity criteria and
-    carry its threshold after an @ in the method name.
+    carry its threshold after an @ in the method name; tokens arms stack the
+    length head onto the criteria as one more head at threshold 1/2 and carry
+    its scale (a multiple of the pool's mean length) after the @.
     """
     overall_heads = NO_VERBOSITY_HEADS + [OVERALL_INDEX]
     policies = {}
@@ -209,6 +233,8 @@ def solve_policies(tensors, prompts: list[str], pool_tokens: dict) -> dict:
         tokens = np.asarray(pool_tokens[prompt], dtype=float)
         policies[(prompt, "base", 1)] = np.array([1.0])
         for n in N_VALUES:
+            mean_length = float(tokens[:n].mean())
+            length = length_preference(tokens[:n], mean_length)[None]
             policies[(prompt, "best_of_blackwell", n)] = blackwell_winner(
                 tensor[:OVERALL_INDEX, :n, :n]
             )
@@ -221,9 +247,17 @@ def solve_policies(tensors, prompts: list[str], pool_tokens: dict) -> dict:
             policies[(prompt, "best_of_nash", n)] = best_of_nash(
                 tensor[OVERALL_INDEX, :n, :n]
             )
-            policies[(prompt, "blackwell_no_verbosity_tokens", n)] = blackwell_winner(
-                tensor[NO_VERBOSITY_HEADS, :n, :n], tokens=tokens[:n]
-            )
+            for scale in SCALES:
+                policies[(prompt, f"blackwell_no_verbosity_tokens@{scale:g}", n)] = (
+                    blackwell_winner(
+                        np.concatenate(
+                            [
+                                tensor[NO_VERBOSITY_HEADS, :n, :n],
+                                length_preference(tokens[:n], scale * mean_length)[None],
+                            ]
+                        )
+                    )
+                )
             for tau in TAUS:
                 thresholds = [0.5] * len(NO_VERBOSITY_HEADS) + [tau]
                 policies[(prompt, f"blackwell_no_verbosity_overall@{tau:.2f}", n)] = (
@@ -232,7 +266,8 @@ def solve_policies(tensors, prompts: list[str], pool_tokens: dict) -> dict:
                 policies[
                     (prompt, f"blackwell_no_verbosity_overall_tokens@{tau:.2f}", n)
                 ] = blackwell_winner(
-                    tensor[overall_heads, :n, :n], thresholds, tokens=tokens[:n]
+                    np.concatenate([tensor[overall_heads, :n, :n], length]),
+                    thresholds + [0.5],
                 )
     return policies
 
@@ -241,12 +276,18 @@ def solve_policies(tensors, prompts: list[str], pool_tokens: dict) -> dict:
 def frontier_methods(win_rates: pd.DataFrame) -> list[str]:
     """Methods on the frontier chart.
 
-    The fixed arms, each tau-sweep family at tau = 0.5, and each family's best
-    tau by the tensor's own overall win rate against the anchor at the largest
-    N, so no judge calls are spent selecting tau.
+    The fixed arms, the whole length-scale sweep, each tau-sweep family at
+    tau = 0.5, and each tau family's best tau by the tensor's own overall win
+    rate against the anchor at the largest N, so no judge calls are spent
+    selecting tau.
     """
+    methods = win_rates["method"]
+    scales = sorted(
+        set(methods[methods.str.startswith("blackwell_no_verbosity_tokens@")]),
+        key=lambda method: float(method.split("@")[1]),
+    )
     sweep = win_rates[
-        win_rates["method"].str.contains("@")
+        methods.str.contains("overall@")
         & (win_rates["criterion"] == "overall")
         & (win_rates["n"] == N_VALUES[-1])
     ]
@@ -259,7 +300,7 @@ def frontier_methods(win_rates: pd.DataFrame) -> list[str]:
                 "best_of_nash",
                 "best_of_blackwell",
                 "blackwell_no_verbosity",
-                "blackwell_no_verbosity_tokens",
+                *scales,
                 "blackwell_no_verbosity_overall@0.50",
                 "blackwell_no_verbosity_overall_tokens@0.50",
                 *best.tolist(),
@@ -273,9 +314,9 @@ def welfare_frame(win_rates: pd.DataFrame) -> pd.DataFrame:
     """Rawlsian (minimum) and Nash (geometric mean) welfare per (method, n).
 
     Both aggregate the mean criterion win rates against the anchor over the
-    five HelpSteer2 heads; the overall head is left out.
+    four quality heads (WELFARE_HEADS); verbosity and overall are left out.
     """
-    criteria = win_rates[win_rates["criterion"].isin(HEADS[:OVERALL_INDEX])]
+    criteria = win_rates[win_rates["criterion"].isin(WELFARE_HEADS)]
     grouped = criteria.groupby(["method", "n"])["win_rate"]
     return pd.DataFrame(
         {
@@ -517,13 +558,6 @@ def judge_atoms(
 
 @app.cell
 def _():
-    import matplotlib.pyplot as plt
-
-    return (plt,)
-
-
-@app.cell
-def _():
     base_model_dropdown = mo.ui.dropdown(
         options=[
             DEFAULT_BASE_MODEL,
@@ -652,9 +686,9 @@ def _(policies, preference_tensors, prompts):
 
 
 @app.cell
-def _(plt, win_rates_dataframe):
+def _(win_rates_dataframe):
     worst_rates = (
-        win_rates_dataframe[win_rates_dataframe["criterion"].isin(HEADS[:OVERALL_INDEX])]
+        win_rates_dataframe[win_rates_dataframe["criterion"].isin(WELFARE_HEADS)]
         .groupby(["method", "n"], as_index=False)["win_rate"]
         .min()
     )
@@ -701,7 +735,7 @@ def _(policies, pool_tokens, worst_rates):
 
 
 @app.cell
-def _(efficiency_dataframe, plt):
+def _(efficiency_dataframe):
     tokens_figure, tokens_axes = plt.subplots(figsize=(5, 3.2))
     tokens_axes.axhline(
         efficiency_dataframe.loc[
@@ -785,7 +819,7 @@ def _(judge_scores_dataframe):
 
 
 @app.cell
-def _(judge_summary, plt):
+def _(judge_summary):
     judge_figure, judge_axes = plt.subplots(figsize=(5, 3.2))
     judge_axes.axhline(
         judge_summary.loc[judge_summary["method"] == "base", "score"].item(),
@@ -810,19 +844,15 @@ def _(judge_summary, plt):
     return
 
 
-@app.cell
-def _(judge_summary, win_rates_dataframe):
-    frontier_dataframe = welfare_frame(win_rates_dataframe).merge(
-        judge_summary.rename(columns={"score": "overall"}), on=["method", "n"]
-    )
-    frontier_dataframe.round(3)
-    return (frontier_dataframe,)
+@app.function
+def frontier_figure(frontier: pd.DataFrame, arms: list[str], grader: str):
+    """Judged overall against Rawlsian welfare, Nash welfare and expected tokens.
 
-
-@app.cell
-def _(evaluation_label, frontier_arms, frontier_dataframe, plt):
-    # One colour per criterion ablation; a tau-sweep family's best tau is
-    # dashed next to its solid tau = 0.5 line. Marker size grows with N
+    One colour per criterion ablation, traced over N with markers growing
+    with N; a tau family's best tau is dashed next to its solid tau = 0.5
+    line; the length-scale sweep draws only scale 1 over N and the other
+    scales as a dotted trace at the largest N.
+    """
     colours = {
         "best_of_blackwell": "#2a78d6",
         "blackwell_no_verbosity": "#eb6834",
@@ -832,45 +862,83 @@ def _(evaluation_label, frontier_arms, frontier_dataframe, plt):
         "best_of_nash": "#8a8983",
         "base": "#8a8983",
     }
-    frontier_figure, frontier_axes = plt.subplots(
-        1, 2, figsize=(11, 4.8), sharey=True, constrained_layout=True
+    figure, axes = plt.subplots(
+        1, 3, figsize=(15, 4.8), sharey=True, constrained_layout=True
     )
-    for welfare_axes, welfare, welfare_label in zip(
-        frontier_axes,
-        ("rawlsian", "nash"),
-        ("Rawlsian welfare (worst criterion)", "Nash welfare (geometric mean)"),
-        strict=True,
-    ):
-        for arm in frontier_arms:
-            arm_stats = frontier_dataframe[
-                frontier_dataframe["method"] == arm
-            ].sort_values("n")
-            family, _, tau = arm.partition("@")
-            welfare_axes.plot(
-                arm_stats[welfare],
-                arm_stats["overall"],
+    panels = (
+        ("rawlsian", "Rawlsian welfare (worst quality criterion)"),
+        ("nash", "Nash welfare (geometric mean of quality criteria)"),
+        ("tokens", "Expected response tokens"),
+    )
+    scale_arms = [
+        arm
+        for arm in arms
+        if arm.startswith("blackwell_no_verbosity_tokens@")
+        and float(arm.split("@")[1]) != 1.0
+    ]
+    for panel_axes, (column, label) in zip(axes, panels, strict=True):
+        for arm in arms:
+            if arm in scale_arms:
+                continue
+            stats = frontier[frontier["method"] == arm].sort_values("n")  # pyright: ignore[reportCallIssue]
+            family, _, suffix = arm.partition("@")
+            dashed = "overall" in family and suffix not in ("", "0.50")
+            panel_axes.plot(
+                stats[column],
+                stats["overall"],
                 color=colours[family],
-                linestyle="--" if tau and tau != "0.50" else "-",
+                linestyle="--" if dashed else "-",
                 linewidth=2,
                 label=arm,
             )
-            welfare_axes.scatter(
-                arm_stats[welfare],
-                arm_stats["overall"],
-                s=20 + 12 * np.log2(arm_stats["n"]),
+            panel_axes.scatter(
+                stats[column],
+                stats["overall"],
+                s=20 + 12 * np.log2(stats["n"]),
                 color=colours[family],
                 edgecolor="white",
                 linewidth=1,
                 zorder=3,
             )
-        welfare_axes.set_xlabel(welfare_label)
-        welfare_axes.spines[["top", "right"]].set_visible(False)
-    frontier_axes[0].set_ylabel("Expected overall win rate vs anchor")
-    frontier_figure.suptitle(f"Welfare graded by the {evaluation_label}", fontsize=10)
-    frontier_axes[1].legend(
-        frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0)
+        if scale_arms:
+            trace = frontier[
+                frontier["method"].isin(scale_arms + ["blackwell_no_verbosity_tokens@1"])
+                & (frontier["n"] == N_VALUES[-1])
+            ].copy()
+            trace["scale"] = trace["method"].str.split("@").str[1].astype(float)  # pyright: ignore[reportAttributeAccessIssue]
+            trace = trace.sort_values("scale")  # pyright: ignore[reportCallIssue]
+            panel_axes.plot(
+                trace[column],
+                trace["overall"],
+                color=colours["blackwell_no_verbosity_tokens"],
+                linestyle=":",
+                linewidth=1.5,
+                marker="s",
+                markersize=5,
+                label=f"tokens scale sweep at N = {N_VALUES[-1]}",
+            )
+        panel_axes.set_xlabel(label)
+        panel_axes.spines[["top", "right"]].set_visible(False)
+    axes[0].set_ylabel("Expected overall win rate vs anchor")
+    figure.suptitle(f"Welfare graded by the {grader}", fontsize=10)
+    axes[2].legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    return figure
+
+
+@app.cell
+def _(judge_summary, policies, pool_tokens, win_rates_dataframe):
+    frontier_dataframe = (
+        welfare_frame(win_rates_dataframe)
+        .merge(expected_token_counts(policies, pool_tokens), on=["method", "n"])
+        .merge(judge_summary.rename(columns={"score": "overall"}), on=["method", "n"])
     )
-    frontier_figure
+    frontier_dataframe.round(3)
+    return (frontier_dataframe,)
+
+
+@app.cell
+def _(evaluation_label, frontier_arms, frontier_dataframe):
+    frontier_figure(frontier_dataframe, frontier_arms, evaluation_label)
     return
 
 

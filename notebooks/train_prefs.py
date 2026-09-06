@@ -23,6 +23,7 @@ __generated_with = "0.24.0"
 app = marimo.App(width="medium")
 
 with app.setup:
+    import functools
     import math
     import tempfile
     from collections.abc import Callable, Iterable, Iterator
@@ -1037,10 +1038,21 @@ def preference_tensor(
     responses: list[str],
     device: str,
     batch_size: int = 16,
+    anchor_only: bool = False,
 ) -> np.ndarray:
-    """Skew-symmetrised win probabilities, shape (head, response, response)."""
+    """Skew-symmetrised win probabilities, shape (head, response, response).
+
+    With ``anchor_only`` just the pairs involving the last response are
+    scored and the rest of the tensor stays at one half: the evaluation reads
+    nothing but the anchor column, and this is 64 times fewer forwards.
+    """
     count = len(responses)
-    index_pairs = [(i, j) for i in range(count) for j in range(count) if i != j]
+    index_pairs = [
+        (i, j)
+        for i in range(count)
+        for j in range(count)
+        if i != j and (not anchor_only or count - 1 in (i, j))
+    ]
     texts = [
         pairwise_text(prompt, responses[i], responses[j]) for i, j in index_pairs
     ]
@@ -1370,7 +1382,8 @@ def _():
     Scores the selected backbone's pool under the hub checkpoints: the
     pairwise model into preference_tensors.npz, the Bradley-Terry model
     into preference_tensors_bt.npz and the Phi-4-mini evaluation model into
-    preference_tensors_eval.npz (skipped until its checkpoint is trained).
+    preference_tensors_eval.npz (anchor column only, skipped until its
+    checkpoint is trained).
     Scoring checkpoints to the hub every 10 prompts and resumes from the
     partial artifact, so a run can pick up where a dead session stopped.
     """)
@@ -1426,7 +1439,7 @@ def _(score_button, score_model_dropdown):
             EVALUATION_CHECKPOINT,
             EVALUATION_TENSORS,
             load_reward_model,
-            preference_tensor,
+            functools.partial(preference_tensor, anchor_only=True),
         ),
     ):
         if not model_exists(checkpoint_file):

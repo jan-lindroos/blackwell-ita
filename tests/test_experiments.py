@@ -16,6 +16,7 @@ from experiments import (
     expected_scores,
     expected_token_counts,
     frontier_methods,
+    length_preference,
     policy_support,
     prompt_tensor,
     welfare_frame,
@@ -183,15 +184,34 @@ def test_entropic_blackwell_interpolates_between_lp_and_uniform():
     )
 
 
-def test_blackwell_token_cap_binds_at_the_pool_mean():
-    """A long dominant candidate is diluted until expected tokens hit the mean."""
+def test_length_preference_is_a_skew_symmetric_sigmoid_of_the_gap():
+    """Shorter wins with probability growing in the gap; the head is a valid preference."""
+    tokens = np.array([100.0, 300.0, 300.0])
+    head = length_preference(tokens, scale=200.0)
+    np.testing.assert_allclose(head + head.T, 1.0)
+    np.testing.assert_allclose(np.diag(head), 0.5)
+    assert head[0, 1] == pytest.approx(1 / (1 + np.exp(-1.0)))
+    assert head[1, 2] == 0.5
+    # Default scale is the pool mean, so the head is dimensionless in tokens
+    np.testing.assert_allclose(length_preference(tokens), length_preference(10 * tokens))
+    # A larger scale flattens the head towards indifference
+    assert length_preference(tokens, scale=2000.0)[0, 1] < head[0, 1]
+
+
+def test_length_head_dilutes_a_long_dominant_candidate_by_scale():
+    """Stacked on the criteria, the length head trades length against dominance."""
     tokens = np.array([300.0, 100.0, 100.0])
     np.testing.assert_allclose(
         blackwell_winner(DOMINANT[None]), [1.0, 0.0, 0.0], atol=1e-6
     )
-    capped = blackwell_winner(DOMINANT[None], tokens=tokens)
-    assert tokens @ capped <= tokens.mean() + 1e-6
-    assert capped[0] == pytest.approx(1 / 3, abs=1e-6)
+    sharp = blackwell_winner(
+        np.stack([DOMINANT, length_preference(tokens, scale=50.0)])
+    )
+    flat = blackwell_winner(
+        np.stack([DOMINANT, length_preference(tokens, scale=5000.0)])
+    )
+    assert sharp[0] < flat[0] < 1.0
+    assert flat[0] > 0.9
 
 
 def test_frontier_methods_picks_best_tau_per_family_at_largest_n():
@@ -217,36 +237,45 @@ def test_frontier_methods_picks_best_tau_per_family_at_largest_n():
                             "win_rate": rate,
                         }
                     )
+    for scale in ("4", "0.25", "1"):
+        rows.append(
+            {
+                "method": f"blackwell_no_verbosity_tokens@{scale}",
+                "n": 128,
+                "criterion": "overall",
+                "win_rate": 0.99,
+            }
+        )
     methods = frontier_methods(pd.DataFrame(rows))
-    assert methods[:7] == [
+    assert methods == [
         "base",
         "best_of_nash",
         "best_of_blackwell",
         "blackwell_no_verbosity",
-        "blackwell_no_verbosity_tokens",
+        "blackwell_no_verbosity_tokens@0.25",
+        "blackwell_no_verbosity_tokens@1",
+        "blackwell_no_verbosity_tokens@4",
         "blackwell_no_verbosity_overall@0.50",
         "blackwell_no_verbosity_overall_tokens@0.50",
+        "blackwell_no_verbosity_overall@0.80",
     ]
-    assert methods[7:] == ["blackwell_no_verbosity_overall@0.80"]
 
 
-def test_welfare_frame_takes_min_and_geometric_mean_over_criteria():
-    """Rawlsian is the criterion minimum, Nash the geometric mean, overall excluded."""
+def test_welfare_frame_takes_min_and_geometric_mean_over_quality_criteria():
+    """Rawlsian is the minimum, Nash the geometric mean; verbosity and overall excluded."""
     rates = {"helpfulness": 0.8, "correctness": 0.2, "coherence": 0.5}
     rows = [
         {"method": "m", "n": 4, "criterion": criterion, "win_rate": rate}
         for criterion, rate in rates.items()
     ] + [
         {"method": "m", "n": 4, "criterion": "complexity", "win_rate": 0.5},
-        {"method": "m", "n": 4, "criterion": "verbosity", "win_rate": 0.5},
+        {"method": "m", "n": 4, "criterion": "verbosity", "win_rate": 0.01},
         {"method": "m", "n": 4, "criterion": "overall", "win_rate": 0.01},
     ]
     frame = welfare_frame(pd.DataFrame(rows))
     assert list(frame.columns) == ["method", "n", "rawlsian", "nash"]
     assert frame["rawlsian"].item() == pytest.approx(0.2)
-    assert frame["nash"].item() == pytest.approx(
-        (0.8 * 0.2 * 0.5 * 0.5 * 0.5) ** (1 / 5)
-    )
+    assert frame["nash"].item() == pytest.approx((0.8 * 0.2 * 0.5 * 0.5) ** (1 / 4))
 
 
 def test_policy_support_drops_dust_and_renormalises():
