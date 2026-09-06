@@ -12,6 +12,7 @@
 #     # torch. Install a matching one so transformers doesn't import the
 #     # broken system copy
 #     "torchvision",
+#     "wandb",
 #     "transformers",
 # ]
 # ///
@@ -33,6 +34,7 @@ with app.setup:
     import numpy as np
     import pandas as pd
     import torch
+    import wandb
     from huggingface_hub import HfApi, file_exists, hf_hub_download
     from torch.utils.data import DataLoader, Dataset
     from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerBase
@@ -42,6 +44,8 @@ with app.setup:
     SPLITS_REPO = "blackwell-ita/helpsteer2-splits"
     DATASET = "helpsteer2"
     DEFAULT_BASE_MODEL = "RLHFlow/LLaMA3-SFT-v2"
+    # Same project as the scripts/ runs so notebook and PSC runs sit together
+    WANDB_PROJECT = "blackwell-ita-rm-comparison"
     SELECTOR_ENCODER = "Qwen/Qwen3-4B-Instruct-2507"
     # The evaluation model: same recipe on a backbone outside the policies'
     # and the selector's families, so the welfare metrics are not read off the
@@ -62,8 +66,8 @@ with app.setup:
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    Before running, switch to GPU, then sign in with `hf auth login`
-    (open terminal available via command menu).
+    Before running, switch to GPU, then sign in with `hf auth login` and
+    `wandb login` (open terminal available via command menu).
     """)
 
 
@@ -956,9 +960,13 @@ def train_reward_model(
     augment_presentation_order: bool = True,
     seed: int = 1810,
     device: str | None = None,
-) -> tuple[PairwisePreferenceModel, dict]:
-    """Train one pairwise model; returns it on the CPU with validation metrics.
+    model_type: str = "pairwise",
+    log_metrics: Callable[[dict], None] | None = None,
+) -> tuple[PairwisePreferenceModel | BradleyTerryRewardModel, dict]:
+    """Train one reward model; returns it on the CPU with validation metrics.
 
+    model_type picks the pairwise model or its Bradley-Terry twin; both share
+    the loop, early stopping and metrics.
     Validation (and with it the early-stopping check) runs every third of a
     pass over the training pairs, so checkpoint selection can catch a peak
     inside the first pass. Early stopping is driven by the pooled validation
@@ -976,23 +984,30 @@ def train_reward_model(
         augment_presentation_order,
         seed,
     )
-    model = PairwisePreferenceModel(
+    model_class = (
+        PairwisePreferenceModel if model_type == "pairwise" else BradleyTerryRewardModel
+    )
+    model = model_class(
         encoder_name,
         AutoTokenizer.from_pretrained(encoder_name),
         max_tokens,
         len(criterion_columns),
     )
     validation_loss = train_until_no_improvement(
-        model,
+        model,  # pyright: ignore[reportArgumentType]
         train_loader,
         validation_loader,
         learning_rate,
         warmup_steps,
         device,
         steps_per_epoch=max(1, len(train_loader) // 3),
+        log_metrics=log_metrics,
     )
     criterion_metrics = per_criterion_metrics(
-        model, validation_loader, criterion_columns, device
+        model,  # pyright: ignore[reportArgumentType]
+        validation_loader,
+        criterion_columns,
+        device,
     )
     model.to("cpu")
     model.zero_grad(set_to_none=True)
@@ -1226,16 +1241,20 @@ def _():
         value="selector (Qwen3-4B)",
         label="encoder",
     )
-    encoder_dropdown
-    return (encoder_dropdown,)
+    model_dropdown = mo.ui.dropdown(
+        options={"pairwise": "pairwise", "bradley-terry": "bradley_terry"},
+        value="pairwise",
+        label="model",
+    )
+    mo.hstack([encoder_dropdown, model_dropdown], justify="start")
+    return encoder_dropdown, model_dropdown
 
 
 @app.cell
-def _(encoder_dropdown):
+def _(encoder_dropdown, model_dropdown):
     encoder_name = encoder_dropdown.value
-    checkpoint_name = (
-        "pairwise.pt" if encoder_name == SELECTOR_ENCODER else EVALUATION_CHECKPOINT
-    )
+    model_type = model_dropdown.value
+    checkpoint_name = checkpoint_filename(model_type, encoder_name)
     max_tokens = 4000
     learning_rate = 1e-5
     batch_size = 12
@@ -1246,6 +1265,7 @@ def _(encoder_dropdown):
         encoder_name,
         learning_rate,
         max_tokens,
+        model_type,
         warmup_steps,
     )
 
@@ -1258,9 +1278,18 @@ def _():
     return criterion_columns, downloaded_pairs
 
 
+@app.function
+def checkpoint_filename(model_type: str, encoder_name: str) -> str:
+    """Hub checkpoint name for a model type and encoder."""
+    stem = "pairwise" if model_type == "pairwise" else "bt"
+    if encoder_name == SELECTOR_ENCODER:
+        return f"{stem}.pt"
+    return f"{stem}_phi4mini.pt"
+
+
 @app.cell
 def _():
-    train_button = mo.ui.run_button(label="Train pairwise")
+    train_button = mo.ui.run_button(label="Train")
     train_button
     return (train_button,)
 
@@ -1274,32 +1303,63 @@ def _(
     encoder_name,
     learning_rate,
     max_tokens,
+    model_type,
     train_button,
     warmup_steps,
 ):
     mo.stop(not train_button.value)
-    pairwise_model, pairwise_metrics = train_reward_model(
-        downloaded_pairs[downloaded_pairs["split"] == "train"],
+    training_pairs = downloaded_pairs[downloaded_pairs["split"] == "train"]
+    wandb.init(
+        project=WANDB_PROJECT,
+        name=Path(checkpoint_name).stem,
+        config={
+            "model_type": model_type,
+            "encoder": encoder_name,
+            "criterion_columns": criterion_columns,
+            "training_pairs": len(training_pairs),
+            "max_tokens": max_tokens,
+            "learning_rate": learning_rate,
+            "batch_size": batch_size,
+            "warmup_steps": warmup_steps,
+        },
+    )
+    trained_model, trained_metrics = train_reward_model(
+        training_pairs,
         criterion_columns,
         max_tokens,
         encoder_name=encoder_name,
         learning_rate=learning_rate,
         batch_size=batch_size,
         warmup_steps=warmup_steps,
+        model_type=model_type,
+        log_metrics=wandb.log,
     )
+    wandb.log({"validation_loss": trained_metrics["validation_loss"]})
+    wandb.finish()
     with tempfile.TemporaryDirectory() as checkpoint_temp:
         checkpoint_path = Path(checkpoint_temp) / checkpoint_name
-        save_reward_model(
-            pairwise_model, criterion_columns, encoder_name, checkpoint_path
-        )
+        if model_type == "pairwise":
+            save_reward_model(
+                trained_model,  # pyright: ignore[reportArgumentType]
+                criterion_columns,
+                encoder_name,
+                checkpoint_path,
+            )
+        else:
+            save_bt_reward_model(
+                trained_model,  # pyright: ignore[reportArgumentType]
+                criterion_columns,
+                encoder_name,
+                checkpoint_path,
+            )
         upload_model(checkpoint_path)
     # Release the GPU for later cells: the model and its leftover gradients
     # otherwise sit on it for the rest of the session
-    pairwise_model.zero_grad(set_to_none=True)
-    pairwise_model.to("cpu")
+    trained_model.zero_grad(set_to_none=True)
+    trained_model.to("cpu")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    mo.md(metrics_markdown(checkpoint_name, pairwise_metrics))
+    mo.md(metrics_markdown(checkpoint_name, trained_metrics))
 
 
 @app.cell(hide_code=True)

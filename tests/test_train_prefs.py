@@ -15,6 +15,7 @@ from train_prefs import (
     bt_preference_tensor,
     build_explicit_loaders,
     build_loaders,
+    checkpoint_filename,
     default_device,
     evaluate_loss,
     graded_target,
@@ -709,3 +710,71 @@ def test_last_token_indices_handles_both_padding_sides():
     left = torch.tensor([[0, 1, 1, 1], [0, 0, 1, 1], [1, 1, 1, 1]])
     assert last_token_indices(right).tolist() == [2, 1, 3]
     assert last_token_indices(left).tolist() == [3, 3, 3]
+
+
+def test_checkpoint_filename_matches_hub_layout():
+    """Checkpoint names follow the hub's stems; the Phi evaluation name is pinned."""
+    assert checkpoint_filename("pairwise", train_prefs.SELECTOR_ENCODER) == "pairwise.pt"
+    assert checkpoint_filename("bradley_terry", train_prefs.SELECTOR_ENCODER) == "bt.pt"
+    assert (
+        checkpoint_filename("pairwise", train_prefs.EVALUATION_ENCODER)
+        == train_prefs.EVALUATION_CHECKPOINT
+    )
+    assert checkpoint_filename("bradley_terry", train_prefs.EVALUATION_ENCODER) == (
+        "bt_phi4mini.pt"
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected_class"),
+    [("pairwise", "PairwisePreferenceModel"), ("bradley_terry", "BradleyTerryRewardModel")],
+)
+def test_train_reward_model_builds_the_requested_model_type(
+    monkeypatch, model_type, expected_class
+):
+    """model_type picks the model class; the shared loop and metrics run on it."""
+    built = []
+
+    class StubModel(torch.nn.Module):
+        def __init__(self, encoder_name, tokenizer, max_tokens, head_count):
+            super().__init__()
+            built.append((type(self).__name__, encoder_name, max_tokens, head_count))
+
+    stubs = {
+        name: type(name, (StubModel,), {})
+        for name in ("PairwisePreferenceModel", "BradleyTerryRewardModel")
+    }
+    for name, stub in stubs.items():
+        monkeypatch.setattr(train_prefs, name, stub)
+    monkeypatch.setattr(
+        train_prefs.AutoTokenizer, "from_pretrained", lambda name: "tokenizer"
+    )
+    monkeypatch.setattr(
+        train_prefs, "build_loaders", lambda *args: ([1, 2, 3], [1])
+    )
+    loop_kwargs = {}
+
+    def fake_loop(*args, **kwargs):
+        loop_kwargs.update(kwargs)
+        return 0.5
+
+    monkeypatch.setattr(train_prefs, "train_until_no_improvement", fake_loop)
+    monkeypatch.setattr(
+        train_prefs, "per_criterion_metrics", lambda *args: {"c": {}}
+    )
+    def log_metrics(metrics: dict) -> None:
+        pass
+
+    model, metrics = train_prefs.train_reward_model(
+        pd.DataFrame(),
+        ["c"],
+        8,
+        encoder_name="enc",
+        device="cpu",
+        model_type=model_type,
+        log_metrics=log_metrics,
+    )
+    assert built == [(expected_class, "enc", 8, 1)]
+    assert loop_kwargs["log_metrics"] is log_metrics
+    assert isinstance(model, stubs[expected_class])
+    assert metrics == {"validation_loss": 0.5, "criteria": {"c": {}}}
