@@ -247,19 +247,40 @@ def test_summarise_computes_metrics_with_paired_bands():
             **heads,
         }
     )
-    summary = summarise(results, draws=200)
+    base = results.assign(method="base", n=1, score=[0.5, 0.5, 0.5], tokens=100.0)
+    summary = summarise(pd.concat([results, base]), draws=200)
+    summary = summary[summary["method"] == "m"]
     assert list(summary.columns) == ["method", "n", "metric", "mean", "lo", "hi"]
     means = summary.set_index("metric")["mean"]
     assert means["overall"] == pytest.approx(0.5)
     assert means["rawlsian"] == pytest.approx(0.4)
     assert means["nash_welfare"] == pytest.approx((0.6**3 * 0.4) ** 0.25)
     assert means["tokens"] == pytest.approx(200.0)
-    assert means["wins_per_ktoken"] == pytest.approx(2.5)
+    assert means["rm_correctness"] == pytest.approx(0.4)
+    assert means["rm_verbosity"] == pytest.approx(0.9)
+    assert means["rm_overall"] == pytest.approx(0.9)
     assert (summary["lo"] <= summary["mean"] + 1e-9).all()
     assert (summary["hi"] >= summary["mean"] - 1e-9).all()
-    unjudged = summarise(results.assign(score=np.nan), draws=50)
+    unjudged = summarise(pd.concat([results.assign(score=np.nan), base]), draws=50)
+    unjudged = unjudged[unjudged["method"] == "m"]
     assert "overall" not in set(unjudged["metric"])
     assert "rawlsian" in set(unjudged["metric"])
+
+
+def test_summarise_bands_are_paired_against_base():
+    """Prompt difficulty cancels: an arm at a constant offset from base has a zero-width band."""
+    rng = np.random.default_rng(0)
+    prompts = [f"p{i}" for i in range(20)]
+    base_scores = rng.uniform(0.0, 1.0, 20)
+    heads = {head: 0.5 for head in experiments.WELFARE_HEADS}
+    frame = lambda method, n, scores: pd.DataFrame(
+        {"prompt": prompts, "method": method, "n": n, "score": scores, "tokens": 100.0, "verbosity": 0.5, "overall": 0.5, **heads}
+    )
+    results = pd.concat([frame("base", 1, base_scores), frame("m", 4, base_scores + 0.1)])
+    summary = summarise(results, draws=300).set_index(["method", "metric"])
+    assert summary.loc[("base", "overall"), "hi"] - summary.loc[("base", "overall"), "lo"] == pytest.approx(0.0)
+    assert summary.loc[("m", "overall"), "hi"] - summary.loc[("m", "overall"), "lo"] == pytest.approx(0.0, abs=1e-9)
+    assert summary.loc[("m", "overall"), "mean"] == pytest.approx(base_scores.mean() + 0.1)
 
 
 def test_cyclic_triad_fraction_detects_cycles():
@@ -274,7 +295,7 @@ def test_matched_weight_picks_the_closest_token_count():
     summary = pd.DataFrame(
         {
             "method": [
-                "blackwell_quality_length@1",
+                "blackwell_quality_length",
                 "nash_length@0.1",
                 "nash_length@0.25",
                 "nash_length@0.5",

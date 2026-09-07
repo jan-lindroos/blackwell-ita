@@ -36,6 +36,11 @@ with app.setup:
     ARTIFACTS_REPO = "blackwell-ita/artifacts"
     DATASET = "helpsteer2"
     DEFAULT_BASE_MODEL = "RLHFlow/LLaMA3-SFT-v2"
+    BACKBONES = [
+        DEFAULT_BASE_MODEL,
+        "google/gemma-2b-it",
+        "mistralai/Mistral-7B-Instruct-v0.3",
+    ]
     HEADS = [
         "helpfulness",
         "correctness",
@@ -59,11 +64,10 @@ with app.setup:
     # to best-of-Nash on 97+ of 100 prompts (the shared shortfall relaxes the
     # other heads by the same amount), so there is no sweep
     QUALITY_HEADS = NO_VERBOSITY_HEADS + [OVERALL_INDEX]
-    # Length-head scales as multiples of the pool's mean length: small is a
-    # strong preference for concision, large is near indifference
-    SCALES = [0.25, 0.5, 1.0, 2.0, 4.0]
     # Scalarised baseline weights: best-of-Nash on (1 - w) overall + w length
     WEIGHTS = [0.1, 0.25, 0.5]
+    # Scorer suffix -> (line style, label) so BT sits dashed on the same axes
+    SCORERS = {"": ("-", "pairwise"), "_bt": ("--", "BT")}
     # Verbosity is a descriptive rating, not a quality criterion (it agrees
     # with helpfulness on 54% of decisive pairs, a coin flip), so the reported
     # welfare and worst-criterion metrics run over the four quality heads;
@@ -234,10 +238,10 @@ def policy_support(
 def solve_policies(tensors, prompts: list[str], pool_tokens: dict) -> dict:
     """Winner policies over pool prefixes, keyed (prompt, method, n).
 
-    Length arms stack the length head onto the quality criteria as one more
-    head at threshold 1/2 and carry its scale (a multiple of the pool's mean
-    length) after the @; nash_length arms are the scalarised baseline, the
-    von Neumann winner of (1 - w) overall + w length, with w after the @.
+    The length arm stacks the length head (scale = the pool's mean length)
+    onto the quality criteria as one more head at threshold 1/2; nash_length
+    arms are the scalarised baseline, the von Neumann winner of
+    (1 - w) overall + w length, with w after the @.
     """
     policies = {}
     for prompt_index, prompt in enumerate(
@@ -261,12 +265,10 @@ def solve_policies(tensors, prompts: list[str], pool_tokens: dict) -> dict:
             policies[(prompt, "entropic_blackwell", n)] = blackwell_winner(
                 quality, beta=BETA
             )
-            for scale in SCALES:
-                length = length_preference(tokens[:n], scale * mean_length)
-                policies[(prompt, f"blackwell_quality_length@{scale:g}", n)] = (
-                    blackwell_winner(np.concatenate([quality, length[None]]))
-                )
             length = length_preference(tokens[:n], mean_length)
+            policies[(prompt, "blackwell_quality_length", n)] = blackwell_winner(
+                np.concatenate([quality, length[None]])
+            )
             for weight in WEIGHTS:
                 policies[(prompt, f"nash_length@{weight:g}", n)] = best_of_nash(
                     (1.0 - weight) * overall + weight * length
@@ -325,9 +327,12 @@ def summarise(
 ) -> pd.DataFrame:
     """Mean and 95% band over prompts of each metric per (method, n).
 
-    Metrics: judged overall (score), Rawlsian and Nash welfare over
-    WELFARE_HEADS, expected tokens and wins per kilotoken. Bands come from
-    multinomial prompt weights shared across arms, so they are paired.
+    Metrics: judged overall (score), each of HEADS' win rate against the
+    anchor, Rawlsian and Nash welfare over WELFARE_HEADS, and expected
+    tokens. Bands are paired:
+    the same multinomial prompt weights resample every arm, and each band
+    is the arm's mean plus the bootstrap spread of its difference from base,
+    so prompt difficulty cancels and the base arm's band has zero width.
     """
     prompts = sorted(results["prompt"].unique())
     count = len(prompts)
@@ -337,38 +342,47 @@ def summarise(
         )
         / count
     )
-    columns = ["score", *WELFARE_HEADS, "tokens"]
+    columns = ["score", *HEADS, "tokens"]
+    welfare_positions = [1 + HEADS.index(head) for head in WELFARE_HEADS]
 
     def statistics(means: np.ndarray) -> dict[str, np.ndarray]:
-        score = means[..., 0]
-        heads = means[..., 1 : 1 + len(WELFARE_HEADS)]
-        tokens = means[..., -1]
+        heads = means[..., welfare_positions]
         return {
-            "overall": score,
+            "overall": means[..., 0],
+            # Per-criterion win rate against the anchor, named "rm_<head>" so
+            # it cannot collide with the judged "overall"
+            **{
+                f"rm_{head}": means[..., 1 + index]
+                for index, head in enumerate(HEADS)
+            },
             "rawlsian": heads.min(axis=-1),
             "nash_welfare": np.exp(np.log(heads).mean(axis=-1)),
-            "tokens": tokens,
-            "wins_per_ktoken": score / (tokens / 1000.0),
+            "tokens": means[..., -1],
         }
 
+    def matrix_for(group: pd.DataFrame) -> np.ndarray:
+        return group.set_index("prompt").reindex(prompts)[columns].to_numpy(dtype=float)
+
+    base = matrix_for(results[results["method"] == "base"])  # pyright: ignore[reportArgumentType]
+    base_draws = statistics(weights @ base)
     rows = []
     for (method, n), group in results.groupby(["method", "n"]):  # pyright: ignore[reportGeneralTypeIssues]
-        matrix = (
-            group.set_index("prompt").reindex(prompts)[columns].to_numpy(dtype=float)
-        )
+        matrix = matrix_for(group)  # pyright: ignore[reportArgumentType]
         point = statistics(matrix.mean(axis=0))
-        band = statistics(weights @ matrix)
+        draws_ = statistics(weights @ matrix)
         for metric, value in point.items():
             if np.isnan(value):
                 continue
+            paired = draws_[metric] - base_draws[metric]
+            centred = paired - paired.mean()
             rows.append(
                 {
                     "method": method,
                     "n": n,
                     "metric": metric,
                     "mean": float(value),
-                    "lo": float(np.percentile(band[metric], 2.5)),
-                    "hi": float(np.percentile(band[metric], 97.5)),
+                    "lo": float(value + np.percentile(centred, 2.5)),
+                    "hi": float(value + np.percentile(centred, 97.5)),
                 }
             )
     return pd.DataFrame(rows, columns=["method", "n", "metric", "mean", "lo", "hi"])
@@ -664,7 +678,7 @@ def draw_metric(axes, summary: pd.DataFrame, metric: str, arms: list[tuple]) -> 
             label=label,
         )
         axes.fill_between(
-            stats["n"], stats["lo"], stats["hi"], color=colour, alpha=0.12 * alpha, linewidth=0
+            stats["n"], stats["lo"], stats["hi"], color=colour, alpha=0.08 * alpha, linewidth=0
         )
     base = summary[(summary["method"] == "base") & (summary["metric"] == metric)]["mean"]
     if not base.empty:  # pyright: ignore[reportAttributeAccessIssue]
@@ -677,118 +691,215 @@ def draw_metric(axes, summary: pd.DataFrame, metric: str, arms: list[tuple]) -> 
 
 
 @app.function
-def chart_verbosity(summary: pd.DataFrame):
-    """Chart 1: the verbosity head makes the max-min policy chase length."""
-    figure, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
-    arms = [
-        ("blackwell_all_heads", BLUE, "-", "Blackwell, all 6 heads (with verbosity)", 1.0),
-        ("blackwell_quality", ORANGE, "-", "Blackwell, 5 quality heads", 1.0),
-        ("best_of_nash", GREY, "-", "best-of-Nash", 1.0),
+def hub_results(backbones: list[str]) -> dict[tuple[str, str], pd.DataFrame]:
+    """Every (backbone, scorer suffix) per-prompt results table on the hub."""
+    tables = {}
+    for backbone in backbones:
+        prefix = pool_prefix(backbone)
+        for suffix in SCORERS:
+            filename = f"results{suffix}.parquet"
+            if file_exists(ARTIFACTS_REPO, f"{prefix}/{filename}", repo_type="dataset"):
+                tables[(backbone, suffix)] = pd.read_parquet(artifact_path(filename, prefix))
+    return tables
+
+
+@app.function
+def grader_of(results: pd.DataFrame) -> str:
+    """Which model graded a results table's welfare columns."""
+    if "grader" in results.columns and len(results):
+        return str(results["grader"].iloc[0])
+    return "selector (self-graded)"
+
+
+@app.function
+def backbone_rows(summaries: dict[tuple[str, str], pd.DataFrame]) -> list[str]:
+    """Backbones with at least one scorer's summary, in BACKBONES order."""
+    return [
+        backbone for backbone in BACKBONES if any(key[0] == backbone for key in summaries)
     ]
-    draw_metric(axes[0], summary, "overall", arms)
-    draw_metric(axes[1], summary, "tokens", arms)
-    axes[0].set_ylabel("Judged overall win rate vs anchor")
-    axes[1].set_ylabel("Expected response tokens")
-    axes[1].legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+
+
+@app.function
+def styled(arms: list[tuple], suffix: str) -> list[tuple]:
+    """Give (method, colour, label, alpha) arms the scorer's line style and label."""
+    style, scorer = SCORERS[suffix]
+    return [
+        (method, colour, style, f"{label} ({scorer})", alpha)
+        for method, colour, label, alpha in arms
+    ]
+
+
+@app.function
+def chart_grid(rows: int, panels: int):
+    """A rows x panels figure whose axes are always a 2-D array."""
+    figure, axes = plt.subplots(
+        rows, panels, figsize=(4.7 * panels, 3.6 * rows), constrained_layout=True, squeeze=False
+    )
+    return figure, axes
+
+
+@app.function
+def legend_outside(sources: list, target) -> None:
+    """Deduplicated legend to the right of target from the sources' handles."""
+    entries = {}
+    for axes in sources:
+        for handle, label in zip(*axes.get_legend_handles_labels(), strict=True):
+            entries.setdefault(label, handle)
+    target.legend(
+        entries.values(),
+        entries.keys(),
+        frameon=False,
+        fontsize=8,
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+    )
+
+
+@app.function
+def draw_rows(summaries: dict[tuple[str, str], pd.DataFrame], metrics: list[tuple[str, str]], arms) -> tuple:
+    """One row per backbone, one panel per metric, pairwise solid and BT dashed.
+
+    ``arms`` is a list of (method, colour, label, alpha) or a callable taking
+    a summary and returning one, for arms that depend on the summary.
+    """
+    rows = backbone_rows(summaries)
+    figure, axes = chart_grid(len(rows), len(metrics))
+    for row, backbone in enumerate(rows):
+        for suffix in SCORERS:
+            summary = summaries.get((backbone, suffix))
+            if summary is None:
+                continue
+            row_arms = styled(arms(summary) if callable(arms) else arms, suffix)  # pyright: ignore[reportArgumentType]
+            for column, (metric, _) in enumerate(metrics):
+                draw_metric(axes[row, column], summary, metric, row_arms)
+        for column, (_, label) in enumerate(metrics):
+            axes[row, column].set_ylabel(label)
+        axes[row, 0].set_title(backbone.split("/")[-1], loc="left", fontsize=9)
+    legend_outside([axes[0, -1]], axes[0, -1])
+    return figure, axes
+
+
+@app.function
+def chart_verbosity(summaries: dict[tuple[str, str], pd.DataFrame]):
+    """Chart 1: the verbosity head makes the max-min policy chase length."""
+    arms = [
+        ("blackwell_all_heads", BLUE, "Blackwell, all 6 heads (with verbosity)", 1.0),
+        ("blackwell_quality", ORANGE, "Blackwell, 5 quality heads", 1.0),
+        ("best_of_nash", GREY, "best-of-Nash", 1.0),
+    ]
+    metrics = [
+        ("overall", "Judged overall win rate vs anchor"),
+        ("tokens", "Expected response tokens"),
+    ]
+    figure, _ = draw_rows(summaries, metrics, arms)
     return figure
 
 
 @app.function
-def chart_quality(summary: pd.DataFrame, grader: str):
+def chart_quality(summaries: dict[tuple[str, str], pd.DataFrame], grader: str):
     """Chart 2: on quality criteria Blackwell matches Nash and guards the worst one."""
-    figure, axes = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
     arms = [
-        ("blackwell_quality", ORANGE, "-", "Blackwell, 5 quality heads", 1.0),
-        ("blackwell_attributes", ORANGE, "--", "Blackwell, 4 attributes (no overall)", 0.5),
-        ("best_of_nash", GREY, "-", "best-of-Nash", 1.0),
+        ("blackwell_quality", ORANGE, "Blackwell, 5 quality heads", 1.0),
+        ("blackwell_attributes", ORANGE, "Blackwell, 4 attributes (no overall)", 0.5),
+        ("best_of_nash", GREY, "best-of-Nash", 1.0),
     ]
-    for panel, metric, label in zip(
-        axes,
-        ("overall", "rawlsian", "nash_welfare"),
-        (
-            "Judged overall win rate vs anchor",
-            f"Rawlsian welfare, worst attribute ({grader})",
-            f"Nash welfare, geometric mean ({grader})",
-        ),
-        strict=True,
-    ):
-        draw_metric(panel, summary, metric, arms)
-        panel.set_ylabel(label)
-    axes[2].legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    metrics = [
+        ("overall", "Judged overall win rate vs anchor"),
+        ("rawlsian", "Rawlsian welfare (worst attribute)"),
+        ("nash_welfare", "Nash welfare (geometric mean)"),
+    ]
+    figure, _ = draw_rows(summaries, metrics, arms)
+    figure.suptitle(f"Welfare graded by the {grader}", fontsize=10)
     return figure
 
 
 @app.function
 def matched_weight(summary: pd.DataFrame) -> str:
-    """The nash_length arm whose tokens at the largest N are closest to the scale-1 length arm's."""
+    """The nash_length arm whose tokens at the largest N are closest to the length arm's."""
     at_max = summary[(summary["n"] == N_VALUES[-1]) & (summary["metric"] == "tokens")]
-    target = at_max.loc[at_max["method"] == "blackwell_quality_length@1", "mean"].item()
+    target = at_max.loc[at_max["method"] == "blackwell_quality_length", "mean"].item()
     baselines = at_max[at_max["method"].str.startswith("nash_length@")]  # pyright: ignore[reportAttributeAccessIssue]
     return baselines.loc[(baselines["mean"] - target).abs().idxmin(), "method"]  # pyright: ignore[reportAttributeAccessIssue]
 
 
 @app.function
-def chart_length(summary: pd.DataFrame):
+def chart_length(summaries: dict[tuple[str, str], pd.DataFrame]):
     """Chart 3: conciseness as a criterion, against Nash and a scalarised baseline."""
-    figure, axes = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
-    baseline = matched_weight(summary)
-    arms = [
-        ("best_of_nash", GREY, "-", "best-of-Nash", 1.0),
-        ("blackwell_quality", ORANGE, "-", "Blackwell, 5 quality heads", 1.0),
-        ("blackwell_quality_length@1", YELLOW, "-", "Blackwell + length head (scale 1)", 1.0),
-        (baseline, MAGENTA, "--", f"scalarised Nash, {baseline.split('@')[1]} length", 1.0),
+
+    def arms(summary: pd.DataFrame) -> list[tuple]:
+        baseline = matched_weight(summary)
+        return [
+            ("best_of_nash", GREY, "best-of-Nash", 1.0),
+            ("blackwell_quality", ORANGE, "Blackwell, 5 quality heads", 1.0),
+            ("blackwell_quality_length", YELLOW, "Blackwell + length head", 1.0),
+            (baseline, MAGENTA, f"scalarised Nash, {baseline.split('@')[1]} length", 1.0),
+        ]
+
+    metrics = [
+        ("overall", "Judged overall win rate vs anchor"),
+        ("tokens", "Expected response tokens"),
     ]
-    scales = [
-        (f"blackwell_quality_length@{scale:g}", YELLOW, "-", f"length head, scale {scale:g}", 0.35)
-        for scale in SCALES
-        if scale != 1.0
-    ]
-    draw_metric(axes[0], summary, "overall", arms)
-    draw_metric(axes[1], summary, "tokens", arms + scales)
-    draw_metric(axes[2], summary, "wins_per_ktoken", arms)
-    axes[0].set_ylabel("Judged overall win rate vs anchor")
-    axes[1].set_ylabel("Expected response tokens")
-    axes[2].set_ylabel("Judged wins per kilotoken")
-    axes[1].legend(frameon=False, fontsize=7, loc="upper left")
-    axes[2].legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    figure, _ = draw_rows(summaries, metrics, arms)
     return figure
 
 
 @app.function
-def chart_scorers(
-    pairwise: pd.DataFrame, bradley_terry: pd.DataFrame, triads: pd.DataFrame, grader: str
-):
-    """Chart 4: joint vs pointwise scoring as the pool grows."""
-    figure, axes = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
-    for summary, style, scorer in ((pairwise, "-", "pairwise"), (bradley_terry, "--", "BT")):
-        arms = [
-            ("blackwell_quality", ORANGE, style, f"Blackwell, 5 quality heads ({scorer})", 1.0),
-            ("best_of_nash", GREY, style, f"best-of-Nash ({scorer})", 1.0),
-        ]
-        draw_metric(axes[0], summary, "overall", arms)
-        draw_metric(axes[1], summary, "rawlsian", arms)
-    axes[0].set_ylabel("Judged overall win rate vs anchor")
-    axes[1].set_ylabel(f"Rawlsian welfare, worst attribute ({grader})")
-    axes[2].plot(triads["n"], triads["fraction"], color=BLUE, marker="o", linewidth=2, label="pairwise tensors")
-    axes[2].axhline(0.0, color=GREY, linestyle="--", linewidth=1, label="BT (transitive)")
-    axes[2].set_xscale("log", base=2)
-    axes[2].set_xticks(N_VALUES)
-    axes[2].set_xticklabels([str(n) for n in N_VALUES])
-    axes[2].set_xlabel("N (pool size)")
-    axes[2].set_ylabel("Cyclic triads in the overall head")
-    axes[2].spines[["top", "right"]].set_visible(False)
-    axes[2].legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+def chart_criteria(summaries: dict[tuple[str, str], pd.DataFrame], grader: str, backbone: str):
+    """One backbone's per-criterion win rates against the anchor, 2 x 3 panels.
+
+    The judged "overall" panel of the other charts is Claude's verdict; these
+    are the evaluation model's six heads, verbosity included as the
+    descriptive attribute it is.
+    """
+    arms = [
+        ("blackwell_all_heads", BLUE, "Blackwell, all 6 heads (with verbosity)", 1.0),
+        ("blackwell_quality", ORANGE, "Blackwell, 5 quality heads", 1.0),
+        ("blackwell_quality_length", YELLOW, "Blackwell + length head", 1.0),
+        ("best_of_nash", GREY, "best-of-Nash", 1.0),
+    ]
+    figure, axes = chart_grid(2, 3)
+    for index, head in enumerate(HEADS):
+        panel = axes[index // 3, index % 3]
+        for suffix in SCORERS:
+            summary = summaries.get((backbone, suffix))
+            if summary is not None:
+                draw_metric(panel, summary, f"rm_{head}", styled(arms, suffix))
+        panel.set_ylabel(f"{head.capitalize()} win rate vs anchor")
+    figure.suptitle(
+        f"{backbone.split('/')[-1]}: per-criterion win rates from the {grader}",
+        fontsize=10,
+    )
+    legend_outside([axes[0, 2]], axes[0, 2])
+    return figure
+
+
+@app.function
+def chart_triads(triads: dict[str, pd.DataFrame]):
+    """Chart 4: cyclic-triad fraction of the pairwise overall head per backbone.
+
+    BT is transitive by construction, so the pairwise model's near-zero
+    cycle rate is why the two scorers pick alike in charts 1 to 3.
+    """
+    figure, axes = plt.subplots(figsize=(5, 3.6), constrained_layout=True)
+    for (backbone, frame), colour in zip(triads.items(), (BLUE, ORANGE, YELLOW), strict=False):
+        axes.plot(
+            frame["n"], frame["fraction"], color=colour, marker="o", linewidth=2, label=backbone.split("/")[-1]
+        )
+    axes.axhline(0.0, color=GREY, linestyle="--", linewidth=1, label="BT (transitive)")
+    axes.set_xscale("log", base=2)
+    axes.set_xticks(N_VALUES)
+    axes.set_xticklabels([str(n) for n in N_VALUES])
+    axes.set_xlabel("N (pool size)")
+    axes.set_ylabel("Cyclic triads in the pairwise overall head")
+    axes.spines[["top", "right"]].set_visible(False)
+    axes.legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
     return figure
 
 
 @app.cell
 def _():
     base_model_dropdown = mo.ui.dropdown(
-        options=[
-            DEFAULT_BASE_MODEL,
-            "google/gemma-2b-it",
-            "mistralai/Mistral-7B-Instruct-v0.3",
-        ],
+        options=BACKBONES,
         value=DEFAULT_BASE_MODEL,
         label="base model",
     )
@@ -882,7 +993,13 @@ def _():
 
 @app.cell
 def _(
-    pool_tokens, preference_tensors, pools, prefix, prompts, solve_button, suffix
+    pool_tokens,
+    pools,
+    preference_tensors,
+    prefix,
+    prompts,
+    solve_button,
+    suffix,
 ):
     # Hub selections reproduce the solved policies exactly, so opening the
     # notebook shows results without the solve; the button forces a re-solve
@@ -966,6 +1083,7 @@ def _(anchors, judge_button, prefix, selections_dataframe, suffix):
 
 @app.cell
 def _(
+    evaluation_label,
     evaluation_tensors,
     judge_scores_dataframe,
     policies,
@@ -976,57 +1094,64 @@ def _(
 ):
     # Per-prompt table behind every chart: per-head win rates vs the anchor
     # (evaluation tensors), expected tokens and the judged score
-    results_dataframe = prompt_results(
-        policies, evaluation_tensors, prompts, pool_tokens
-    ).merge(judge_scores_dataframe, on=["prompt", "method", "n"], how="left")
+    results_dataframe = (
+        prompt_results(policies, evaluation_tensors, prompts, pool_tokens)
+        .merge(judge_scores_dataframe, on=["prompt", "method", "n"], how="left")
+        .assign(grader=evaluation_label)
+    )
     upload_dataframe(f"results{suffix}.parquet", results_dataframe, prefix)
     summary_dataframe = summarise(results_dataframe)
     summary_dataframe.pivot(index=["method", "n"], columns="metric", values="mean").round(3)
-    return (summary_dataframe,)
-
-
-@app.cell
-def _(summary_dataframe):
-    chart_verbosity(summary_dataframe)
     return
 
 
 @app.cell
-def _(evaluation_label, summary_dataframe):
-    chart_quality(summary_dataframe, evaluation_label)
+def _():
+    charts_button = mo.ui.run_button(label="Show charts")
+    charts_button
+    return (charts_button,)
+
+
+@app.cell
+def _(charts_button):
+    mo.stop(not charts_button.value)
+    # The story charts read every results table on the hub, one row per
+    # backbone with pairwise solid and BT dashed, so they do not depend on
+    # the dropdowns; the summary above is what this backbone and scorer
+    # contribute
+    hub_tables = hub_results(BACKBONES)
+    hub_summaries = {key: summarise(table) for key, table in hub_tables.items()}
+    hub_grader = grader_of(next(iter(hub_tables.values()))) if hub_tables else ""
+    list(hub_summaries)
+    return hub_grader, hub_summaries
+
+
+@app.cell
+def _(hub_summaries):
+    chart_verbosity(hub_summaries)
     return
 
 
 @app.cell
-def _(summary_dataframe):
-    chart_length(summary_dataframe)
+def _(hub_grader, hub_summaries):
+    chart_quality(hub_summaries, hub_grader)
     return
 
 
 @app.cell
-def _(evaluation_label, prefix, summary_dataframe, suffix):
-    # The other scorer's results table comes from the hub, so both scorers
-    # appear without solving twice; the triad diagnostic reads the pairwise
-    # tensors, which are the only ones that can hold cycles
-    other_suffix = "_bt" if suffix == "" else ""
-    other_file = f"results{other_suffix}.parquet"
-    if file_exists(ARTIFACTS_REPO, f"{prefix}/{other_file}", repo_type="dataset"):
-        other_summary = summarise(pd.read_parquet(artifact_path(other_file, prefix)))
-        pairwise_summary, bt_summary = (
-            (summary_dataframe, other_summary)
-            if suffix == ""
-            else (other_summary, summary_dataframe)
-        )
-        pairwise_tensors = np.load(artifact_path("preference_tensors.npz", prefix))
-        scorer_chart = chart_scorers(
-            pairwise_summary,
-            bt_summary,
-            triad_fractions(pairwise_tensors, pairwise_tensors["prompts"].tolist()),
-            evaluation_label,
-        )
-    else:
-        scorer_chart = mo.md(f"{other_file} is not on the hub yet; run the other scorer first.")
-    scorer_chart
+def _(hub_summaries):
+    chart_length(hub_summaries)
+    return
+
+
+@app.cell
+def _(hub_grader, hub_summaries):
+    mo.vstack(
+        [
+            chart_criteria(hub_summaries, hub_grader, criteria_backbone)
+            for criteria_backbone in backbone_rows(hub_summaries)
+        ]
+    )
     return
 
 
