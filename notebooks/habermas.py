@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.13"
 # dependencies = [
-#     "blackwell-ita @ git+https://github.com/jan-lindroos/blackwell-ita",
+#     "blackwell-ita @ git+https://github.com/jan-lindroos/blackwell-ita@ablation",
 #     "marimo>=0.23.16",
 #     # molab's base image ships a torchvision built against a mismatched
 #     # torch. Install a matching one so transformers doesn't import the
