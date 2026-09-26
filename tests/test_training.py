@@ -127,3 +127,19 @@ def test_configurations_have_unique_names_and_known_model_types():
     assert {
         configuration.model_type for configuration in REWARD_MODEL_CONFIGURATIONS
     } <= set(training.REWARD_MODEL_CLASSES)
+
+
+def test_ensure_trained_skips_training_when_the_checkpoint_is_on_the_hub(monkeypatch):
+    saved_metrics = pd.DataFrame({"criterion": ["x"]})
+    monkeypatch.setattr(training, "hub_file_exists", lambda *arguments: True)
+    monkeypatch.setattr(
+        training, "read_hub_dataframe", lambda *arguments: saved_metrics
+    )
+
+    def fail_training(*arguments):
+        raise AssertionError("training ran although the checkpoint exists")
+
+    monkeypatch.setattr(training, "train_reward_model", fail_training)
+    assert training.ensure_trained(
+        REWARD_MODEL_CONFIGURATIONS[0], pd.DataFrame(), ["x"], "prefix", "cpu"
+    ).equals(saved_metrics)

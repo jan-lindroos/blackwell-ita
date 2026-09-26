@@ -94,11 +94,16 @@ def load_helpsteer2_pairs() -> pd.DataFrame:
     )
 
 
-def assign_prompt_splits(pairs: pd.DataFrame, seed: int = 1810) -> pd.DataFrame:
-    """Label every pair train, validation or test by prompt, 70/15/15."""
+def assign_prompt_splits(
+    pairs: pd.DataFrame, group_column: str = "prompt", seed: int = 1810
+) -> pd.DataFrame:
+    """Label every pair train, validation or test by ``group_column``, 70/15/15."""
     # Several pairs share a prompt, so a row-level split would leak
     shuffled_prompts = (
-        pairs["prompt"].drop_duplicates().sample(frac=1.0, random_state=seed).tolist()
+        pairs[group_column]
+        .drop_duplicates()
+        .sample(frac=1.0, random_state=seed)
+        .tolist()
     )
     train_count = round(len(shuffled_prompts) * SPLIT_FRACTIONS["train"])
     validation_count = round(len(shuffled_prompts) * SPLIT_FRACTIONS["validation"])
@@ -110,7 +115,7 @@ def assign_prompt_splits(pairs: pd.DataFrame, seed: int = 1810) -> pd.DataFrame:
         else "test"
         for position, prompt in enumerate(shuffled_prompts)
     }
-    return pairs.assign(split=pairs["prompt"].map(split_by_prompt))  # pyright: ignore[reportArgumentType]
+    return pairs.assign(split=pairs[group_column].map(split_by_prompt))  # pyright: ignore[reportArgumentType]
 
 
 class Example(TypedDict):
@@ -199,15 +204,13 @@ def split_loaders(
     }
 
 
-def split_summary(pairs: pd.DataFrame) -> pd.DataFrame:
-    """Prompt and pair counts per split."""
+def split_summary(pairs: pd.DataFrame, group_column: str = "prompt") -> pd.DataFrame:
+    """Group and pair counts per split."""
     return (
         pairs.groupby("split")
-        .agg(prompts=("prompt", "nunique"), pairs=("prompt", "size"))
+        .agg(groups=(group_column, "nunique"), pairs=(group_column, "size"))
         .assign(
-            prompt_fraction=lambda summary: (
-                summary["prompts"] / summary["prompts"].sum()
-            )
+            group_fraction=lambda summary: summary["groups"] / summary["groups"].sum()
         )
         .reindex(list(SPLIT_FRACTIONS))
     )

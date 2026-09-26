@@ -1,13 +1,31 @@
+import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass
 from itertools import islice
+from pathlib import Path
 
 import pandas as pd
 import torch
+import wandb
 from tqdm.auto import tqdm
 
-from blackwell_ita.data import CRITERIA, Batch, split_loaders
-from blackwell_ita.models import REWARD_MODEL_CLASSES, RewardModel
+from blackwell_ita.data import Batch, split_loaders
+from blackwell_ita.hub import (
+    REWARD_MODELS_REPOSITORY,
+    download_hub_file,
+    hub_file_exists,
+    read_hub_dataframe,
+    upload_dataframe,
+    upload_hub_file,
+)
+from blackwell_ita.models import (
+    REWARD_MODEL_CLASSES,
+    RewardModel,
+    load_reward_model,
+    save_reward_model,
+)
+
+WANDB_PROJECT = "blackwell-ita-reward-models"
 
 
 @dataclass(frozen=True)
@@ -204,6 +222,7 @@ def train_until_no_improvement(
 def train_reward_model(
     configuration: RewardModelConfiguration,
     pairs: pd.DataFrame,
+    criteria: list[str],
     device: str,
     log_metrics: Callable[[dict], None],
 ) -> tuple[RewardModel, pd.DataFrame]:
@@ -212,10 +231,10 @@ def train_reward_model(
     Returns the model on the CPU and its validation and test metrics.
     """
     torch.manual_seed(configuration.seed)
-    loaders = split_loaders(pairs, CRITERIA, configuration.batch_size)
+    loaders = split_loaders(pairs, criteria, configuration.batch_size)
     model = REWARD_MODEL_CLASSES[configuration.model_type](
         configuration.encoder_name,
-        CRITERIA,
+        criteria,
         configuration.max_tokens,
         configuration.lora_rank,
     )
@@ -247,3 +266,56 @@ def train_reward_model(
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
     return model, pd.concat(split_metrics, ignore_index=True)
+
+
+def ensure_trained(
+    configuration: RewardModelConfiguration,
+    pairs: pd.DataFrame,
+    criteria: list[str],
+    prefix: str,
+    device: str,
+) -> pd.DataFrame:
+    """Train and upload the checkpoint and metrics unless the hub has them.
+
+    Returns the validation and test metrics.
+    """
+    if not hub_file_exists(
+        REWARD_MODELS_REPOSITORY, configuration.checkpoint_filename, prefix
+    ):
+        wandb_run = wandb.init(
+            project=WANDB_PROJECT,
+            name=f"{prefix}_{configuration.name}",
+            config=asdict(configuration) | {"hub_prefix": prefix},
+        )
+        wandb_run.define_metric("*", step_metric="step")
+        trained_model, trained_metrics = train_reward_model(
+            configuration, pairs, criteria, device, wandb_run.log
+        )
+        wandb_run.finish()
+        upload_dataframe(
+            REWARD_MODELS_REPOSITORY,
+            configuration.metrics_filename,
+            trained_metrics,
+            prefix,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            local_checkpoint_path = (
+                Path(temporary_directory) / configuration.checkpoint_filename
+            )
+            save_reward_model(trained_model, local_checkpoint_path)
+            upload_hub_file(REWARD_MODELS_REPOSITORY, local_checkpoint_path, prefix)
+    return read_hub_dataframe(
+        REWARD_MODELS_REPOSITORY, configuration.metrics_filename, prefix
+    )
+
+
+def load_trained(
+    configuration: RewardModelConfiguration, prefix: str, device: str
+) -> RewardModel:
+    """Load a trained checkpoint from the hub in eval mode."""
+    return load_reward_model(
+        download_hub_file(
+            REWARD_MODELS_REPOSITORY, configuration.checkpoint_filename, prefix
+        ),
+        device,
+    )
