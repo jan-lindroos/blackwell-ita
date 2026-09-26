@@ -5,21 +5,23 @@ description = "Multi-preference inference-time alignment via the Blackwell winne
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "cvxpy",
     "datasets",
     "huggingface-hub",
     "marimo>=0.23.16",
-    "matplotlib",
-    "numpy",
     "pandas",
+    "peft",
     "pyarrow",
-    "scipy",
     "torch",
+    "tqdm",
     # 5.15 predates torch 2.13 and its Qwen3 modeling file fails to import
     # against it; 5.16.1 is the first version verified compatible
     "transformers>=5.16.1",
     "wandb",
 ]
+
+[build-system]
+requires = ["uv_build>=0.9,<0.12"]
+build-backend = "uv_build"
 
 # PSC Bridges-2 H100 nodes run driver 560 (CUDA <= 12.6); the default PyPI
 # torch is a CUDA-13 build that cannot initialize there. Pull torch from the
@@ -58,15 +60,5 @@ exclude = ["**/node_modules", "**/__pycache__", "**/.*"]
 root = "notebooks"
 reportUnusedExpression = "none"
 
-[[tool.basedpyright.executionEnvironments]]
-root = "tests"
-extraPaths = ["notebooks"]
-
-[[tool.basedpyright.executionEnvironments]]
-root = "scripts"
-extraPaths = ["notebooks"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["notebooks"]
-markers = ["slow: downloads models"]

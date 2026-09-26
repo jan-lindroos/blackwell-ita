@@ -13,4 +13,4 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run marimo check notebooks/*.py
-      - run: uv run pytest -m "not slow"
+      - run: uv run pytest
