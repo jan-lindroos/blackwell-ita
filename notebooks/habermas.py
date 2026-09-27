@@ -39,12 +39,7 @@ with app.setup:
         model_track_results,
         participant_preference_tensor,
     )
-    from blackwell_ita.hub import (
-        ARTIFACTS_REPOSITORY,
-        hub_file_exists,
-        read_hub_dataframe,
-        upload_dataframe,
-    )
+    from blackwell_ita.hub import ARTIFACTS_REPOSITORY, ensure_hub_dataframe
     from blackwell_ita.scoring import score_with_resume
     from blackwell_ita.selection import summarise_methods
     from blackwell_ita.training import ensure_trained, load_trained
@@ -52,14 +47,6 @@ with app.setup:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     SAMPLES_PER_GROUP = 64
     WELFARE_NAMES = ["rawlsian_welfare", "nash_welfare", "utilitarian_welfare"]
-
-
-@app.function
-def ensure_hub_dataframe(filename: str, build) -> pd.DataFrame:
-    """Build and upload ``filename`` unless the hub has it, then read it back."""
-    if not hub_file_exists(ARTIFACTS_REPOSITORY, filename, HABERMAS_PREFIX):
-        upload_dataframe(ARTIFACTS_REPOSITORY, filename, build(), HABERMAS_PREFIX)
-    return read_hub_dataframe(ARTIFACTS_REPOSITORY, filename, HABERMAS_PREFIX)
 
 
 @app.function
@@ -86,15 +73,26 @@ def score_participant_tensors(configuration, filename: str, keyed_inputs: dict) 
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    Run on a GPU with `HF_TOKEN` and `WANDB_API_KEY` set.
+    Run on a GPU with `HF_TOKEN` and `WANDB_API_KEY` set. Training and
+    generation are independent, so they can run in two sessions at once.
     """)
     return
 
 
 @app.cell
 def _():
+    train_button = mo.ui.run_button(label="Train reward models")
+    generate_button = mo.ui.run_button(label="Generate candidates")
+    mo.hstack([train_button, generate_button], justify="start")
+    return generate_button, train_button
+
+
+@app.cell
+def _():
     rankings = ensure_hub_dataframe(
+        ARTIFACTS_REPOSITORY,
         "rankings.parquet",
+        HABERMAS_PREFIX,
         lambda: assign_prompt_splits(load_habermas_rankings(), "question_id"),
     )
     pairs = habermas_pairs(rankings)
@@ -103,7 +101,8 @@ def _():
 
 
 @app.cell
-def _(pairs):
+def _(pairs, train_button):
+    mo.stop(not train_button.value)
     preference_model_metrics = pd.concat(
         [
             ensure_trained(
@@ -181,21 +180,27 @@ def _():
 @app.cell
 def _(rankings):
     deliberation_groups_frame = ensure_hub_dataframe(
-        "groups.parquet", lambda: deliberation_groups(rankings, "test")
+        ARTIFACTS_REPOSITORY,
+        "groups.parquet",
+        HABERMAS_PREFIX,
+        lambda: deliberation_groups(rankings, "test"),
     )
     deliberation_groups_frame
     return (deliberation_groups_frame,)
 
 
 @app.cell
-def _(deliberation_groups_frame):
+def _(deliberation_groups_frame, generate_button):
+    mo.stop(not generate_button.value)
     generation_prompts = [
         consensus_prompt(group_row["question"], list(group_row["opinions"]))
         for group_row in deliberation_groups_frame.to_dict("records")
     ]
     candidates_by_backbone = {
         backbone_name: ensure_hub_dataframe(
+            ARTIFACTS_REPOSITORY,
             f"candidates_{backbone_name.split('/')[-1].lower()}.parquet",
+            HABERMAS_PREFIX,
             lambda backbone_name=backbone_name: generate_responses(
                 backbone_name, generation_prompts, SAMPLES_PER_GROUP, DEVICE
             ).assign(

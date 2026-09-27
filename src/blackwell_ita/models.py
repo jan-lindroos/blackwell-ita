@@ -87,7 +87,11 @@ class MultiHeadEncoder(torch.nn.Module):
     """
 
     def __init__(
-        self, encoder_name: str, head_count: int, lora_rank: int | None
+        self,
+        encoder_name: str,
+        head_count: int,
+        lora_rank: int | None,
+        gradient_checkpointing: bool,
     ) -> None:
         """Load the decoder, optionally wrap it in LoRA, attach a fresh head."""
         super().__init__()
@@ -98,9 +102,10 @@ class MultiHeadEncoder(torch.nn.Module):
         # Multimodal checkpoints (Gemma 4) nest the text decoder; the vision
         # and audio embedders are never used
         self.encoder = getattr(pretrained_model, "language_model", pretrained_model)
-        self.encoder.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
+        if gradient_checkpointing:
+            self.encoder.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
         if lora_rank is not None:
             self.encoder = get_peft_model(
                 self.encoder,  # pyright: ignore[reportArgumentType]
@@ -135,6 +140,7 @@ class RewardModel(torch.nn.Module):
         criteria: list[str],
         max_tokens: int,
         lora_rank: int | None,
+        gradient_checkpointing: bool = True,
     ) -> None:
         """Build the encoder and load the tokenizer."""
         super().__init__()
@@ -153,7 +159,9 @@ class RewardModel(torch.nn.Module):
         self.text_prefix = (
             bos_token if bos_token is not None and not adds_bos_token else ""
         )
-        self.scorer = MultiHeadEncoder(encoder_name, len(criteria), lora_rank)
+        self.scorer = MultiHeadEncoder(
+            encoder_name, len(criteria), lora_rank, gradient_checkpointing
+        )
 
     def score(self, texts: list[str], device: str) -> torch.Tensor:
         """Tokenize texts and return per-criterion logits."""

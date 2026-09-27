@@ -1,15 +1,23 @@
 import tempfile
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass
 from itertools import islice
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 import wandb
 from tqdm.auto import tqdm
 
-from blackwell_ita.data import Batch, split_loaders
+from blackwell_ita.data import (
+    Batch,
+    PreferencePairDataset,
+    evaluation_loader,
+    longest_batch,
+    split_datasets,
+    training_batches,
+)
 from blackwell_ita.hub import (
     REWARD_MODELS_REPOSITORY,
     download_hub_file,
@@ -37,17 +45,24 @@ class RewardModelConfiguration:
     encoder_name: str
     lora_rank: int | None
     learning_rate: float
+    evaluation_interval_steps: int
     max_tokens: int = 4096
     batch_size: int = 12
     warmup_steps: int = 100
-    evaluations_per_epoch: int = 3
+    early_stopping_pair_count: int = 4000
     patience: int = 2
     seed: int = 1810
+    gradient_checkpointing: bool = True
 
     @property
     def checkpoint_filename(self) -> str:
         """Checkpoint filename on the hub."""
         return f"{self.name}.pt"
+
+    @property
+    def training_state_filename(self) -> str:
+        """Resumable mid-training state filename on the hub."""
+        return f"{self.name}_training_state.pt"
 
     @property
     def metrics_filename(self) -> str:
@@ -62,6 +77,7 @@ REWARD_MODEL_CONFIGURATIONS = [
         encoder_name="Qwen/Qwen3-4B-Instruct-2507",
         lora_rank=None,
         learning_rate=5e-6,
+        evaluation_interval_steps=400,
     ),
     RewardModelConfiguration(
         name="qwen3_4b_bradley_terry",
@@ -69,6 +85,7 @@ REWARD_MODEL_CONFIGURATIONS = [
         encoder_name="Qwen/Qwen3-4B-Instruct-2507",
         lora_rank=None,
         learning_rate=5e-6,
+        evaluation_interval_steps=400,
     ),
     RewardModelConfiguration(
         name="gemma4_12b_pairwise_lora",
@@ -76,6 +93,7 @@ REWARD_MODEL_CONFIGURATIONS = [
         encoder_name="google/gemma-4-12B-it",
         lora_rank=16,
         learning_rate=1e-4,
+        evaluation_interval_steps=400,
     ),
 ]
 
@@ -135,18 +153,25 @@ def logged_metrics(
 
 def train_until_no_improvement(
     model: RewardModel,
-    train_loader: Iterable[Batch],
+    train_dataset: PreferencePairDataset,
     validation_loader: Iterable[Batch],
+    batch_size: int,
     learning_rate: float,
     warmup_steps: int,
     steps_per_round: int,
     patience: int,
+    seed: int,
     device: str,
     log_metrics: Callable[[dict], None],
+    saved_state: dict | None = None,
+    save_state: Callable[[dict], None] | None = None,
 ) -> float:
     """Train in rounds, validating after each, until ``patience`` rounds pass
     without a new best validation loss. Restores the best trainable weights
     and returns the best validation loss.
+
+    ``save_state`` receives everything needed to resume after every round;
+    passing that back as ``saved_state`` continues exactly where it stopped.
     """
     model.to(device)
     trainable_parameters = {
@@ -158,20 +183,26 @@ def train_until_no_improvement(
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda scheduler_step: min(1.0, (scheduler_step + 1) / warmup_steps)
     )
-
-    def cycling_batches() -> Iterator[Batch]:
-        while True:
-            yield from train_loader
-
-    training_batches = cycling_batches()
+    # Fail in the first minute, not hours in, if the worst batch does not fit
+    model.compute_loss(longest_batch(train_dataset, batch_size), device).backward()
+    optimizer.zero_grad(set_to_none=True)
     best_validation_loss = float("inf")
     best_trainable_state: dict[str, torch.Tensor] | None = None
     rounds_without_improvement = 0
     step = 0
+    if saved_state is not None:
+        model.load_state_dict(saved_state["trainable_state"], strict=False)
+        optimizer.load_state_dict(saved_state["optimizer"])
+        scheduler.load_state_dict(saved_state["scheduler"])
+        best_validation_loss = saved_state["best_validation_loss"]
+        best_trainable_state = saved_state["best_trainable_state"]
+        rounds_without_improvement = saved_state["rounds_without_improvement"]
+        step = saved_state["step"]
+    batches = training_batches(train_dataset, batch_size, seed, start_step=step)
     while rounds_without_improvement < patience:
         model.train()
         for batch in tqdm(
-            islice(training_batches, steps_per_round),
+            islice(batches, steps_per_round),
             total=steps_per_round,
             desc=f"steps {step + 1} to {step + steps_per_round}",
         ):
@@ -200,23 +231,40 @@ def train_until_no_improvement(
         log_metrics(
             {"step": step}
             | logged_metrics(
-                "validation", validation_loss, validation_criterion_metrics
+                "early_stopping", validation_loss, validation_criterion_metrics
             )
         )
         if validation_loss < best_validation_loss:
             best_validation_loss = validation_loss
             rounds_without_improvement = 0
-            best_trainable_state = {
-                name: parameter.detach().to("cpu", copy=True)
-                for name, parameter in trainable_parameters.items()
-            }
+            best_trainable_state = cpu_copy(trainable_parameters)
         else:
             # A NaN validation loss lands here too, so divergence exhausts patience
             rounds_without_improvement += 1
+        if save_state is not None:
+            save_state(
+                {
+                    "step": step,
+                    "best_validation_loss": best_validation_loss,
+                    "rounds_without_improvement": rounds_without_improvement,
+                    "trainable_state": cpu_copy(trainable_parameters),
+                    "best_trainable_state": best_trainable_state,
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                }
+            )
     if best_trainable_state is None:
         raise RuntimeError(f"no finite validation loss, last was {validation_loss}")  # pyright: ignore[reportPossiblyUnboundVariable]
     model.load_state_dict(best_trainable_state, strict=False)
     return best_validation_loss
+
+
+def cpu_copy(parameters: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Detached CPU copies, so a snapshot survives further training."""
+    return {
+        name: parameter.detach().to("cpu", copy=True)
+        for name, parameter in parameters.items()
+    }
 
 
 def train_reward_model(
@@ -225,35 +273,59 @@ def train_reward_model(
     criteria: list[str],
     device: str,
     log_metrics: Callable[[dict], None],
+    saved_state: dict | None = None,
+    save_state: Callable[[dict], None] | None = None,
 ) -> tuple[RewardModel, pd.DataFrame]:
     """Train on the train split, early stop on validation, evaluate on test.
 
     Returns the model on the CPU and its validation and test metrics.
     """
     torch.manual_seed(configuration.seed)
-    loaders = split_loaders(pairs, criteria, configuration.batch_size)
+    datasets_by_split = split_datasets(pairs, criteria)
+    evaluation_loaders = {
+        split_name: evaluation_loader(
+            datasets_by_split[split_name], configuration.batch_size
+        )
+        for split_name in ("validation", "test")
+    }
+    validation_dataset = datasets_by_split["validation"]
+    early_stopping_indices = sorted(
+        np.random.default_rng(configuration.seed)
+        .choice(
+            len(validation_dataset),
+            size=min(configuration.early_stopping_pair_count, len(validation_dataset)),
+            replace=False,
+        )
+        .tolist()
+    )
+    early_stopping_loader = evaluation_loader(
+        validation_dataset, configuration.batch_size, early_stopping_indices
+    )
     model = REWARD_MODEL_CLASSES[configuration.model_type](
         configuration.encoder_name,
         criteria,
         configuration.max_tokens,
         configuration.lora_rank,
+        configuration.gradient_checkpointing,
     )
     train_until_no_improvement(
         model,
-        loaders["train"],
-        loaders["validation"],
+        datasets_by_split["train"],
+        early_stopping_loader,
+        configuration.batch_size,
         configuration.learning_rate,
         configuration.warmup_steps,
-        steps_per_round=max(
-            1, len(loaders["train"]) // configuration.evaluations_per_epoch
-        ),
+        steps_per_round=configuration.evaluation_interval_steps,
         patience=configuration.patience,
+        seed=configuration.seed,
         device=device,
         log_metrics=log_metrics,
+        saved_state=saved_state,
+        save_state=save_state,
     )
     split_metrics = []
-    for split_name in ("validation", "test"):
-        pooled_loss, criterion_metrics = evaluate(model, loaders[split_name], device)
+    for split_name, split_loader in evaluation_loaders.items():
+        pooled_loss, criterion_metrics = evaluate(model, split_loader, device)
         log_metrics(
             logged_metrics(f"final_{split_name}", pooled_loss, criterion_metrics)
         )
@@ -277,19 +349,57 @@ def ensure_trained(
 ) -> pd.DataFrame:
     """Train and upload the checkpoint and metrics unless the hub has them.
 
+    LoRA runs upload their training state after every round and resume from
+    it. A full fine-tune's state would be about 48 GB, so it trains in one go.
     Returns the validation and test metrics.
     """
     if not hub_file_exists(
         REWARD_MODELS_REPOSITORY, configuration.checkpoint_filename, prefix
     ):
+        resumable = configuration.lora_rank is not None
+        saved_state = (
+            torch.load(
+                download_hub_file(
+                    REWARD_MODELS_REPOSITORY,
+                    configuration.training_state_filename,
+                    prefix,
+                ),
+                map_location="cpu",
+                weights_only=True,
+            )
+            if resumable
+            and hub_file_exists(
+                REWARD_MODELS_REPOSITORY, configuration.training_state_filename, prefix
+            )
+            else None
+        )
         wandb_run = wandb.init(
             project=WANDB_PROJECT,
             name=f"{prefix}_{configuration.name}",
             config=asdict(configuration) | {"hub_prefix": prefix},
+            id=saved_state["wandb_run_id"] if saved_state is not None else None,
+            resume="allow",
         )
         wandb_run.define_metric("*", step_metric="step")
+
+        def upload_training_state(training_state: dict) -> None:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                local_state_path = (
+                    Path(temporary_directory) / configuration.training_state_filename
+                )
+                torch.save(
+                    training_state | {"wandb_run_id": wandb_run.id}, local_state_path
+                )
+                upload_hub_file(REWARD_MODELS_REPOSITORY, local_state_path, prefix)
+
         trained_model, trained_metrics = train_reward_model(
-            configuration, pairs, criteria, device, wandb_run.log
+            configuration,
+            pairs,
+            criteria,
+            device,
+            wandb_run.log,
+            saved_state=saved_state,
+            save_state=upload_training_state if resumable else None,
         )
         wandb_run.finish()
         upload_dataframe(

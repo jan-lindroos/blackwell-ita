@@ -1,4 +1,5 @@
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pandas as pd
@@ -70,3 +71,12 @@ def upload_dataframe(
 def read_hub_dataframe(repository_id: str, filename: str, prefix: str) -> pd.DataFrame:
     """Read a parquet file from under ``prefix``."""
     return pd.read_parquet(download_hub_file(repository_id, filename, prefix))
+
+
+def ensure_hub_dataframe(
+    repository_id: str, filename: str, prefix: str, build: Callable[[], pd.DataFrame]
+) -> pd.DataFrame:
+    """Build and upload ``filename`` unless the hub has it, then read it back."""
+    if not hub_file_exists(repository_id, filename, prefix):
+        upload_dataframe(repository_id, filename, build(), prefix)
+    return read_hub_dataframe(repository_id, filename, prefix)

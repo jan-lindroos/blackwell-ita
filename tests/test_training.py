@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from blackwell_ita import training
+from blackwell_ita.data import PreferencePairDataset
 from blackwell_ita.training import (
     REWARD_MODEL_CONFIGURATIONS,
     evaluate,
@@ -23,7 +24,7 @@ class ScriptedModel(torch.nn.Module):
         self.validation_losses = iter(validation_losses)
 
     def compute_loss(self, batch, device):
-        # The gradient is -1, so a unit-lr SGD-like step adds about one
+        # The gradient is -1, so every AdamW step raises the weight
         return -self.weight
 
     def batch_logits(self, batch, device):
@@ -34,6 +35,37 @@ def validation_batch() -> dict:
     return {"target": torch.tensor([[1.0, 0.0]]), "mask": torch.tensor([[1.0, 1.0]])}
 
 
+def tiny_train_dataset() -> PreferencePairDataset:
+    pairs = pd.DataFrame(
+        {
+            "prompt": ["p", "longer prompt", "q"],
+            "response_a": ["a", "b", "c"],
+            "response_b": ["d", "e", "f"],
+            "x": [1.0, 0.0, 0.5],
+        }
+    )
+    return PreferencePairDataset(pairs, ["x"], augment_presentation_order=False)
+
+
+def run_training(model: ScriptedModel, **overrides) -> float:
+    return train_until_no_improvement(
+        **{
+            "model": model,
+            "train_dataset": tiny_train_dataset(),
+            "validation_loader": [validation_batch()],
+            "batch_size": 2,
+            "learning_rate": 0.1,
+            "warmup_steps": 1,
+            "steps_per_round": 2,
+            "patience": 2,
+            "seed": 0,
+            "device": "cpu",
+            "log_metrics": lambda row: None,
+        }
+        | overrides
+    )
+
+
 def test_train_until_no_improvement_restores_the_best_trainable_weights():
     # Round 3 regresses and round 4 recovers; rounds 5 and 6 exhaust patience
     model = ScriptedModel([3.0, 2.0, 2.5, 1.5, 1.6, 1.7])
@@ -42,20 +74,10 @@ def test_train_until_no_improvement_restores_the_best_trainable_weights():
 
     def log_metrics(row: dict) -> None:
         logged_rows.append(row)
-        if "validation/loss" in row:
+        if "early_stopping/loss" in row:
             weights_after_each_round.append(model.weight.item())
 
-    train_until_no_improvement(
-        model,  # pyright: ignore[reportArgumentType]
-        train_loader=[{}],  # pyright: ignore[reportArgumentType]
-        validation_loader=[validation_batch()],  # pyright: ignore[reportArgumentType]
-        learning_rate=0.1,
-        warmup_steps=1,
-        steps_per_round=2,
-        patience=2,
-        device="cpu",
-        log_metrics=log_metrics,
-    )
+    run_training(model, log_metrics=log_metrics)
     assert len(weights_after_each_round) == 6
     assert model.weight.item() == weights_after_each_round[3]
     assert [row["step"] for row in logged_rows if "train/loss" in row] == list(
@@ -64,19 +86,41 @@ def test_train_until_no_improvement_restores_the_best_trainable_weights():
 
 
 def test_train_until_no_improvement_raises_when_validation_is_never_finite():
-    model = ScriptedModel([float("nan")] * 2)
     with pytest.raises(RuntimeError):
-        train_until_no_improvement(
-            model,  # pyright: ignore[reportArgumentType]
-            train_loader=[{}],  # pyright: ignore[reportArgumentType]
-            validation_loader=[validation_batch()],  # pyright: ignore[reportArgumentType]
-            learning_rate=0.1,
-            warmup_steps=1,
-            steps_per_round=1,
-            patience=2,
-            device="cpu",
-            log_metrics=lambda row: None,
+        run_training(ScriptedModel([float("nan")] * 2))
+
+
+class Interrupted(Exception):
+    pass
+
+
+def test_resuming_from_saved_state_matches_an_uninterrupted_run():
+    validation_losses = [3.0, 2.0, 2.5, 1.5, 1.6, 1.7]
+    uninterrupted_model = ScriptedModel(validation_losses)
+    uninterrupted_loss = run_training(uninterrupted_model)
+    saved_states = []
+
+    def save_then_die_after_two_rounds(training_state: dict) -> None:
+        saved_states.append(training_state)
+        if len(saved_states) == 2:
+            raise Interrupted
+
+    with pytest.raises(Interrupted):
+        run_training(
+            ScriptedModel(validation_losses), save_state=save_then_die_after_two_rounds
         )
+    resumed_model = ScriptedModel(validation_losses[2:])
+    resumed_steps = []
+    resumed_loss = run_training(
+        resumed_model,
+        saved_state=saved_states[-1],
+        log_metrics=lambda row: resumed_steps.append(row["step"]),
+    )
+    assert resumed_loss == uninterrupted_loss
+    assert resumed_model.weight.item() == pytest.approx(
+        uninterrupted_model.weight.item()
+    )
+    assert resumed_steps[0] == 5
 
 
 class FixedLogitModel(torch.nn.Module):
