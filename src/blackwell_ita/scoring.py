@@ -7,7 +7,7 @@ import torch
 from tqdm.auto import tqdm
 
 from blackwell_ita.hub import download_hub_file, hub_file_exists, upload_hub_file
-from blackwell_ita.models import RewardModel, truncated_pairwise_text
+from blackwell_ita.models import RewardModel, pointwise_text, truncated_pairwise_text
 
 
 def pairwise_preference_tensor(
@@ -20,8 +20,13 @@ def pairwise_preference_tensor(
     """Skew-symmetrised win probabilities, shape (head, response, response).
 
     Both presentation orders of every pair are scored, then
-    P <- (P + 1 - P^T) / 2 with 1/2 on the diagonal.
+    P <- (P + 1 - P^T) / 2 with 1/2 on the diagonal. A Bradley-Terry model
+    scores each response once instead.
     """
+    if model.model_type == "bradley_terry":
+        return bradley_terry_preference_tensor(
+            model, prompt, responses, device, batch_size
+        )
     response_count = len(responses)
     index_pairs = [
         (first_index, second_index)
@@ -63,6 +68,25 @@ def pairwise_preference_tensor(
     ):
         preference_tensor[:, first_index, second_index] = pair_probabilities
     return (preference_tensor + 1.0 - preference_tensor.transpose(0, 2, 1)) / 2.0
+
+
+def bradley_terry_preference_tensor(
+    model: RewardModel,
+    prompt: str,
+    responses: list[str],
+    device: str,
+    batch_size: int = 64,
+) -> np.ndarray:
+    """Win probabilities sigmoid(r_i - r_j), shape (head, response, response)."""
+    response_texts = [pointwise_text(prompt, response) for response in responses]
+    with torch.no_grad():
+        rewards = torch.cat(
+            [
+                model.score(response_texts[start : start + batch_size], device).cpu()
+                for start in range(0, len(response_texts), batch_size)
+            ]
+        ).T
+    return torch.sigmoid(rewards[:, :, None] - rewards[:, None, :]).numpy()
 
 
 def upload_tensors(

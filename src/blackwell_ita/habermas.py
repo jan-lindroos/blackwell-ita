@@ -46,6 +46,15 @@ HABERMAS_CONFIGURATIONS = [
         max_tokens=2048,
     ),
     RewardModelConfiguration(
+        name="qwen3_4b_bradley_terry",
+        model_type="bradley_terry",
+        encoder_name="Qwen/Qwen3-4B-Instruct-2507",
+        lora_rank=None,
+        learning_rate=5e-6,
+        evaluation_interval_steps=2500,
+        max_tokens=2048,
+    ),
+    RewardModelConfiguration(
         name="gemma4_12b_pairwise_lora",
         model_type="pairwise",
         encoder_name="google/gemma-4-12B-it",

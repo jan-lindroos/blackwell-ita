@@ -9,6 +9,7 @@ from blackwell_ita.scoring import pairwise_preference_tensor, score_with_resume
 class FirstResponseLengthModel:
     """Logit favours whichever response comes first, more so when it is longer."""
 
+    model_type = "pairwise"
     tokenizer = CharacterTokenizer()
     max_tokens = 1000
 
@@ -34,6 +35,31 @@ def test_pairwise_preference_tensor_cancels_presentation_order_bias():
     # A constant first-position bonus cancels, leaving the longer response ahead
     assert tensor[0, 1, 0] > 0.5
     assert tensor[0, 1, 2] > 0.5
+
+
+class ResponseLengthRewardModel:
+    """Pointwise reward equal to the response length."""
+
+    model_type = "bradley_terry"
+
+    def score(self, texts: list[str], device: str) -> torch.Tensor:
+        return torch.tensor(
+            [[float(len(text.split("[RESPONSE]\n")[1]))] for text in texts]
+        )
+
+
+def test_bradley_terry_preference_tensor_is_sigmoid_of_reward_differences():
+    tensor = pairwise_preference_tensor(
+        ResponseLengthRewardModel(),  # pyright: ignore[reportArgumentType]
+        "p",
+        ["a", "aaaa", "aa"],
+        "cpu",
+        batch_size=2,
+    )
+    rewards = np.array([1.0, 4.0, 2.0])
+    expected = 1.0 / (1.0 + np.exp(rewards[None, :] - rewards[:, None]))
+    assert tensor.shape == (1, 3, 3)
+    assert np.allclose(tensor[0], expected)
 
 
 def test_score_with_resume_scores_only_missing_keys_and_checkpoints(monkeypatch):
