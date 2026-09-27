@@ -113,10 +113,11 @@ def _(pairs):
         ],
         ignore_index=True,
     )
+    trained_configurations = HABERMAS_CONFIGURATIONS
     preference_model_metrics.pivot_table(
         index=["split", "criterion"], columns="name", values="decisive_accuracy"
     )
-    return
+    return (trained_configurations,)
 
 
 @app.cell(hide_code=True)
@@ -128,7 +129,7 @@ def _():
 
 
 @app.cell
-def _(rankings):
+def _(rankings, trained_configurations):
     human_track_sets = candidate_sets(rankings, "test")
     human_track_inputs = {
         set_row["set_id"]: {
@@ -149,7 +150,7 @@ def _(rankings):
                 ),
                 configuration.name,
             )
-            for configuration in HABERMAS_CONFIGURATIONS
+            for configuration in trained_configurations
         ],
         ignore_index=True,
     )
@@ -209,7 +210,7 @@ def _(deliberation_groups_frame):
 
 
 @app.cell
-def _(candidates_by_backbone, deliberation_groups_frame):
+def _(candidates_by_backbone, deliberation_groups_frame, trained_configurations):
     model_track_frames = []
     for backbone_name, backbone_candidates in candidates_by_backbone.items():
         backbone_slug = backbone_name.split("/")[-1].lower()
@@ -233,7 +234,7 @@ def _(candidates_by_backbone, deliberation_groups_frame):
                 f"model_track_{backbone_slug}_{configuration.name}.npz",
                 pool_inputs,
             )
-            for configuration in HABERMAS_CONFIGURATIONS
+            for configuration in trained_configurations
         }
         for selector_name, grader_name in permutations(tensors_by_model, 2):
             model_track_frames.append(
