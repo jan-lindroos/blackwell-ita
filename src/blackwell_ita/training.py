@@ -183,7 +183,9 @@ def train_until_no_improvement(
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda scheduler_step: min(1.0, (scheduler_step + 1) / warmup_steps)
     )
-    # Fail in the first minute, not hours in, if the worst batch does not fit
+    # Fail in the first minute, not hours in, if the worst batch does not fit.
+    # Gradient checkpointing only engages in training mode
+    model.train()
     model.compute_loss(longest_batch(train_dataset, batch_size), device).backward()
     optimizer.zero_grad(set_to_none=True)
     best_validation_loss = float("inf")
