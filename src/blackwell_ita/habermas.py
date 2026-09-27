@@ -53,7 +53,6 @@ HABERMAS_CONFIGURATIONS = [
         learning_rate=1e-4,
         evaluation_interval_steps=2500,
         max_tokens=2048,
-        gradient_checkpointing=False,
     ),
 ]
 GENERATION_BACKBONES = ["mistralai/Mistral-7B-Instruct-v0.3", "RLHFlow/LLaMA3-SFT-v2"]

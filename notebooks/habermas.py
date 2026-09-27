@@ -70,21 +70,24 @@ def score_participant_tensors(configuration, filename: str, keyed_inputs: dict) 
     return predicted_tensors
 
 
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    Run on a GPU with `HF_TOKEN` and `WANDB_API_KEY` set. Training and
-    generation are independent, so they can run in two sessions at once.
-    """)
-    return
-
-
 @app.cell
 def _():
-    train_button = mo.ui.run_button(label="Train reward models")
-    generate_button = mo.ui.run_button(label="Generate candidates")
-    mo.hstack([train_button, generate_button], justify="start")
-    return generate_button, train_button
+    train_buttons = mo.ui.dictionary(
+        {
+            configuration.name: mo.ui.run_button(label=f"Train {configuration.name}")
+            for configuration in HABERMAS_CONFIGURATIONS
+        }
+    )
+    generate_buttons = mo.ui.dictionary(
+        {
+            backbone_name: mo.ui.run_button(
+                label=f"Generate {backbone_name.split('/')[-1]}"
+            )
+            for backbone_name in GENERATION_BACKBONES
+        }
+    )
+    mo.hstack([*train_buttons.values(), *generate_buttons.values()], justify="start")
+    return generate_buttons, train_buttons
 
 
 @app.cell
@@ -101,18 +104,22 @@ def _():
 
 
 @app.cell
-def _(pairs, train_button):
-    mo.stop(not train_button.value)
+def _(pairs, train_buttons):
+    mo.stop(not any(train_buttons.value.values()))
+    trained_configurations = [
+        configuration
+        for configuration in HABERMAS_CONFIGURATIONS
+        if train_buttons.value[configuration.name]
+    ]
     preference_model_metrics = pd.concat(
         [
             ensure_trained(
                 configuration, pairs, HABERMAS_CRITERIA, HABERMAS_PREFIX, DEVICE
             )
-            for configuration in HABERMAS_CONFIGURATIONS
+            for configuration in trained_configurations
         ],
         ignore_index=True,
     )
-    trained_configurations = HABERMAS_CONFIGURATIONS
     preference_model_metrics.pivot_table(
         index=["split", "criterion"], columns="name", values="decisive_accuracy"
     )
@@ -190,8 +197,8 @@ def _(rankings):
 
 
 @app.cell
-def _(deliberation_groups_frame, generate_button):
-    mo.stop(not generate_button.value)
+def _(deliberation_groups_frame, generate_buttons):
+    mo.stop(not any(generate_buttons.value.values()))
     generation_prompts = [
         consensus_prompt(group_row["question"], list(group_row["opinions"]))
         for group_row in deliberation_groups_frame.to_dict("records")
@@ -209,13 +216,16 @@ def _(deliberation_groups_frame, generate_button):
                 ].to_numpy()[responses["prompt_index"]]
             ),
         )
-        for backbone_name in GENERATION_BACKBONES
+        for backbone_name, pressed in generate_buttons.value.items()
+        if pressed
     }
     return (candidates_by_backbone,)
 
 
 @app.cell
 def _(candidates_by_backbone, deliberation_groups_frame, trained_configurations):
+    # Each preference model grades the other's selections
+    mo.stop(len(trained_configurations) < 2)
     model_track_frames = []
     for backbone_name, backbone_candidates in candidates_by_backbone.items():
         backbone_slug = backbone_name.split("/")[-1].lower()
