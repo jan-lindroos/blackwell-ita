@@ -46,6 +46,7 @@ with app.setup:
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     SAMPLES_PER_GROUP = 64
+    POOL_SIZE = 16
     WELFARE_NAMES = ["rawlsian_welfare", "nash_welfare", "utilitarian_welfare"]
 
 
@@ -235,7 +236,8 @@ def _(candidates_by_backbone, deliberation_groups_frame, trained_configurations)
                 "question": group_row["question"],
                 "opinions": list(group_row["opinions"]),
                 "statements": backbone_candidates[
-                    backbone_candidates["question_id"] == group_row["question_id"]
+                    (backbone_candidates["question_id"] == group_row["question_id"])
+                    & (backbone_candidates["sample_index"] < POOL_SIZE)
                 ]
                 .sort_values("sample_index")["response"]
                 .tolist()
@@ -246,7 +248,7 @@ def _(candidates_by_backbone, deliberation_groups_frame, trained_configurations)
         tensors_by_model = {
             configuration.name: score_participant_tensors(
                 configuration,
-                f"model_track_{backbone_slug}_{configuration.name}.npz",
+                f"model_track_{backbone_slug}_{configuration.name}_pool{POOL_SIZE}.npz",
                 pool_inputs,
             )
             for configuration in trained_configurations
