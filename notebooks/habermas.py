@@ -46,7 +46,6 @@ with app.setup:
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     SAMPLES_PER_GROUP = 64
-    POOL_SIZE = 16
     WELFARE_NAMES = ["rawlsian_welfare", "nash_welfare", "utilitarian_welfare"]
 
 
@@ -73,22 +72,30 @@ def score_participant_tensors(configuration, filename: str, keyed_inputs: dict) 
 
 @app.cell
 def _():
-    train_buttons = mo.ui.dictionary(
+    train_checkboxes = mo.ui.dictionary(
         {
-            configuration.name: mo.ui.run_button(label=f"Train {configuration.name}")
+            configuration.name: mo.ui.checkbox(label=f"Train {configuration.name}")
             for configuration in HABERMAS_CONFIGURATIONS
         }
     )
-    generate_buttons = mo.ui.dictionary(
+    generate_checkboxes = mo.ui.dictionary(
         {
-            backbone_name: mo.ui.run_button(
+            backbone_name: mo.ui.checkbox(
                 label=f"Generate {backbone_name.split('/')[-1]}"
             )
             for backbone_name in GENERATION_BACKBONES
         }
     )
-    mo.hstack([*train_buttons.values(), *generate_buttons.values()], justify="start")
-    return generate_buttons, train_buttons
+    pool_size_slider = mo.ui.slider(steps=[16, 64], label="Pool size", show_value=True)
+    mo.hstack(
+        [
+            *train_checkboxes.values(),
+            *generate_checkboxes.values(),
+            pool_size_slider,
+        ],
+        justify="start",
+    )
+    return generate_checkboxes, pool_size_slider, train_checkboxes
 
 
 @app.cell
@@ -105,12 +112,12 @@ def _():
 
 
 @app.cell
-def _(pairs, train_buttons):
-    mo.stop(not any(train_buttons.value.values()))
+def _(pairs, train_checkboxes):
+    mo.stop(not any(train_checkboxes.value.values()))
     trained_configurations = [
         configuration
         for configuration in HABERMAS_CONFIGURATIONS
-        if train_buttons.value[configuration.name]
+        if train_checkboxes.value[configuration.name]
     ]
     preference_model_metrics = pd.concat(
         [
@@ -198,8 +205,8 @@ def _(rankings):
 
 
 @app.cell
-def _(deliberation_groups_frame, generate_buttons):
-    mo.stop(not any(generate_buttons.value.values()))
+def _(deliberation_groups_frame, generate_checkboxes):
+    mo.stop(not any(generate_checkboxes.value.values()))
     generation_prompts = [
         consensus_prompt(group_row["question"], list(group_row["opinions"]))
         for group_row in deliberation_groups_frame.to_dict("records")
@@ -217,14 +224,19 @@ def _(deliberation_groups_frame, generate_buttons):
                 ].to_numpy()[responses["prompt_index"]]
             ),
         )
-        for backbone_name, pressed in generate_buttons.value.items()
-        if pressed
+        for backbone_name, selected in generate_checkboxes.value.items()
+        if selected
     }
     return (candidates_by_backbone,)
 
 
 @app.cell
-def _(candidates_by_backbone, deliberation_groups_frame, trained_configurations):
+def _(
+    candidates_by_backbone,
+    deliberation_groups_frame,
+    pool_size_slider,
+    trained_configurations,
+):
     # Each preference model grades the other's selections
     mo.stop(len(trained_configurations) < 2)
     model_track_frames = []
@@ -237,7 +249,7 @@ def _(candidates_by_backbone, deliberation_groups_frame, trained_configurations)
                 "opinions": list(group_row["opinions"]),
                 "statements": backbone_candidates[
                     (backbone_candidates["question_id"] == group_row["question_id"])
-                    & (backbone_candidates["sample_index"] < POOL_SIZE)
+                    & (backbone_candidates["sample_index"] < pool_size_slider.value)
                 ]
                 .sort_values("sample_index")["response"]
                 .tolist()
@@ -248,7 +260,7 @@ def _(candidates_by_backbone, deliberation_groups_frame, trained_configurations)
         tensors_by_model = {
             configuration.name: score_participant_tensors(
                 configuration,
-                f"model_track_{backbone_slug}_{configuration.name}_pool{POOL_SIZE}.npz",
+                f"model_track_{backbone_slug}_{configuration.name}_pool{pool_size_slider.value}.npz",
                 pool_inputs,
             )
             for configuration in trained_configurations
