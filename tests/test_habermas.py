@@ -6,6 +6,8 @@ from blackwell_ita.habermas import (
     candidate_sets,
     consensus_prompt,
     deliberation_groups,
+    diverse_candidate_prompts,
+    generate_habermas_candidates,
     habermas_pairs,
     habermas_prompt,
     human_preference_tensor,
@@ -140,6 +142,87 @@ def test_consensus_prompt_numbers_every_opinion():
     assert "Question: Should we?" in prompt
     assert "Participant 1: Yes." in prompt
     assert "Participant 2: No." in prompt
+
+
+def proposal_groups():
+    return pd.DataFrame(
+        [
+            {"question_id": q, "question": q + "?", "opinions": ["A", "B", "C", "D"]}
+            for q in ["q1", "q2"]
+        ]
+    )
+
+
+def test_diverse_pool_preserves_balance_and_target_identity():
+    plan = diverse_candidate_prompts(proposal_groups())
+    pd.testing.assert_frame_equal(plan, diverse_candidate_prompts(proposal_groups()))
+    for _, group in plan.groupby("question_id"):
+        assert group.sample_index.tolist() == list(range(16))
+        assert group.candidate_kind.value_counts().to_dict() == {
+            "consensus": 4,
+            "participant": 4,
+            "pair": 6,
+            "common_ground": 1,
+            "alternative_compromise": 1,
+        }
+        pairs = group[group.candidate_kind == "pair"].target_participants
+        assert {tuple(sorted(pair)) for pair in pairs} == {
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (2, 3),
+            (2, 4),
+            (3, 4),
+        }
+        orders = np.array(group.opinion_order.tolist())
+        for position in range(4):
+            assert np.bincount(orders[:, position])[1:].tolist() == [4, 4, 4, 4]
+    for row in plan.to_dict("records"):
+        assert "words" not in row["prompt"]
+        assert "paragraph" not in row["prompt"]
+        for i, opinion in enumerate(["A", "B", "C", "D"], 1):
+            assert f"Participant {i}: {opinion}" in row["prompt"]
+        if row["target_participants"]:
+            assert (
+                "participants " + ", ".join(map(str, row["target_participants"])) + "."
+                in row["prompt"]
+            )
+
+
+def test_generation_maps_local_outputs_to_fixed_plan(monkeypatch):
+    def fake_generate(model_name, prompts, samples_per_prompt, device):
+        assert model_name == "mock"
+        assert samples_per_prompt == 1
+        assert device == "cpu"
+        # Reverse the output to catch accidental positional alignment.
+        return pd.DataFrame(
+            [
+                {"prompt_index": i, "sample_index": 0, "response": prompt}
+                for i, prompt in reversed(list(enumerate(prompts)))
+            ]
+        )
+
+    monkeypatch.setattr("blackwell_ita.habermas.generate_responses", fake_generate)
+    for strategy in ["diverse_v2", "consensus"]:
+        result = generate_habermas_candidates(
+            "mock", proposal_groups(), "cpu", strategy
+        )
+        assert len(result) == 32
+        assert result.response.equals(result.prompt)
+        assert result.strategy.eq(strategy).all()
+        assert not result.duplicated(["question_id", "sample_index"]).any()
+        for row in result.to_dict("records"):
+            assert f"Question: {row['question_id']}?" in row["response"]
+            assert "paragraph" not in row["prompt"]
+
+
+def test_diverse_generation_rejects_wrong_group_sizes():
+    with pytest.raises(ValueError, match="four participants"):
+        diverse_candidate_prompts(
+            pd.DataFrame(
+                [{"question_id": "q", "question": "Q?", "opinions": ["A", "B"]}]
+            )
+        )
 
 
 def test_human_track_results_score_selections_on_human_rankings():

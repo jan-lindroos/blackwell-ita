@@ -24,15 +24,16 @@ with app.setup:
     import torch
 
     from blackwell_ita.data import assign_prompt_splits, split_summary
-    from blackwell_ita.generation import generate_responses
     from blackwell_ita.habermas import (
         GENERATION_BACKBONES,
+        GENERATION_STRATEGIES,
         HABERMAS_CONFIGURATIONS,
         HABERMAS_CRITERIA,
+        HABERMAS_POOL_SIZE,
         HABERMAS_PREFIX,
         candidate_sets,
-        consensus_prompt,
         deliberation_groups,
+        generate_habermas_candidates,
         habermas_pairs,
         human_preference_tensor,
         human_track_results,
@@ -46,7 +47,6 @@ with app.setup:
     from blackwell_ita.training import ensure_trained, load_trained
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    SAMPLES_PER_GROUP = 64
     WELFARE_NAMES = ["rawlsian_welfare", "nash_welfare", "utilitarian_welfare"]
 
 
@@ -87,16 +87,24 @@ def _():
             for backbone_name in GENERATION_BACKBONES
         }
     )
-    pool_size_slider = mo.ui.slider(steps=[16, 64], label="Pool size", show_value=True)
+    generation_strategies = mo.ui.multiselect(
+        options=GENERATION_STRATEGIES,
+        value=["diverse_v2"],
+        label="Generation strategies",
+    )
     mo.hstack(
         [
             *train_checkboxes.values(),
             *generate_checkboxes.values(),
-            pool_size_slider,
+            generation_strategies,
         ],
         justify="start",
     )
-    return generate_checkboxes, pool_size_slider, train_checkboxes
+    return (
+        generate_checkboxes,
+        generation_strategies,
+        train_checkboxes,
+    )
 
 
 @app.cell
@@ -174,6 +182,22 @@ def _():
 
     Generated statements have no human ratings, so every number here is a
     model-based proxy graded by the preference model that did not select.
+
+    Generate with the selected backbone on the notebook device. The fixed
+    `diverse_v2` pool contains 4 consensus drafts, 4 participant-focused proposals,
+    all 6 pair-focused compromises, and 2 whole-group alternatives. Prompts impose
+    no word or paragraph limit; generation retains its 512-token safety cap.
+    Four opinion orderings balance positions across the pool, but not within
+    every candidate type. An optional consensus baseline uses the same backbone
+    and decoding settings. Completed pools are cached on Hugging Face.
+    Diversity is experimental: greater predicted disagreement alone does not
+    establish better representation or proposal quality.
+
+    The diverse strategy adapts participant-subset generation from
+    [PROSE, Appendix D.2](https://arxiv.org/html/2505.22939v1) and opinion-order
+    shuffling from the public
+    [prompted Habermas implementation](https://github.com/google-deepmind/habermas_machine/blob/main/habermas_machine/machine.py).
+    Its allocation and proposal prompts are our own, not the original study protocol.
     """)
     return
 
@@ -191,27 +215,26 @@ def _(rankings):
 
 
 @app.cell
-def _(deliberation_groups_frame, generate_checkboxes):
+def _(deliberation_groups_frame, generate_checkboxes, generation_strategies):
     mo.stop(not any(generate_checkboxes.value.values()))
-    generation_prompts = [
-        consensus_prompt(group_row["question"], list(group_row["opinions"]))
-        for group_row in deliberation_groups_frame.to_dict("records")
-    ]
+    mo.stop(not generation_strategies.value)
     candidates_by_backbone = {
-        backbone_name: ensure_hub_dataframe(
+        (backbone_name, strategy): ensure_hub_dataframe(
             ARTIFACTS_REPOSITORY,
-            f"candidates_{backbone_name.split('/')[-1].lower()}.parquet",
+            f"candidates_local_v2_{backbone_name.split('/')[-1].lower()}_{strategy}.parquet",
             HABERMAS_PREFIX,
-            lambda backbone_name=backbone_name: generate_responses(
-                backbone_name, generation_prompts, SAMPLES_PER_GROUP, DEVICE
-            ).assign(
-                question_id=lambda responses: deliberation_groups_frame[
-                    "question_id"
-                ].to_numpy()[responses["prompt_index"]]
+            lambda backbone_name=backbone_name, strategy=strategy: (
+                generate_habermas_candidates(
+                    backbone_name,
+                    deliberation_groups_frame,
+                    DEVICE,
+                    strategy=strategy,
+                )
             ),
         )
         for backbone_name, selected in generate_checkboxes.value.items()
         if selected
+        for strategy in generation_strategies.value
     }
     return (candidates_by_backbone,)
 
@@ -220,13 +243,15 @@ def _(deliberation_groups_frame, generate_checkboxes):
 def _(
     candidates_by_backbone,
     deliberation_groups_frame,
-    pool_size_slider,
     trained_configurations,
 ):
     # Each preference model grades the other's selections
     mo.stop(len(trained_configurations) < 2)
     model_track_frames = []
-    for backbone_name, backbone_candidates in candidates_by_backbone.items():
+    for (
+        backbone_name,
+        strategy,
+    ), backbone_candidates in candidates_by_backbone.items():
         backbone_slug = backbone_name.split("/")[-1].lower()
         # The anchor rides at the last index of every pool
         pool_inputs = {
@@ -235,7 +260,6 @@ def _(
                 "opinions": list(group_row["opinions"]),
                 "statements": backbone_candidates[
                     (backbone_candidates["question_id"] == group_row["question_id"])
-                    & (backbone_candidates["sample_index"] < pool_size_slider.value)
                 ]
                 .sort_values("sample_index")["response"]
                 .tolist()
@@ -246,7 +270,7 @@ def _(
         tensors_by_model = {
             configuration.name: score_participant_tensors(
                 configuration,
-                f"model_track_{backbone_slug}_{configuration.name}_pool{pool_size_slider.value}.npz",
+                f"model_track_local_v2_{backbone_slug}_{strategy}_{configuration.name}_pool{HABERMAS_POOL_SIZE}.npz",
                 pool_inputs,
             )
             for configuration in trained_configurations
@@ -260,12 +284,12 @@ def _(
                     backbone_name,
                     selector_name,
                     grader_name,
-                )
+                ).assign(strategy=strategy)
             )
     model_track_results_frame = pd.concat(model_track_frames, ignore_index=True)
     summarise_methods(
         model_track_results_frame,
-        ["evidence", "backbone", "selector"],
+        ["evidence", "backbone", "strategy", "selector"],
         "question_id",
         [
             f"{opponent}_{welfare_name}"

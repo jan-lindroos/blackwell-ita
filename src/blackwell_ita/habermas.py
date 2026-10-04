@@ -1,6 +1,9 @@
+from itertools import combinations
+
 import numpy as np
 import pandas as pd
 
+from blackwell_ita.generation import generate_responses
 from blackwell_ita.models import RewardModel
 from blackwell_ita.scoring import pairwise_preference_tensor
 from blackwell_ita.selection import (
@@ -65,6 +68,8 @@ HABERMAS_CONFIGURATIONS = [
     ),
 ]
 GENERATION_BACKBONES = ["mistralai/Mistral-7B-Instruct-v0.3", "RLHFlow/LLaMA3-SFT-v2"]
+HABERMAS_POOL_SIZE = 16
+GENERATION_STRATEGIES = ["consensus", "diverse_v2"]
 
 
 def usable_rankings(comparisons: pd.DataFrame) -> pd.DataFrame:
@@ -234,9 +239,125 @@ def consensus_prompt(question: str, opinions: list[str]) -> str:
     )
     return (
         "A group of citizens is deliberating on the question below. Write a single"
-        " consensus statement, in one paragraph, that the whole group could"
+        " consensus statement that the whole group could"
         " endorse. Reply with the statement only.\n\n"
         f"Question: {question}\n\n{numbered_opinions}"
+    )
+
+
+def diverse_candidate_prompts(groups: pd.DataFrame, seed: int = 1810) -> pd.DataFrame:
+    """A fixed pool of 16 proposals, with stable participant IDs and varied order.
+
+    Each block contains four consensus, four individual, six pair-focused,
+    and two whole-group proposals. Targets use one-based IDs into group opinions.
+    """
+    rows = []
+    for group in groups.to_dict("records"):
+        opinions = list(group["opinions"])
+        if len(opinions) != 4:
+            raise ValueError("The diverse pool requires exactly four participants")
+        # Rotate balanced orders; this balances positions across the pool,
+        # not every candidate type or every possible order interaction.
+        rng = np.random.default_rng(seed)
+        slots = (
+            [("consensus", ())] * 4
+            + [("participant", (i,)) for i in range(1, 5)]
+            + [("pair", pair) for pair in combinations(range(1, 5), 2)]
+            + [("common_ground", ()), ("alternative_compromise", ())]
+        )
+        orders = np.array([[0, 1, 3, 2], [1, 2, 0, 3], [2, 3, 1, 0], [3, 0, 2, 1]])
+        labels = rng.permutation(4)
+        for sample_index in range(HABERMAS_POOL_SIZE):
+            kind, targets = slots[sample_index % 16]
+            order = labels[orders[sample_index % 4]]
+            targets = tuple(i + 1 for i in order if i + 1 in targets)
+            numbered = "\n\n".join(f"Participant {i + 1}: {opinions[i]}" for i in order)
+            if kind == "consensus":
+                priority = (
+                    "Seek a position that could attract broad support across the group. "
+                    "Address shared concerns while acknowledging the main unresolved disagreement."
+                )
+            elif targets:
+                priority = (
+                    (
+                        "Give equal weight to"
+                        if kind == "pair"
+                        else "Give particular weight to"
+                    )
+                    + " the stated priorities of participants "
+                    + ", ".join(map(str, targets))
+                    + ". Develop a proposal that preserves those priorities while making "
+                    "a concrete accommodation for other participants' concerns. "
+                    "Make any necessary trade-off explicit."
+                )
+            elif kind == "common_ground":
+                priority = (
+                    "Propose a limited, concrete step supported by concerns shared across "
+                    "the group. Leave genuinely unresolved issues open."
+                )
+            else:
+                priority = (
+                    "Address the main disagreement through a concrete condition, safeguard, "
+                    "exception, or staged implementation. Explain what that arrangement "
+                    "accommodates and what disagreement remains."
+                )
+            prompt = (
+                f"Question: {group['question']}\n\nParticipant opinions:\n{numbered}"
+                "\n\nWrite one candidate proposal for this group to evaluate.\n"
+                f"{priority}\n"
+                "Give a concrete answer grounded in the supplied opinions. Explain the "
+                "proposed policy, accommodation, or trade-off. Acknowledge relevant "
+                "disagreement without inventing anyone's position. Do not claim that "
+                "participants have agreed to your proposal. Do not describe this drafting "
+                "task or mention participant numbers.\nReturn only the proposal."
+            )
+            rows.append(
+                {
+                    "question_id": group["question_id"],
+                    "sample_index": sample_index,
+                    "candidate_kind": kind,
+                    "target_participants": list(targets),
+                    "opinion_order": [int(i) + 1 for i in order],
+                    "prompt": prompt,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def generate_habermas_candidates(
+    model_name: str,
+    groups: pd.DataFrame,
+    device: str,
+    strategy: str = "diverse_v2",
+) -> pd.DataFrame:
+    """Generate a fixed 16-candidate pool on the notebook device."""
+    if strategy not in GENERATION_STRATEGIES:
+        raise ValueError(f"Unknown generation strategy: {strategy}")
+    plan = diverse_candidate_prompts(groups)
+    if strategy == "consensus":
+        prompts = {
+            group["question_id"]: consensus_prompt(
+                group["question"], list(group["opinions"])
+            )
+            for group in groups.to_dict("records")
+        }
+        plan["prompt"] = plan["question_id"].map(
+            lambda question_id: prompts[question_id]
+        )
+        plan["candidate_kind"] = "consensus"
+        plan["target_participants"] = [[] for _ in range(len(plan))]
+        plan["opinion_order"] = [list(range(1, 5)) for _ in range(len(plan))]
+    plan["strategy"] = strategy
+    responses = generate_responses(model_name, plan["prompt"].tolist(), 1, device)
+    # Each prompt generates one response; preserve the group's sample index.
+    return (
+        plan.rename_axis("prompt_index")
+        .reset_index()
+        .merge(
+            responses[["prompt_index", "response"]],
+            on="prompt_index",
+            validate="one_to_one",
+        )
     )
 
 
