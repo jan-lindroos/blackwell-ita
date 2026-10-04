@@ -12,21 +12,63 @@ def blackwell_winner(
     max(0, threshold - P_k(policy, e_i)) over pure opponents i and heads k,
     as a linear programme in epigraph form.
     """
-    head_count, candidate_count, _ = preference_tensor.shape
+    return target_set_winner(
+        preference_tensor,
+        np.eye(preference_tensor.shape[0]),
+        np.full(preference_tensor.shape[0], threshold),
+    )
+
+
+def target_set_winner(
+    preference_tensor: np.ndarray, normals: np.ndarray, thresholds: np.ndarray
+) -> np.ndarray:
+    """Minimax L-infinity distance to {z in R^k: normals @ z >= thresholds}.
+
+    Nonnegative, unit-sum rows make the distance the largest positive constraint
+    shortfall. The target is upward closed, without an upper box constraint.
+    """
+    if (
+        preference_tensor.ndim != 3
+        or preference_tensor.shape[1] != preference_tensor.shape[2]
+        or preference_tensor.shape[1] == 0
+        or not np.isfinite(preference_tensor).all()
+        or np.any((preference_tensor < 0) | (preference_tensor > 1))
+        or normals.ndim != 2
+        or normals.shape[1] != preference_tensor.shape[0]
+        or normals.shape[0] == 0
+        or not np.isfinite(normals).all()
+        or (normals < 0).any()
+        or not np.allclose(normals.sum(axis=1), 1)
+        or thresholds.shape != (len(normals),)
+        or not np.isfinite(thresholds).all()
+        or np.any((thresholds < 0) | (thresholds > 1))
+    ):
+        raise ValueError("Invalid preference tensor or monotone target set")
+    transformed = np.einsum("rk,kij->rij", normals, preference_tensor)
+    candidate_count = preference_tensor.shape[1]
     policy = cp.Variable(candidate_count, nonneg=True)
     shortfall = cp.Variable(nonneg=True)
     constraints = [cp.sum(policy) == 1] + [
-        preference_tensor[head].T @ policy + shortfall >= threshold
-        for head in range(head_count)
+        transformed[row].T @ policy + shortfall >= thresholds[row]
+        for row in range(len(normals))
     ]
     problem = cp.Problem(cp.Minimize(shortfall), constraints)  # pyright: ignore[reportArgumentType]
-    problem.solve(solver=cp.CLARABEL)
+    problem.solve(solver=cp.SCIPY, scipy_options={"method": "highs"})
     if (
         problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
         or policy.value is None
     ):
         raise RuntimeError(f"blackwell_winner solve failed: {problem.status}")
-    return clean_policy(np.asarray(policy.value))
+    result = clean_policy(np.asarray(policy.value))
+    attained = max(
+        0.0,
+        float(
+            (thresholds[:, None] - np.einsum("i,rij->rj", result, transformed)).max()
+        ),
+    )
+    if abs(attained - float(np.asarray(problem.value))) > 1e-5:
+        raise RuntimeError("Policy cleanup changed the target-set optimum")
+    return result
 
 
 def von_neumann_winner(preference_matrix: np.ndarray) -> np.ndarray:
@@ -51,10 +93,30 @@ def uniform_policy(candidate_count: int) -> np.ndarray:
     return np.full(candidate_count, 1.0 / candidate_count)
 
 
-def best_of_n(preference_tensor: np.ndarray) -> np.ndarray:
+def borda(preference_tensor: np.ndarray) -> np.ndarray:
     """The candidate with the highest head-averaged win rate against a uniform opponent."""
     scores = preference_tensor.mean(axis=(0, 2))
     return np.eye(len(scores))[scores.argmax()]
+
+
+def best_of_n(rewards: np.ndarray, weights: np.ndarray | None = None) -> np.ndarray:
+    """Pick the largest weighted scalar reward; rewards are (head, candidate).
+
+    These are raw pointwise rewards, not averages of pairwise win probabilities.
+    Ties choose the first candidate, as in the Borda diagnostic.
+    """
+    if rewards.ndim != 2 or 0 in rewards.shape or not np.isfinite(rewards).all():
+        raise ValueError("Expected finite scalar rewards, shape (head, candidate)")
+    if weights is None:
+        weights = np.full(rewards.shape[0], 1 / rewards.shape[0])
+    if (
+        weights.shape != (rewards.shape[0],)
+        or not np.isfinite(weights).all()
+        or (weights < 0).any()
+        or not np.isclose(weights.sum(), 1)
+    ):
+        raise ValueError("Scalar weights must be nonnegative and sum to one")
+    return np.eye(rewards.shape[1])[(weights @ rewards).argmax()]
 
 
 def maximin(preference_tensor: np.ndarray) -> np.ndarray:
@@ -65,7 +127,7 @@ def maximin(preference_tensor: np.ndarray) -> np.ndarray:
 
 SELECTION_METHODS = {
     "uniform": lambda preference_tensor: uniform_policy(preference_tensor.shape[1]),
-    "best_of_n": best_of_n,
+    "borda": borda,
     "maximin": maximin,
     "scalarised_nash": scalarised_nash,
     "blackwell": blackwell_winner,

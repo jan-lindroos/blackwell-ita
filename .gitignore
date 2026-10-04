@@ -21,3 +21,4 @@ CLAUDE.md
 .pytest_cache/
 .idea/
 notebooks/__marimo__/session/
+.helpsteer/

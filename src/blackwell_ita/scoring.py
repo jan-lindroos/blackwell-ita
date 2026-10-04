@@ -59,7 +59,9 @@ def pairwise_preference_tensor(
                 device,
             )
             probability_batches.append(torch.sigmoid(logits).cpu())
-    probabilities = torch.cat(probability_batches).numpy()[np.argsort(length_order)]
+    probabilities = (
+        torch.cat(probability_batches).float().numpy()[np.argsort(length_order)]
+    )
     preference_tensor = np.full(
         (probabilities.shape[1], response_count, response_count), 0.5
     )
@@ -78,6 +80,24 @@ def bradley_terry_preference_tensor(
     batch_size: int = 64,
 ) -> np.ndarray:
     """Win probabilities sigmoid(r_i - r_j), shape (head, response, response)."""
+    rewards = bradley_terry_rewards(model, prompt, responses, device, batch_size)
+    return rewards_to_preferences(rewards)
+
+
+def rewards_to_preferences(rewards: np.ndarray) -> np.ndarray:
+    """Convert raw (head, response) BT rewards into complementary probabilities."""
+    values = torch.as_tensor(rewards)
+    return torch.sigmoid(values[:, :, None] - values[:, None, :]).numpy()
+
+
+def bradley_terry_rewards(
+    model: RewardModel,
+    prompt: str,
+    responses: list[str],
+    device: str,
+    batch_size: int = 64,
+) -> np.ndarray:
+    """Raw scalar rewards, shape (head, response), retained for best-of-N."""
     response_texts = [pointwise_text(prompt, response) for response in responses]
     with torch.no_grad():
         rewards = torch.cat(
@@ -86,7 +106,7 @@ def bradley_terry_preference_tensor(
                 for start in range(0, len(response_texts), batch_size)
             ]
         ).T
-    return torch.sigmoid(rewards[:, :, None] - rewards[:, None, :]).numpy()
+    return rewards.float().numpy()
 
 
 def upload_tensors(
