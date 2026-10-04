@@ -3,8 +3,10 @@ import pandas as pd
 import pytest
 
 from blackwell_ita.selection import (
+    best_of_n,
     blackwell_winner,
     clean_policy,
+    maximin,
     paired_bootstrap_interval,
     scalarised_nash,
     summarise_methods,
@@ -51,6 +53,14 @@ def test_blackwell_protects_the_minority_head_that_averaging_overrides():
             scalarised_nash(preference_tensor), preference_tensor, np.full(3, 1 / 3)
         ).min()
     )
+
+
+def test_best_of_n_and_maximin_pick_one_candidate_each():
+    majority = skew_symmetric({(0, 1): 0.9, (0, 2): 0.9, (1, 2): 0.9}, 3)
+    minority = skew_symmetric({(0, 1): 0.0, (0, 2): 0.0, (1, 2): 0.9}, 3)
+    preference_tensor = np.stack([majority, majority, majority, minority])
+    assert best_of_n(preference_tensor).tolist() == [1.0, 0.0, 0.0]
+    assert maximin(preference_tensor).tolist() == [0.0, 1.0, 0.0]
 
 
 def test_clean_policy_drops_dust_and_renormalises():

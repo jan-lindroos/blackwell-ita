@@ -51,8 +51,22 @@ def uniform_policy(candidate_count: int) -> np.ndarray:
     return np.full(candidate_count, 1.0 / candidate_count)
 
 
+def best_of_n(preference_tensor: np.ndarray) -> np.ndarray:
+    """The candidate with the highest head-averaged win rate against a uniform opponent."""
+    scores = preference_tensor.mean(axis=(0, 2))
+    return np.eye(len(scores))[scores.argmax()]
+
+
+def maximin(preference_tensor: np.ndarray) -> np.ndarray:
+    """The candidate whose worst-off head has the highest win rate against a uniform opponent."""
+    scores = preference_tensor.mean(axis=2).min(axis=0)
+    return np.eye(len(scores))[scores.argmax()]
+
+
 SELECTION_METHODS = {
     "uniform": lambda preference_tensor: uniform_policy(preference_tensor.shape[1]),
+    "best_of_n": best_of_n,
+    "maximin": maximin,
     "scalarised_nash": scalarised_nash,
     "blackwell": blackwell_winner,
 }

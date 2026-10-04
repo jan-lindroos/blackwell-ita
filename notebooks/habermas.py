@@ -34,6 +34,7 @@ with app.setup:
         consensus_prompt,
         deliberation_groups,
         habermas_pairs,
+        human_preference_tensor,
         human_track_results,
         load_habermas_rankings,
         model_track_results,
@@ -137,36 +138,21 @@ def _(pairs, train_checkboxes):
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    ## Human-rated candidates
+    ## Selection from human preferences
     """)
     return
 
 
 @app.cell
-def _(rankings, trained_configurations):
+def _(rankings):
     human_track_sets = candidate_sets(rankings, "test")
-    human_track_inputs = {
-        set_row["set_id"]: {
-            "question": set_row["question"],
-            "opinions": list(set_row["opinions"]),
-            "statements": list(set_row["statements"]),
-        }
-        for set_row in human_track_sets.to_dict("records")
-    }
-    human_track_results_frame = pd.concat(
-        [
-            human_track_results(
-                human_track_sets,
-                score_participant_tensors(
-                    configuration,
-                    f"human_track_{configuration.name}.npz",
-                    human_track_inputs,
-                ),
-                configuration.name,
-            )
-            for configuration in trained_configurations
-        ],
-        ignore_index=True,
+    human_track_results_frame = human_track_results(
+        human_track_sets,
+        {
+            set_row["set_id"]: human_preference_tensor(set_row["participant_ranks"])
+            for set_row in human_track_sets.to_dict("records")
+        },
+        "human preferences",
     )
     summarise_methods(
         human_track_results_frame,
@@ -184,7 +170,7 @@ def _(rankings, trained_configurations):
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    ## Model-based candidates
+    ## Reward model selection (larger sample)
 
     Generated statements have no human ratings, so every number here is a
     model-based proxy graded by the preference model that did not select.
