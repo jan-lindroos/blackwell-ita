@@ -42,7 +42,7 @@ from blackwell_ita.training import REWARD_MODEL_CONFIGURATIONS
 
 RESULT_METRICS = [
     *HELPSTEER_CRITERIA,
-    "rawlsian_welfare",
+    "egalitarian_welfare",
     "nash_welfare",
     "utilitarian_welfare",
 ]

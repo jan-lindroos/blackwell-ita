@@ -5,9 +5,11 @@ import pandas as pd
 
 from blackwell_ita.generation import generate_responses
 from blackwell_ita.models import RewardModel
-from blackwell_ita.scoring import pairwise_preference_tensor
+from blackwell_ita.scoring import pairwise_preference_tensor, preferences_to_rewards
 from blackwell_ita.selection import (
     SELECTION_METHODS,
+    best_of_n,
+    paired_bootstrap_interval,
     uniform_policy,
     welfare,
     win_rates,
@@ -24,17 +26,6 @@ COMPARISON_COLUMNS = {
     "own_opinion.text": "opinion",
     "candidates.text": "statements",
     "rankings.numerical_ranks": "ranks",
-    "ratings.agreement": "agreements",
-}
-# MOCK marks a rating the interface filled in, so it counts as missing
-AGREEMENT_SCALE = {
-    "STRONGLY_DISAGREE": 1.0,
-    "DISAGREE": 2.0,
-    "SOMEWHAT_DISAGREE": 3.0,
-    "NEUTRAL": 4.0,
-    "SOMEWHAT_AGREE": 5.0,
-    "AGREE": 6.0,
-    "STRONGLY_AGREE": 7.0,
 }
 HABERMAS_CRITERIA = ["preference"]
 HABERMAS_PREFIX = "habermas"
@@ -75,8 +66,7 @@ GENERATION_STRATEGIES = ["consensus", "diverse_v2"]
 def usable_rankings(comparisons: pd.DataFrame) -> pd.DataFrame:
     """One row per human participant and candidate set they fully ranked.
 
-    Rank 0 is best and ties share a rank. Agreements map onto 1 to 7, NaN
-    where missing.
+    Rank 0 is best and ties share a rank.
     """
     completed = comparisons[
         (comparisons["metadata.provenance"] == "HUMAN_CITIZEN")
@@ -93,10 +83,6 @@ def usable_rankings(comparisons: pd.DataFrame) -> pd.DataFrame:
     return rankings.assign(
         statements=[list(statements) for statements in rankings["statements"]],
         ranks=[[int(rank) for rank in ranks] for ranks in rankings["ranks"]],
-        agreements=[
-            [AGREEMENT_SCALE.get(agreement, np.nan) for agreement in agreements]
-            for agreements in rankings["agreements"]
-        ],
     ).reset_index(drop=True)
 
 
@@ -148,15 +134,6 @@ def habermas_pairs(rankings: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(pair_rows)
 
 
-def human_preference_tensor(participant_ranks: list[list[int]]) -> np.ndarray:
-    """Observed preferences, shape (participant, statement, statement)."""
-    ranks = np.asarray(participant_ranks)
-    return (
-        (ranks[:, :, None] < ranks[:, None, :])
-        + 0.5 * (ranks[:, :, None] == ranks[:, None, :])
-    ).astype(float)
-
-
 def candidate_sets(rankings: pd.DataFrame, split_name: str) -> pd.DataFrame:
     """One row per candidate set in ``split_name`` that two or more participants ranked."""
     split_rankings = rankings[rankings["split"] == split_name]
@@ -174,7 +151,6 @@ def candidate_sets(rankings: pd.DataFrame, split_name: str) -> pd.DataFrame:
                 "statements": set_rankings["statements"].iloc[0],  # pyright: ignore[reportAttributeAccessIssue]
                 "opinions": set_rankings["opinion"].tolist(),
                 "participant_ranks": set_rankings["ranks"].tolist(),
-                "participant_agreements": set_rankings["agreements"].tolist(),
             }
         )
     return pd.DataFrame(set_rows)
@@ -389,44 +365,28 @@ def prefixed_welfare(
     }
 
 
-def human_track_results(
-    sets: pd.DataFrame, predicted_tensors: dict[str, np.ndarray], selector_name: str
-) -> pd.DataFrame:
-    """Select on predicted preferences, score on the participants' own rankings.
+def selection_policies(
+    selector_tensor: np.ndarray, selector_name: str
+) -> dict[str, np.ndarray]:
+    """Each method's mixture over the pool, with zero weight on the anchor.
 
-    Win rates are against a uniformly random member of the candidate set,
-    agreement is the expected 1 to 7 rating, over participants who rated.
+    The anchor (the group's human top pick) sits at the last index. A
+    Bradley-Terry selector also runs best-of-N on the rewards its tensor encodes.
     """
-    result_rows = []
-    for set_row in sets.to_dict("records"):
-        human_tensor = human_preference_tensor(set_row["participant_ranks"])
-        agreements = np.asarray(set_row["participant_agreements"], dtype=float)
-        rated_participants = ~np.isnan(agreements).any(axis=1)
-        for method_name, select in SELECTION_METHODS.items():
-            policy = select(predicted_tensors[set_row["set_id"]])
-            result_rows.append(
-                {
-                    "evidence": "human ground truth",
-                    "selector": selector_name,
-                    "method": method_name,
-                    "set_id": set_row["set_id"],
-                    "question_id": set_row["question_id"],
-                    "candidate_count": len(policy),
-                    "participant_count": len(human_tensor),
-                }
-                | prefixed_welfare(
-                    "win_rate",
-                    win_rates(policy, human_tensor, uniform_policy(len(policy))),
-                )
-                | (
-                    prefixed_welfare(
-                        "agreement", agreements[rated_participants] @ policy
-                    )
-                    if rated_participants.any()
-                    else {}
-                )
-            )
-    return pd.DataFrame(result_rows)
+    selection_methods = SELECTION_METHODS | (
+        {"best_of_n": lambda tensor: best_of_n(preferences_to_rewards(tensor))}
+        if any(
+            configuration.name == selector_name
+            and configuration.model_type == "bradley_terry"
+            for configuration in HABERMAS_CONFIGURATIONS
+        )
+        else {}
+    )
+    pool_size = selector_tensor.shape[1] - 1
+    return {
+        method_name: np.append(select(selector_tensor[:, :pool_size, :pool_size]), 0.0)
+        for method_name, select in selection_methods.items()
+    }
 
 
 def model_track_results(
@@ -439,19 +399,16 @@ def model_track_results(
 ) -> pd.DataFrame:
     """Select on one model's tensors over the generated pool, grade with another's.
 
-    The anchor (the group's human top pick) sits at the last index, excluded
-    from selection. Win rates are against the anchor and against a uniformly
-    random pool member.
+    Win rates are against a uniformly random pool member, the anchor excluded.
     """
     result_rows = []
     for group_row in groups.to_dict("records"):
         selector_tensor = selector_tensors[group_row["question_id"]]
         grader_tensor = grader_tensors[group_row["question_id"]]
-        pool_size = selector_tensor.shape[1] - 1
-        anchor_opponent = np.eye(pool_size + 1)[pool_size]
-        pool_opponent = np.append(uniform_policy(pool_size), 0.0)
-        for method_name, select in SELECTION_METHODS.items():
-            policy = np.append(select(selector_tensor[:, :pool_size, :pool_size]), 0.0)
+        pool_opponent = np.append(uniform_policy(selector_tensor.shape[1] - 1), 0.0)
+        for method_name, policy in selection_policies(
+            selector_tensor, selector_name
+        ).items():
             result_rows.append(
                 {
                     "evidence": f"model-based proxy, graded by {grader_name}",
@@ -462,10 +419,64 @@ def model_track_results(
                     "question_id": group_row["question_id"],
                 }
                 | prefixed_welfare(
-                    "anchor", win_rates(policy, grader_tensor, anchor_opponent)
-                )
-                | prefixed_welfare(
                     "pool", win_rates(policy, grader_tensor, pool_opponent)
                 )
             )
     return pd.DataFrame(result_rows)
+
+
+def bootstrap_summary(
+    per_instance: pd.DataFrame, summary_columns: list[str]
+) -> pd.DataFrame:
+    """Mean ``value`` per group with a 95% bootstrap interval over instances."""
+    summary_rows = []
+    for group_values, group_results in per_instance.groupby(
+        summary_columns, sort=False
+    ):
+        values = group_results["value"].to_numpy()
+        low, high = paired_bootstrap_interval(values)
+        summary_rows.append(
+            dict(zip(summary_columns, group_values, strict=True))  # pyright: ignore[reportCallIssue, reportArgumentType]
+            | {
+                "value": values.mean(),
+                "interval_low": low,
+                "interval_high": high,
+                "instances": len(values),
+            }
+        )
+    return pd.DataFrame(summary_rows)
+
+
+def pool_difference_summary(
+    results: pd.DataFrame, welfare_names: list[str]
+) -> pd.DataFrame:
+    """Column method's pool win rate minus the row method's, pooled.
+
+    Differences are taken within each selector-grader direction, then averaged
+    within each backbone and question, which are the bootstrap instances.
+    Best-of-N is only compared in the directions a Bradley-Terry model selects.
+    """
+    long_results = results.melt(
+        id_vars=["backbone", "selector", "grader", "question_id", "method"],
+        value_vars=[f"pool_{welfare_name}" for welfare_name in welfare_names],
+        var_name="welfare",
+    ).assign(welfare=lambda frame: frame["welfare"].str.removeprefix("pool_"))
+    paired = long_results.merge(
+        long_results,
+        on=["backbone", "selector", "grader", "question_id", "welfare"],
+        suffixes=("_row", "_column"),
+    )
+    per_instance = (
+        paired.assign(
+            value=paired["value_column"] - paired["value_row"],
+            row_method=paired["method_row"],
+            column_method=paired["method_column"],
+        )
+        .groupby(
+            ["row_method", "column_method", "welfare", "backbone", "question_id"],
+            sort=False,
+        )["value"]
+        .mean()
+        .reset_index()  # pyright: ignore[reportAttributeAccessIssue]
+    )
+    return bootstrap_summary(per_instance, ["row_method", "column_method", "welfare"])

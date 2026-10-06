@@ -3,7 +3,12 @@ import torch
 from test_models import CharacterTokenizer
 
 from blackwell_ita import scoring
-from blackwell_ita.scoring import pairwise_preference_tensor, score_with_resume
+from blackwell_ita.scoring import (
+    pairwise_preference_tensor,
+    preferences_to_rewards,
+    rewards_to_preferences,
+    score_with_resume,
+)
 
 
 class FirstResponseLengthModel:
@@ -60,6 +65,16 @@ def test_bradley_terry_preference_tensor_is_sigmoid_of_reward_differences():
     expected = 1.0 / (1.0 + np.exp(rewards[None, :] - rewards[:, None]))
     assert tensor.shape == (1, 3, 3)
     assert np.allclose(tensor[0], expected)
+
+
+def test_preferences_to_rewards_recovers_rewards_up_to_a_per_head_constant():
+    rewards = np.array([[1.0, 4.0, 2.0, -3.0], [0.5, 0.0, 6.0, 1.0]])
+    recovered = preferences_to_rewards(rewards_to_preferences(rewards))
+    assert recovered.shape == rewards.shape
+    assert np.allclose(
+        recovered - recovered.mean(axis=1, keepdims=True),
+        rewards - rewards.mean(axis=1, keepdims=True),
+    )
 
 
 def test_score_with_resume_scores_only_missing_keys_and_checkpoints(monkeypatch):

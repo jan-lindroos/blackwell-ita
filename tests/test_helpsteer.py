@@ -15,7 +15,7 @@ from blackwell_ita.helpsteer import (
 )
 from blackwell_ita.helpsteer_cli import evaluate_policies, input_fingerprint
 from blackwell_ita.scoring import rewards_to_preferences
-from blackwell_ita.selection import best_of_n, borda
+from blackwell_ita.selection import best_of_n, max_mean_win_rate
 
 
 def test_target_refinement_reaches_values_between_coarse_grid_points(monkeypatch):
@@ -115,10 +115,10 @@ def test_generation_uses_fixed_size_temperature_and_records_settings(monkeypatch
     assert len(candidate_pools(prompts, frame)["p"]) == 64
 
 
-def test_scalar_best_of_n_is_not_borda_of_bt_probabilities():
+def test_scalar_best_of_n_is_not_max_mean_win_rate_of_bt_probabilities():
     rewards = np.array([[100.0, 1.0, 0.0], [0.0, 5.0, 10.0]])
     assert best_of_n(rewards).argmax() == 0
-    assert borda(rewards_to_preferences(rewards)).argmax() == 2
+    assert max_mean_win_rate(rewards_to_preferences(rewards)).argmax() == 2
     with pytest.raises(ValueError, match="scalar rewards"):
         best_of_n(rewards_to_preferences(rewards))
 
@@ -169,7 +169,7 @@ def test_missing_selected_judgment_fails_instead_of_renormalising():
     outcomes["p"][:, 1] = 0
     result = evaluate_policies(policy, outcomes).iloc[0]
     assert result.overall == 0.5
-    assert result.rawlsian_welfare == 0.5
+    assert result.egalitarian_welfare == 0.5
 
 
 def test_fingerprint_changes_on_scores_candidates_or_split():

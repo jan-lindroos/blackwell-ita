@@ -10,12 +10,22 @@ from blackwell_ita.habermas import (
     generate_habermas_candidates,
     habermas_pairs,
     habermas_prompt,
-    human_preference_tensor,
-    human_track_results,
     model_track_results,
+    pool_difference_summary,
     rank_preference,
+    selection_policies,
     usable_rankings,
 )
+from blackwell_ita.scoring import rewards_to_preferences
+
+
+def rank_tensor(participant_ranks: list[list[int]]) -> np.ndarray:
+    """Preferences implied by ranks, shape (participant, statement, statement)."""
+    ranks = np.asarray(participant_ranks)
+    return (
+        (ranks[:, :, None] < ranks[:, None, :])
+        + 0.5 * (ranks[:, :, None] == ranks[:, None, :])
+    ).astype(float)
 
 
 def comparison_row(**overrides) -> dict:
@@ -28,7 +38,6 @@ def comparison_row(**overrides) -> dict:
         "own_opinion.text": "Yes.",
         "candidates.text": np.array(["a", "b", "c"], dtype=object),
         "rankings.numerical_ranks": np.array([1, 0, 1]),
-        "ratings.agreement": np.array(["AGREE", "MOCK", "STRONGLY_DISAGREE"]),
         "metadata.provenance": "HUMAN_CITIZEN",
         "rankings.metadata.status": "COMPLETED",
     } | overrides
@@ -49,9 +58,6 @@ def test_usable_rankings_keeps_only_complete_human_rankings():
     ranking = rankings.iloc[0]
     assert ranking["statements"] == ["a", "b", "c"]
     assert ranking["ranks"] == [1, 0, 1]
-    assert ranking["agreements"][0] == 6.0
-    assert np.isnan(ranking["agreements"][1])
-    assert ranking["agreements"][2] == 1.0
 
 
 def test_rank_preference_prefers_the_lower_rank_and_ties_at_half():
@@ -73,7 +79,6 @@ def ranking_frame() -> pd.DataFrame:
             "opinion": ["Yes.", "No."],
             "statements": [["a", "b", "c"], ["a", "b", "c"]],
             "ranks": [[0, 1, 1], [2, 1, 0]],
-            "agreements": [[7.0, 4.0, 4.0], [1.0, np.nan, 7.0]],
             "split": ["test", "test"],
         }
     )
@@ -93,14 +98,6 @@ def test_habermas_pairs_cover_every_unordered_pair_per_participant():
         ["b", "c", 0.5],
     ]
     assert set(pairs["split"]) == {"test"}
-
-
-def test_human_preference_tensor_is_skew_symmetric_with_half_diagonal():
-    tensor = human_preference_tensor([[0, 1, 1], [2, 1, 0]])
-    assert tensor.shape == (2, 3, 3)
-    assert np.allclose(tensor + tensor.transpose(0, 2, 1), 1.0)
-    assert tensor[0, 0, 1] == 1.0
-    assert tensor[1, 0, 2] == 0.0
 
 
 def test_candidate_sets_group_participants_who_saw_the_same_statements():
@@ -123,7 +120,6 @@ def test_deliberation_groups_pick_four_participants_and_their_top_statement():
                 "opinion": f"opinion {question} {participant}",
                 "statements": ["worst", "best", "middle"],
                 "ranks": [2, 0, 1],
-                "agreements": [1.0, 7.0, 4.0],
                 "split": "test",
             }
             for question in range(3)
@@ -225,30 +221,111 @@ def test_diverse_generation_rejects_wrong_group_sizes():
         )
 
 
-def test_human_track_results_score_selections_on_human_rankings():
-    sets = candidate_sets(ranking_frame(), "test")
-    # The predicted tensor copies participant one's ranking for both heads
-    predicted_tensor = human_preference_tensor([[0, 1, 1], [0, 1, 1]])
-    results = human_track_results(sets, {"r_0": predicted_tensor}, "model")
-    nash_row = results[results["method"] == "scalarised_nash"].iloc[0]
-    # Statement a: participant one wins 2.5 of 3, participant two 0.5 of 3
-    assert nash_row["win_rate_rawlsian_welfare"] == pytest.approx(0.5 / 3, abs=1e-5)
-    assert nash_row["win_rate_utilitarian_welfare"] == pytest.approx(0.5, abs=1e-5)
-    # Participant two has a missing agreement and is left out
-    assert nash_row["agreement_rawlsian_welfare"] == pytest.approx(7.0, abs=1e-4)
-    assert results["evidence"].eq("human ground truth").all()  # pyright: ignore[reportGeneralTypeIssues]
-
-
 def test_model_track_results_exclude_the_anchor_from_selection():
     # Two participants and a pool of two plus the anchor, which the selector loves
-    selector_tensor = human_preference_tensor([[1, 2, 0], [1, 2, 0]])
-    grader_tensor = human_preference_tensor([[0, 1, 2], [1, 0, 2]])
+    selector_tensor = rank_tensor([[1, 2, 0], [1, 2, 0]])
+    grader_tensor = rank_tensor([[0, 1, 2], [1, 0, 2]])
     groups = pd.DataFrame({"question_id": ["q"]})
     results = model_track_results(
         groups, {"q": selector_tensor}, {"q": grader_tensor}, "backbone", "a", "b"
     )
     blackwell_row = results[results["method"] == "blackwell"].iloc[0]
-    # The selector prefers candidate 0 among the pool, which beats the anchor
-    # for both participants under the grader
-    assert blackwell_row["anchor_rawlsian_welfare"] == pytest.approx(1.0, abs=1e-5)
+    # The selector prefers candidate 0 among the pool. Under the grader the
+    # second participant wins 0.25 against the pool with it, 0 with the anchor
+    assert blackwell_row["pool_egalitarian_welfare"] == pytest.approx(0.25, abs=1e-5)
+    nash_target_row = results[results["method"] == "blackwell_nash"].iloc[0]
+    assert nash_target_row["pool_egalitarian_welfare"] == pytest.approx(0.25, abs=1e-5)
+    assert not any(column.startswith("anchor_") for column in results.columns)
     assert blackwell_row["evidence"] == "model-based proxy, graded by b"
+
+
+def test_model_track_results_add_best_of_n_only_for_bradley_terry_selectors():
+    # One participant loves statement 0 and three mildly prefer statement 1, so
+    # summed rewards pick 0 while mean win rates pick 1. The anchor is last
+    rewards = np.array([[10.0, 0.0, 0.0, 0.0]] + [[0.0, 2.0, 0.0, 0.0]] * 3)
+    tensor = rewards_to_preferences(rewards)
+    groups = pd.DataFrame({"question_id": ["q"]})
+    results = model_track_results(
+        groups,
+        {"q": tensor},
+        {"q": tensor},
+        "backbone",
+        "qwen3_4b_bradley_terry",
+        "qwen3_4b_pairwise",
+    ).set_index("method")
+    # The mean win rate maximiser leads on its own objective once they disagree
+    assert (
+        results.loc["best_of_n", "pool_utilitarian_welfare"]
+        < results.loc["max_mean_win_rate", "pool_utilitarian_welfare"] - 0.1
+    )
+    pairwise_results = model_track_results(
+        groups,
+        {"q": tensor},
+        {"q": tensor},
+        "backbone",
+        "qwen3_4b_pairwise",
+        "qwen3_4b_bradley_terry",
+    )
+    assert "best_of_n" not in set(pairwise_results["method"])
+
+
+def test_selection_policies_are_mixtures_that_skip_the_anchor():
+    tensor = rewards_to_preferences(
+        np.array([[2.0, 1.0, 0.0, 3.0], [1.0, 2.0, 0.0, 3.0]])
+    )
+    policies = selection_policies(tensor, "qwen3_4b_bradley_terry")
+    assert "best_of_n" in policies
+    assert "best_of_n" not in selection_policies(tensor, "qwen3_4b_pairwise")
+    for policy in policies.values():
+        assert policy.shape == (4,)
+        assert policy.sum() == pytest.approx(1.0)
+        assert policy[-1] == 0.0
+
+
+def pool_inputs() -> tuple[pd.DataFrame, dict, dict]:
+    # Four participants over a pool of three plus the anchor
+    random_generator = np.random.default_rng(1)
+    tensors = {
+        model_name: {
+            question_id: rewards_to_preferences(random_generator.normal(size=(4, 4)))
+            for question_id in ["q1", "q2"]
+        }
+        for model_name in ["qwen3_4b_bradley_terry", "qwen3_4b_pairwise"]
+    }
+    return (
+        pd.DataFrame({"question_id": ["q1", "q2"]}),
+        tensors["qwen3_4b_bradley_terry"],
+        tensors["qwen3_4b_pairwise"],
+    )
+
+
+def test_pool_difference_summary_is_column_minus_row_within_each_direction():
+    groups, first_tensors, second_tensors = pool_inputs()
+    names = ["qwen3_4b_bradley_terry", "qwen3_4b_pairwise"]
+    results = pd.concat(
+        [
+            model_track_results(
+                groups, first_tensors, second_tensors, "b", names[0], names[1]
+            ),
+            model_track_results(
+                groups, second_tensors, first_tensors, "b", names[1], names[0]
+            ),
+        ],
+        ignore_index=True,
+    )
+    summary = pool_difference_summary(results, ["egalitarian_welfare"]).set_index(
+        ["row_method", "column_method"]
+    )
+    assert summary.loc[("blackwell", "blackwell"), "value"] == pytest.approx(0.0)
+    pool_by_method = results.groupby(["method", "question_id"])[
+        "pool_egalitarian_welfare"
+    ].mean()
+    expected = (pool_by_method["maximin"] - pool_by_method["uniform"]).mean()  # pyright: ignore[reportOperatorIssue, reportArgumentType, reportCallIssue, reportIndexIssue]
+    assert summary.loc[("uniform", "maximin"), "value"] == pytest.approx(expected)
+    # Best-of-N only exists when Qwen BT selects, so only that direction counts
+    forward = results[results["selector"] == names[0]].set_index(
+        ["method", "question_id"]
+    )["pool_egalitarian_welfare"]
+    assert summary.loc[("uniform", "best_of_n"), "value"] == pytest.approx(
+        (forward["best_of_n"] - forward["uniform"]).mean()
+    )

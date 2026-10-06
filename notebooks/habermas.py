@@ -26,33 +26,52 @@ with app.setup:
     from blackwell_ita.data import assign_prompt_splits, split_summary
     from blackwell_ita.habermas import (
         GENERATION_BACKBONES,
-        GENERATION_STRATEGIES,
         HABERMAS_CONFIGURATIONS,
         HABERMAS_CRITERIA,
         HABERMAS_POOL_SIZE,
         HABERMAS_PREFIX,
-        candidate_sets,
         deliberation_groups,
         generate_habermas_candidates,
         habermas_pairs,
-        human_preference_tensor,
-        human_track_results,
         load_habermas_rankings,
         model_track_results,
         participant_preference_tensor,
+        pool_difference_summary,
     )
-    from blackwell_ita.hub import ARTIFACTS_REPOSITORY, ensure_hub_dataframe
-    from blackwell_ita.scoring import score_with_resume
+    from blackwell_ita.habermas_views import (
+        explorer_controls,
+        method_matrix_heatmap,
+        question_view,
+    )
+    from blackwell_ita.hub import (
+        ARTIFACTS_REPOSITORY,
+        REWARD_MODELS_REPOSITORY,
+        ensure_hub_dataframe,
+        hub_file_exists,
+    )
+    from blackwell_ita.scoring import download_tensors, score_with_resume
     from blackwell_ita.selection import summarise_methods
     from blackwell_ita.training import ensure_trained, load_trained
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    WELFARE_NAMES = ["rawlsian_welfare", "nash_welfare", "utilitarian_welfare"]
+    WELFARE_NAMES = ["egalitarian_welfare", "nash_welfare", "utilitarian_welfare"]
+    METRIC_NAMES = [f"pool_{welfare_name}" for welfare_name in WELFARE_NAMES]
+    STRATEGY = "diverse_v2"
 
 
 @app.function
 def score_participant_tensors(configuration, filename: str, keyed_inputs: dict) -> dict:
-    """Predicted participant tensors per key, loading the model only if needed."""
+    """Predicted participant tensors per key, loading the model only if needed.
+
+    On CPU nothing is scored, only the keys already on the hub come back.
+    """
+    if DEVICE == "cpu":
+        cached_tensors = download_tensors(
+            ARTIFACTS_REPOSITORY, filename, HABERMAS_PREFIX
+        )
+        return {
+            key: cached_tensors[key] for key in keyed_inputs if key in cached_tensors
+        }
     load_model = functools.cache(
         lambda: load_trained(configuration, HABERMAS_PREFIX, DEVICE)
     )
@@ -73,42 +92,6 @@ def score_participant_tensors(configuration, filename: str, keyed_inputs: dict) 
 
 @app.cell
 def _():
-    train_checkboxes = mo.ui.dictionary(
-        {
-            configuration.name: mo.ui.checkbox(label=f"Train {configuration.name}")
-            for configuration in HABERMAS_CONFIGURATIONS
-        }
-    )
-    generate_checkboxes = mo.ui.dictionary(
-        {
-            backbone_name: mo.ui.checkbox(
-                label=f"Generate {backbone_name.split('/')[-1]}"
-            )
-            for backbone_name in GENERATION_BACKBONES
-        }
-    )
-    generation_strategies = mo.ui.multiselect(
-        options=GENERATION_STRATEGIES,
-        value=["diverse_v2"],
-        label="Generation strategies",
-    )
-    mo.hstack(
-        [
-            *train_checkboxes.values(),
-            *generate_checkboxes.values(),
-            generation_strategies,
-        ],
-        justify="start",
-    )
-    return (
-        generate_checkboxes,
-        generation_strategies,
-        train_checkboxes,
-    )
-
-
-@app.cell
-def _():
     rankings = ensure_hub_dataframe(
         ARTIFACTS_REPOSITORY,
         "rankings.parquet",
@@ -121,12 +104,14 @@ def _():
 
 
 @app.cell
-def _(pairs, train_checkboxes):
-    mo.stop(not any(train_checkboxes.value.values()))
+def _(pairs):
     trained_configurations = [
         configuration
         for configuration in HABERMAS_CONFIGURATIONS
-        if train_checkboxes.value[configuration.name]
+        if DEVICE != "cpu"
+        or hub_file_exists(
+            REWARD_MODELS_REPOSITORY, configuration.checkpoint_filename, HABERMAS_PREFIX
+        )
     ]
     preference_model_metrics = pd.concat(
         [
@@ -143,65 +128,6 @@ def _(pairs, train_checkboxes):
     return (trained_configurations,)
 
 
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    ## Selection from human preferences
-    """)
-    return
-
-
-@app.cell
-def _(rankings):
-    human_track_sets = candidate_sets(rankings, "test")
-    human_track_results_frame = human_track_results(
-        human_track_sets,
-        {
-            set_row["set_id"]: human_preference_tensor(set_row["participant_ranks"])
-            for set_row in human_track_sets.to_dict("records")
-        },
-        "human preferences",
-    )
-    summarise_methods(
-        human_track_results_frame,
-        ["evidence", "selector"],
-        "set_id",
-        [
-            f"{measure}_{welfare_name}"
-            for measure in ("win_rate", "agreement")
-            for welfare_name in WELFARE_NAMES
-        ],
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    ## Reward model selection (larger sample)
-
-    Generated statements have no human ratings, so every number here is a
-    model-based proxy graded by the preference model that did not select.
-
-    Generate with the selected backbone on the notebook device. The fixed
-    `diverse_v2` pool contains 4 consensus drafts, 4 participant-focused proposals,
-    all 6 pair-focused compromises, and 2 whole-group alternatives. Prompts impose
-    no word or paragraph limit; generation retains its 512-token safety cap.
-    Four opinion orderings balance positions across the pool, but not within
-    every candidate type. An optional consensus baseline uses the same backbone
-    and decoding settings. Completed pools are cached on Hugging Face.
-    Diversity is experimental: greater predicted disagreement alone does not
-    establish better representation or proposal quality.
-
-    The diverse strategy adapts participant-subset generation from
-    [PROSE, Appendix D.2](https://arxiv.org/html/2505.22939v1) and opinion-order
-    shuffling from the public
-    [prompted Habermas implementation](https://github.com/google-deepmind/habermas_machine/blob/main/habermas_machine/machine.py).
-    Its allocation and proposal prompts are our own, not the original study protocol.
-    """)
-    return
-
-
 @app.cell
 def _(rankings):
     deliberation_groups_frame = ensure_hub_dataframe(
@@ -215,26 +141,23 @@ def _(rankings):
 
 
 @app.cell
-def _(deliberation_groups_frame, generate_checkboxes, generation_strategies):
-    mo.stop(not any(generate_checkboxes.value.values()))
-    mo.stop(not generation_strategies.value)
+def _(deliberation_groups_frame):
+    candidate_filenames = {
+        backbone_name: f"candidates_local_v2_{backbone_name.split('/')[-1].lower()}_{STRATEGY}.parquet"
+        for backbone_name in GENERATION_BACKBONES
+    }
     candidates_by_backbone = {
-        (backbone_name, strategy): ensure_hub_dataframe(
+        backbone_name: ensure_hub_dataframe(
             ARTIFACTS_REPOSITORY,
-            f"candidates_local_v2_{backbone_name.split('/')[-1].lower()}_{strategy}.parquet",
+            candidate_filename,
             HABERMAS_PREFIX,
-            lambda backbone_name=backbone_name, strategy=strategy: (
-                generate_habermas_candidates(
-                    backbone_name,
-                    deliberation_groups_frame,
-                    DEVICE,
-                    strategy=strategy,
-                )
+            lambda backbone_name=backbone_name: generate_habermas_candidates(
+                backbone_name, deliberation_groups_frame, DEVICE, strategy=STRATEGY
             ),
         )
-        for backbone_name, selected in generate_checkboxes.value.items()
-        if selected
-        for strategy in generation_strategies.value
+        for backbone_name, candidate_filename in candidate_filenames.items()
+        if DEVICE != "cpu"
+        or hub_file_exists(ARTIFACTS_REPOSITORY, candidate_filename, HABERMAS_PREFIX)
     }
     return (candidates_by_backbone,)
 
@@ -246,12 +169,9 @@ def _(
     trained_configurations,
 ):
     # Each preference model grades the other's selections
-    mo.stop(len(trained_configurations) < 2)
     model_track_frames = []
-    for (
-        backbone_name,
-        strategy,
-    ), backbone_candidates in candidates_by_backbone.items():
+    tensors_by_backbone = {}
+    for backbone_name, backbone_candidates in candidates_by_backbone.items():
         backbone_slug = backbone_name.split("/")[-1].lower()
         # The anchor rides at the last index of every pool
         pool_inputs = {
@@ -270,32 +190,78 @@ def _(
         tensors_by_model = {
             configuration.name: score_participant_tensors(
                 configuration,
-                f"model_track_local_v2_{backbone_slug}_{strategy}_{configuration.name}_pool{HABERMAS_POOL_SIZE}.npz",
+                f"model_track_local_v2_{backbone_slug}_{STRATEGY}_{configuration.name}_pool{HABERMAS_POOL_SIZE}.npz",
                 pool_inputs,
             )
             for configuration in trained_configurations
         }
+        tensors_by_backbone[backbone_name] = tensors_by_model
         for selector_name, grader_name in permutations(tensors_by_model, 2):
+            scored_question_ids = (
+                tensors_by_model[selector_name].keys()
+                & tensors_by_model[grader_name].keys()
+            )
             model_track_frames.append(
                 model_track_results(
-                    deliberation_groups_frame,
+                    deliberation_groups_frame[
+                        deliberation_groups_frame["question_id"].isin(
+                            scored_question_ids
+                        )
+                    ],
                     tensors_by_model[selector_name],
                     tensors_by_model[grader_name],
                     backbone_name,
                     selector_name,
                     grader_name,
-                ).assign(strategy=strategy)
+                )
             )
     model_track_results_frame = pd.concat(model_track_frames, ignore_index=True)
     summarise_methods(
         model_track_results_frame,
-        ["evidence", "backbone", "strategy", "selector"],
+        ["evidence", "backbone", "selector"],
         "question_id",
-        [
-            f"{opponent}_{welfare_name}"
-            for opponent in ("anchor", "pool")
-            for welfare_name in WELFARE_NAMES
-        ],
+        METRIC_NAMES,
+    )
+    return model_track_results_frame, tensors_by_backbone
+
+
+@app.cell
+def _(model_track_results_frame):
+    method_matrix_heatmap(
+        pool_difference_summary(model_track_results_frame, WELFARE_NAMES),
+        centre=0.0,
+        scale=100.0,
+        title="Column minus row, win rate against the pool, all backbones and selector-grader pairs",
+        legend_title="Points",
+    )
+    return
+
+
+@app.cell
+def _(deliberation_groups_frame, tensors_by_backbone):
+    explorer_backbone, explorer_question, explorer_selector = explorer_controls(
+        deliberation_groups_frame, tensors_by_backbone
+    )
+    mo.vstack([explorer_backbone, explorer_question, explorer_selector])
+    return explorer_backbone, explorer_question, explorer_selector
+
+
+@app.cell
+def _(
+    candidates_by_backbone,
+    deliberation_groups_frame,
+    explorer_backbone,
+    explorer_question,
+    explorer_selector,
+    tensors_by_backbone,
+):
+    question_view(
+        deliberation_groups_frame,
+        candidates_by_backbone,
+        tensors_by_backbone,
+        explorer_backbone.value,
+        explorer_question.value,
+        explorer_selector.value,
     )
     return
 

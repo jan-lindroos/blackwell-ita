@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Multi-preference inference-time alignment via the Blackwell winner"
 requires-python = ">=3.13"
 dependencies = [
+    "altair>=6.3.0",
     "cvxpy>=1.9.3",
     "datasets",
     "huggingface-hub",

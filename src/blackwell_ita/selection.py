@@ -1,3 +1,5 @@
+import warnings
+
 import cvxpy as cp
 import numpy as np
 import pandas as pd
@@ -71,6 +73,68 @@ def target_set_winner(
     return result
 
 
+def nash_target_winner(
+    preference_tensor: np.ndarray, threshold: float = 0.5
+) -> np.ndarray:
+    """Minimax L-infinity distance to {z : geometric mean of z >= threshold}.
+
+    The target is convex and upward closed, so the distance from z is the
+    smallest t >= 0 with geo_mean(z + t) >= threshold. Each pure opponent adds
+    one geometric-mean cone constraint.
+    """
+    if (
+        preference_tensor.ndim != 3
+        or preference_tensor.shape[1] != preference_tensor.shape[2]
+        or preference_tensor.shape[1] == 0
+        or not np.isfinite(preference_tensor).all()
+        or np.any((preference_tensor < 0) | (preference_tensor > 1))
+        or not 0 <= threshold <= 1
+    ):
+        raise ValueError("Invalid preference tensor or Nash target threshold")
+    candidate_count = preference_tensor.shape[1]
+    policy = cp.Variable(candidate_count, nonneg=True)
+    shortfall = cp.Variable(nonneg=True)
+    constraints = [cp.sum(policy) == 1] + [
+        cp.geo_mean(preference_tensor[:, :, opponent] @ policy + shortfall) >= threshold
+        for opponent in range(candidate_count)
+    ]
+    problem = cp.Problem(cp.Minimize(shortfall), constraints)  # pyright: ignore[reportArgumentType]
+    # Equal weights make the second-order cone form exact, and Clarabel's
+    # power cones fail on hard 0/1 preferences
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="geo_mean is being approximated")
+        problem.solve(solver=cp.CLARABEL)
+    if (
+        problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+        or policy.value is None
+    ):
+        raise RuntimeError(f"nash_target_winner solve failed: {problem.status}")
+    result = clean_policy(np.asarray(policy.value))
+    attained = nash_shortfall(
+        np.einsum("i,kij->kj", result, preference_tensor), threshold
+    ).max()
+    if abs(attained - float(np.asarray(problem.value))) > 1e-5:
+        raise RuntimeError("Policy cleanup changed the target-set optimum")
+    return result
+
+
+def nash_shortfall(values: np.ndarray, threshold: float) -> np.ndarray:
+    """Per column, the smallest t >= 0 with geometric mean of values + t >= threshold.
+
+    Values are (head, column) in [0, 1]. Bisection on [0, threshold], since
+    adding the threshold itself always reaches the target.
+    """
+    low = np.zeros(values.shape[1])
+    high = np.full(values.shape[1], float(threshold))
+    with np.errstate(divide="ignore"):
+        for _ in range(60):
+            middle = (low + high) / 2
+            reached = np.exp(np.log(values + middle).mean(axis=0)) >= threshold
+            high = np.where(reached, middle, high)
+            low = np.where(reached, low, middle)
+        return np.where(np.exp(np.log(values).mean(axis=0)) >= threshold, 0.0, high)
+
+
 def von_neumann_winner(preference_matrix: np.ndarray) -> np.ndarray:
     """Nash equilibrium of the symmetric game: the one-head Blackwell winner."""
     return blackwell_winner(preference_matrix[None])
@@ -93,7 +157,7 @@ def uniform_policy(candidate_count: int) -> np.ndarray:
     return np.full(candidate_count, 1.0 / candidate_count)
 
 
-def borda(preference_tensor: np.ndarray) -> np.ndarray:
+def max_mean_win_rate(preference_tensor: np.ndarray) -> np.ndarray:
     """The candidate with the highest head-averaged win rate against a uniform opponent."""
     scores = preference_tensor.mean(axis=(0, 2))
     return np.eye(len(scores))[scores.argmax()]
@@ -103,7 +167,7 @@ def best_of_n(rewards: np.ndarray, weights: np.ndarray | None = None) -> np.ndar
     """Pick the largest weighted scalar reward; rewards are (head, candidate).
 
     These are raw pointwise rewards, not averages of pairwise win probabilities.
-    Ties choose the first candidate, as in the Borda diagnostic.
+    Ties choose the first candidate, as in max_mean_win_rate.
     """
     if rewards.ndim != 2 or 0 in rewards.shape or not np.isfinite(rewards).all():
         raise ValueError("Expected finite scalar rewards, shape (head, candidate)")
@@ -127,10 +191,11 @@ def maximin(preference_tensor: np.ndarray) -> np.ndarray:
 
 SELECTION_METHODS = {
     "uniform": lambda preference_tensor: uniform_policy(preference_tensor.shape[1]),
-    "borda": borda,
+    "max_mean_win_rate": max_mean_win_rate,
     "maximin": maximin,
     "scalarised_nash": scalarised_nash,
     "blackwell": blackwell_winner,
+    "blackwell_nash": nash_target_winner,
 }
 
 
@@ -142,11 +207,11 @@ def win_rates(
 
 
 def welfare(per_head_values: np.ndarray) -> dict[str, float]:
-    """Rawlsian (minimum), Nash (geometric mean) and utilitarian (mean) welfare."""
+    """Egalitarian (minimum), Nash (geometric mean) and utilitarian (mean) welfare."""
     with np.errstate(divide="ignore"):
         log_values = np.log(per_head_values)
     return {
-        "rawlsian_welfare": float(per_head_values.min()),
+        "egalitarian_welfare": float(per_head_values.min()),
         "nash_welfare": float(np.exp(log_values.mean())),
         "utilitarian_welfare": float(per_head_values.mean()),
     }

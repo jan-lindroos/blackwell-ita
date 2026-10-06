@@ -90,6 +90,11 @@ def rewards_to_preferences(rewards: np.ndarray) -> np.ndarray:
     return torch.sigmoid(values[:, :, None] - values[:, None, :]).numpy()
 
 
+def preferences_to_rewards(preference_tensor: np.ndarray) -> np.ndarray:
+    """Invert ``rewards_to_preferences``, recovering (head, response) rewards up to a per-head constant."""
+    return np.log(preference_tensor / (1.0 - preference_tensor)).mean(axis=2)
+
+
 def bradley_terry_rewards(
     model: RewardModel,
     prompt: str,
