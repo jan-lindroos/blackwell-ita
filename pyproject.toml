@@ -5,8 +5,8 @@ description = "Multi-preference inference-time alignment via the Blackwell winne
 requires-python = ">=3.13"
 dependencies = [
     "altair>=6.3.0",
+    "anthropic>=1.15.0",
     "cvxpy>=1.9.3",
-    "datasets",
     "huggingface-hub",
     "marimo>=0.23.16",
     "pandas",

@@ -5,6 +5,10 @@ __pycache__/
 
 # LaTeX build artifacts
 paper/*.aux
+poster/*.aux
+poster/*.fdb_latexmk
+poster/*.fls
+poster/*.log
 paper/*.bbl
 paper/*.blg
 paper/*.fdb_latexmk
@@ -22,3 +26,4 @@ CLAUDE.md
 .idea/
 notebooks/__marimo__/session/
 .helpsteer/
+.env

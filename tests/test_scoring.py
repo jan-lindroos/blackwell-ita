@@ -8,6 +8,7 @@ from blackwell_ita.scoring import (
     preferences_to_rewards,
     rewards_to_preferences,
     score_with_resume,
+    win_rates_against,
 )
 
 
@@ -109,3 +110,13 @@ def test_score_with_resume_scores_only_missing_keys_and_checkpoints(monkeypatch)
     assert list(tensors) == ["done", "first", "second", "third"]
     assert tensors["done"].tolist() == [0.0]
     assert set(hub_storage["tensors.npz"]) == {"done", "first", "second", "third"}
+
+
+def test_win_rates_against_match_the_full_tensor_column():
+    for model in (FirstResponseLengthModel(), ResponseLengthRewardModel()):
+        responses = ["a", "aaaa", "aa"]
+        tensor = pairwise_preference_tensor(model, "p", [*responses, "aaa"], "cpu")  # pyright: ignore[reportArgumentType]
+        assert np.allclose(
+            win_rates_against(model, "p", responses, "aaa", "cpu", batch_size=2),  # pyright: ignore[reportArgumentType]
+            tensor[:, :3, 3],
+        )

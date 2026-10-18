@@ -1,18 +1,26 @@
-from itertools import permutations
-
 import numpy as np
 import pandas as pd
+import pytest
 
-from blackwell_ita.habermas import model_track_results, pool_difference_summary
+from blackwell_ita.habermas import (
+    PARTICIPANT_PAIRS,
+    WHOLE_GROUP,
+    evaluation_results,
+    gold_frontier,
+    instance_welfare,
+)
 from blackwell_ita.habermas_views import (
+    METHOD_LABELS,
+    beaten_histogram,
     explorer_controls,
-    method_matrix_heatmap,
+    frontier_chart,
     mixture_table,
+    nash_chart,
     question_view,
+    winner_chart,
 )
 from blackwell_ita.scoring import rewards_to_preferences
 
-BACKBONE = "mistralai/Mistral-7B-Instruct-v0.3"
 MODELS = ["qwen3_4b_bradley_terry", "qwen3_4b_pairwise"]
 
 
@@ -22,72 +30,115 @@ def groups() -> pd.DataFrame:
             "question_id": ["q1", "q2"],
             "question": ["Should we?", "Must we?"],
             "opinions": [[f"opinion {i}" for i in range(4)]] * 2,
-            "anchor": ["anchor", "anchor"],
+            "split": ["test", "test"],
         }
     )
 
 
-def tensors_by_backbone() -> dict:
-    # Four participants over a pool of three plus the anchor
+def tensors_by_selector() -> dict:
     random_generator = np.random.default_rng(0)
     return {
-        BACKBONE: {
-            model_name: {
-                question_id: rewards_to_preferences(
-                    random_generator.normal(size=(4, 4))
-                )
-                for question_id in ["q1", "q2"]
-            }
-            for model_name in MODELS
+        model_name: {
+            question_id: rewards_to_preferences(random_generator.normal(size=(4, 4)))
+            for question_id in ["q1", "q2"]
         }
+        for model_name in MODELS
     }
 
 
-def candidates() -> dict:
+def gold_tensors() -> dict:
+    random_generator = np.random.default_rng(1)
     return {
-        BACKBONE: pd.DataFrame(
-            {
-                "question_id": ["q1"] * 3 + ["q2"] * 3,
-                "sample_index": [2, 0, 1] * 2,
-                "candidate_kind": ["pair", "consensus", "participant"] * 2,
-                "target_participants": [[1, 3], [], [2]] * 2,
-                "response": ["third", "first", "second"] * 2,
-            }
-        )
+        question_id: rewards_to_preferences(random_generator.normal(size=(4, 4)))
+        for question_id in ["q1", "q2"]
     }
 
 
-def test_method_matrix_heatmap_draws_one_grid_per_welfare_function_without_uniform():
-    tensors = tensors_by_backbone()[BACKBONE]
-    results = pd.concat(
+def candidates() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "question_id": ["q1"] * 4 + ["q2"] * 4,
+            "sample_index": [2, 0, 1, 3] * 2,
+            "candidate_kind": ["pair", "consensus", "participant", "compromise"] * 2,
+            "target_participants": [[1, 3], [], [2], []] * 2,
+            "response": ["third", "first", "second", "fourth"] * 2,
+        }
+    )
+
+
+def results() -> pd.DataFrame:
+    return pd.concat(
         [
-            model_track_results(
-                groups(), tensors[selector], tensors[grader], BACKBONE, selector, grader
+            evaluation_results(
+                groups(),
+                selector_tensors,
+                gold_tensors(),
+                selector_name,
+                WHOLE_GROUP + PARTICIPANT_PAIRS,
             )
-            for selector, grader in permutations(MODELS, 2)
+            for selector_name, selector_tensors in tensors_by_selector().items()
         ],
         ignore_index=True,
     )
-    summary = pool_difference_summary(
-        results, ["egalitarian_welfare", "nash_welfare", "utilitarian_welfare"]
+
+
+def chart_rows(chart) -> list[dict]:
+    return [row for rows in chart.to_dict()["datasets"].values() for row in rows]
+
+
+def test_frontier_chart_draws_the_frontier_once_per_selector_and_every_method():
+    welfare = instance_welfare(results())
+    whole_group: pd.DataFrame = welfare[welfare["group_size"] == 4]  # pyright: ignore[reportAssignmentType]
+    rows = chart_rows(
+        frontier_chart(
+            gold_frontier(groups(), gold_tensors(), WHOLE_GROUP, "best"),
+            whole_group,
+            "best",
+            "Title",
+        )
     )
-    chart = method_matrix_heatmap(summary, 0.0, 100.0, "Title", "Points").to_dict()
-    assert [grid["title"] for grid in chart["hconcat"]] == [
-        "Egalitarian",
-        "Nash",
-        "Utilitarian",
-    ]
-    labels = {
-        row[key]
-        for rows in chart["datasets"].values()
-        for row in rows
-        for key in ("row_label", "column_label")
+    frontier_rows = [row for row in rows if row["kind"] == "frontier"]
+    method_rows = [row for row in rows if row["kind"] == "method"]
+    assert {row["selector_label"] for row in frontier_rows} == {"Qwen BT", "Qwen PW"}
+    assert len(frontier_rows) == 2 * 21
+    assert {row["method_label"] for row in method_rows} == set(
+        METHOD_LABELS.values()
+    ) - {"Uniform pool"}
+    blackwell_row = next(
+        row
+        for row in method_rows
+        if row["method_label"] == "BoB (orthant)" and row["selector_label"] == "Qwen PW"
+    )
+    expected = whole_group[
+        (whole_group["method"] == "blackwell")
+        & (whole_group["selector"] == "qwen3_4b_pairwise")
+    ]["worst"].mean()
+    assert blackwell_row["worst"] == expected
+
+
+def test_nash_chart_compares_the_reference_algorithm_with_its_baselines():
+    welfare = instance_welfare(results())
+    rows = chart_rows(nash_chart(welfare[welfare["group_size"] == 4]))  # pyright: ignore[reportArgumentType]
+    assert {row["method_label"] for row in rows} == {
+        "Reference BoB (Nash)",
+        "Best-of-N",
+        "Maximin",
+        "Scalarised Nash",
     }
-    assert "Uniform" not in labels
+    assert all(
+        row["interval_low"] <= row["value"] <= row["interval_high"] for row in rows
+    )
+
+
+def test_beaten_histogram_counts_every_whole_group_participant_per_selector():
+    whole_group: pd.DataFrame = results()[results()["group_size"] == 4]  # pyright: ignore[reportAssignmentType]
+    chart = beaten_histogram(whole_group, 4)
+    assert [column.title for column in chart.hconcat] == ["Qwen BT", "Qwen PW"]
+    assert len(chart_rows(chart)) == len(whole_group)
 
 
 def test_mixture_table_lists_answers_any_method_uses_with_weight_columns():
-    pool_statements = candidates()[BACKBONE].query("question_id == 'q1'")
+    pool_statements = candidates().query("question_id == 'q1'")
     pool_statements = pool_statements.sort_values("sample_index")
     policies = {
         "uniform": np.full(4, 0.25),
@@ -98,53 +149,59 @@ def test_mixture_table_lists_answers_any_method_uses_with_weight_columns():
     assert table.columns.tolist() == [
         "answer",
         "originating_kind",
-        "Blackwell (orthant)",
+        "Uniform pool",
         "Scalarised Nash",
+        "BoB (orthant)",
     ]
-    assert table["answer"].tolist() == ["first", "third"]
-    assert table["originating_kind"].tolist() == ["consensus", "pair (1, 3)"]
-    assert table["Blackwell (orthant)"].tolist() == [0.25, 0.75]
+    assert table["answer"].tolist() == ["first", "second", "third", "fourth"]
+    assert table["originating_kind"].tolist() == [
+        "consensus",
+        "participant (2)",
+        "pair (1, 3)",
+        "compromise",
+    ]
+    assert table["BoB (orthant)"].tolist()[0] == 0.25
     assert np.isnan(table["Scalarised Nash"].iloc[1])
 
 
 def test_question_view_shows_participants_and_the_mixture_table():
-    view = question_view(
-        groups(), candidates(), tensors_by_backbone(), BACKBONE, "q1", MODELS[0]
-    )
+    view = question_view(groups(), candidates(), tensors_by_selector(), "q1", MODELS[0])
     for text in ["Should we?", "Participant 4:"]:
         assert text in view.text
 
 
 def test_question_view_reports_unscored_questions():
-    tensors = tensors_by_backbone()
-    del tensors[BACKBONE][MODELS[0]]["q1"]
-    view = question_view(groups(), candidates(), tensors, BACKBONE, "q1", MODELS[0])
+    tensors = tensors_by_selector()
+    del tensors[MODELS[0]]["q1"]
+    view = question_view(groups(), candidates(), tensors, "q1", MODELS[0])
     assert "Not scored yet" in view.text
 
 
-def test_explorer_controls_offer_backbones_questions_and_selectors():
-    backbone, question, selector = explorer_controls(groups(), tensors_by_backbone())
-    assert backbone.value == BACKBONE
+def test_explorer_controls_offer_questions_and_selectors():
+    question, selector = explorer_controls(groups(), tensors_by_selector())
     assert question.value == "q1"
     assert sorted(selector.options.values()) == sorted(MODELS)
 
 
-def test_method_matrix_heatmap_signs_differences_and_skips_ties():
-    summary = pd.DataFrame(
-        {
-            "row_method": ["blackwell", "blackwell"],
-            "column_method": ["blackwell", "maximin"],
-            "welfare": ["nash_welfare", "nash_welfare"],
-            "value": [0.0, 0.004],
-            "interval_low": [1e-12, 0.001],
-            "interval_high": [1e-12, 0.007],
-            "instances": [100, 100],
-        }
+def test_winner_chart_summarises_average_and_worst_served_per_method():
+    winner_rates = {"q1": np.full((4, 4), 0.25), "q2": np.full((4, 4), 0.75)}
+    welfare = instance_welfare(
+        pd.concat(
+            [
+                evaluation_results(
+                    groups(),
+                    selector_tensors,
+                    gold_tensors(),
+                    selector_name,
+                    WHOLE_GROUP,
+                    winner_rates,
+                )
+                for selector_name, selector_tensors in tensors_by_selector().items()
+            ],
+            ignore_index=True,
+        )
     )
-    datasets = method_matrix_heatmap(summary, 0.0, 100.0, "Title", "Points").to_dict()[
-        "datasets"
-    ]
-    assert [row["cell_text"] for rows in datasets.values() for row in rows] == [
-        "+0.00",
-        "+0.40*",
-    ]
+    rows = chart_rows(winner_chart(welfare))
+    assert {row["served_label"] for row in rows} == {"Average", "Worst served"}
+    assert all(row["value"] == pytest.approx(0.5) for row in rows)
+    assert {row["method_label"] for row in rows} == set(METHOD_LABELS.values())

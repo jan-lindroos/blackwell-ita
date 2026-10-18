@@ -2,98 +2,12 @@ import math
 from collections.abc import Iterator
 from typing import TypedDict
 
-import datasets
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset, default_collate
 
-HELPSTEER2_ATTRIBUTES = [
-    "helpfulness",
-    "correctness",
-    "coherence",
-    "complexity",
-    "verbosity",
-]
-CRITERIA = [*HELPSTEER2_ATTRIBUTES, "overall"]
 SPLIT_FRACTIONS = {"train": 0.7, "validation": 0.15, "test": 0.15}
-PREFERENCES_URL = "hf://datasets/nvidia/HelpSteer2/preference/preference.jsonl.gz"
-
-
-def graded_target(margin: float) -> float:
-    """Map an ordinal rating margin to a graded win probability."""
-    if margin >= 2:
-        return 1.0
-    if margin >= 1:
-        return 0.75
-    if margin <= -2:
-        return 0.0
-    if margin <= -1:
-        return 0.25
-    return 0.5
-
-
-def helpsteer2_response_pairs(
-    responses: pd.DataFrame,
-) -> Iterator[tuple[pd.Series, pd.Series]]:
-    """Yield response row pairs, paired consecutively within each prompt group."""
-    for prompt, prompt_responses in responses.groupby("prompt", sort=False):
-        assert len(prompt_responses) % 2 == 0, f"odd response group for {prompt!r}"
-        for start in range(0, len(prompt_responses), 2):
-            yield prompt_responses.iloc[start], prompt_responses.iloc[start + 1]
-
-
-def helpsteer2_pairs(
-    responses: pd.DataFrame, preferences: pd.DataFrame
-) -> pd.DataFrame:
-    """Build preference pairs with per-attribute and overall targets."""
-    pair_rows = []
-    for first_response, second_response in helpsteer2_response_pairs(responses):
-        pair_row = {
-            "prompt": first_response["prompt"],
-            "response_a": first_response["response"],
-            "response_b": second_response["response"],
-        }
-        for attribute in HELPSTEER2_ATTRIBUTES:
-            pair_row[attribute] = graded_target(
-                first_response[attribute] - second_response[attribute]
-            )
-        pair_rows.append(pair_row)
-    pairs = pd.DataFrame(pair_rows)
-    # Positive preference_strength means response_2 is preferred. The
-    # (prompt, response_1, response_2) key is unique within each source split
-    # (verified against the source file, Aug 2026), so the merge cannot fan out
-    overall_preferences = preferences.assign(
-        overall=[
-            graded_target(-strength) for strength in preferences["preference_strength"]
-        ]
-    )
-    return pairs.merge(
-        overall_preferences[["prompt", "response_1", "response_2", "overall"]],
-        how="left",
-        left_on=["prompt", "response_a", "response_b"],
-        right_on=["prompt", "response_1", "response_2"],
-    ).drop(columns=["response_1", "response_2"])
-
-
-def load_helpsteer2_pairs() -> pd.DataFrame:
-    """Pairs from both HelpSteer2 halves, which the preference file calls train and val."""
-    preferences = pd.read_json(PREFERENCES_URL, lines=True)
-    return pd.concat(
-        [
-            helpsteer2_pairs(
-                datasets.load_dataset(  # pyright: ignore[reportArgumentType]
-                    "nvidia/HelpSteer2", split=response_split
-                ).to_pandas(),  # pyright: ignore[reportAttributeAccessIssue]
-                preferences[preferences["split"] == preference_split],  # pyright: ignore[reportArgumentType]
-            )
-            for response_split, preference_split in (
-                ("train", "train"),
-                ("validation", "val"),
-            )
-        ],
-        ignore_index=True,
-    )
 
 
 def assign_prompt_splits(

@@ -4,8 +4,8 @@ import torch
 
 from blackwell_ita import training
 from blackwell_ita.data import PreferencePairDataset
+from blackwell_ita.habermas import GOLD_CONFIGURATION
 from blackwell_ita.training import (
-    REWARD_MODEL_CONFIGURATIONS,
     evaluate,
     logged_metrics,
     train_until_no_improvement,
@@ -165,14 +165,6 @@ def test_logged_metrics_flattens_per_criterion_results():
     }
 
 
-def test_configurations_have_unique_names_and_known_model_types():
-    names = [configuration.name for configuration in REWARD_MODEL_CONFIGURATIONS]
-    assert len(names) == len(set(names))
-    assert {
-        configuration.model_type for configuration in REWARD_MODEL_CONFIGURATIONS
-    } <= set(training.REWARD_MODEL_CLASSES)
-
-
 def test_ensure_trained_skips_training_when_the_checkpoint_is_on_the_hub(monkeypatch):
     saved_metrics = pd.DataFrame({"criterion": ["x"]})
     monkeypatch.setattr(training, "hub_file_exists", lambda *arguments: True)
@@ -185,5 +177,5 @@ def test_ensure_trained_skips_training_when_the_checkpoint_is_on_the_hub(monkeyp
 
     monkeypatch.setattr(training, "train_reward_model", fail_training)
     assert training.ensure_trained(
-        REWARD_MODEL_CONFIGURATIONS[0], pd.DataFrame(), ["x"], "prefix", "cpu"
+        GOLD_CONFIGURATION, pd.DataFrame(), ["x"], "prefix", "cpu"
     ).equals(saved_metrics)

@@ -12,6 +12,7 @@ from blackwell_ita.selection import (
     nash_shortfall,
     nash_target_winner,
     paired_bootstrap_interval,
+    reference_nash_winner,
     scalarised_nash,
     summarise_methods,
     target_set_winner,
@@ -299,3 +300,56 @@ def test_nash_target_winner_solves_hard_preferences_without_warnings():
         nash_distance(policy, preference_tensor)
         <= min(nash_distance(rival, preference_tensor) for rival in grid) + 1e-9
     )
+
+
+def reference_geometric_mean(
+    policy: np.ndarray, preference_tensor: np.ndarray
+) -> float:
+    row_count = preference_tensor.shape[1] // 2
+    reference_win_rates = preference_tensor[:, :row_count, row_count:].mean(axis=2)
+    return float(np.exp(np.log(reference_win_rates @ policy[:row_count]).mean()))
+
+
+@pytest.mark.parametrize(("seed", "head_count", "size"), [(0, 2, 6), (1, 4, 16)])
+def test_reference_nash_winner_mixes_rows_to_the_best_geometric_mean(
+    seed, head_count, size
+):
+    preference_tensor = random_preference_tensor(seed, head_count, size)
+    policy = reference_nash_winner(preference_tensor)
+    assert policy.sum() == pytest.approx(1.0)
+    assert (policy[size // 2 :] == 0).all()
+    optimum = reference_geometric_mean(policy, preference_tensor)
+    rivals = [
+        *np.eye(size // 2),
+        *np.random.default_rng(seed).dirichlet(np.ones(size // 2), size=2000),
+    ]
+    assert (
+        optimum
+        >= max(
+            reference_geometric_mean(
+                np.append(rival, np.zeros(size - size // 2)), preference_tensor
+            )
+            for rival in rivals
+        )
+        - 1e-6
+    )
+
+
+def test_reference_nash_winner_splits_evenly_between_opposed_rows():
+    # Each row wins every column for one participant and loses for the other
+    preference_tensor = np.full((2, 4, 4), 0.5)
+    preference_tensor[0, 0, 2:] = preference_tensor[1, 1, 2:] = 1.0
+    preference_tensor[1, 0, 2:] = preference_tensor[0, 1, 2:] = 0.0
+    preference_tensor[:, 2:, :2] = 1.0 - preference_tensor[:, :2, 2:].transpose(0, 2, 1)
+    assert reference_nash_winner(preference_tensor) == pytest.approx(
+        [0.5, 0.5, 0.0, 0.0], abs=1e-4
+    )
+
+
+@pytest.mark.parametrize(
+    "preference_tensor",
+    [np.full((3, 3), 0.5), np.full((2, 1, 1), 0.5), np.full((2, 4, 4), 1.5)],
+)
+def test_reference_nash_winner_rejects_invalid_inputs(preference_tensor):
+    with pytest.raises(ValueError):
+        reference_nash_winner(preference_tensor)

@@ -70,34 +70,6 @@ class RewardModelConfiguration:
         return f"{self.name}_metrics.parquet"
 
 
-REWARD_MODEL_CONFIGURATIONS = [
-    RewardModelConfiguration(
-        name="qwen3_4b_pairwise",
-        model_type="pairwise",
-        encoder_name="Qwen/Qwen3-4B-Instruct-2507",
-        lora_rank=None,
-        learning_rate=5e-6,
-        evaluation_interval_steps=400,
-    ),
-    RewardModelConfiguration(
-        name="qwen3_4b_bradley_terry",
-        model_type="bradley_terry",
-        encoder_name="Qwen/Qwen3-4B-Instruct-2507",
-        lora_rank=None,
-        learning_rate=5e-6,
-        evaluation_interval_steps=400,
-    ),
-    RewardModelConfiguration(
-        name="gemma4_12b_pairwise_lora",
-        model_type="pairwise",
-        encoder_name="google/gemma-4-12B-it",
-        lora_rank=16,
-        learning_rate=1e-4,
-        evaluation_interval_steps=400,
-    ),
-]
-
-
 def evaluate(
     model: RewardModel,
     data_loader: Iterable[Batch],

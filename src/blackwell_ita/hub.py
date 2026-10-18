@@ -5,22 +5,17 @@ from pathlib import Path
 import pandas as pd
 from huggingface_hub import HfApi, file_exists, hf_hub_download
 
-SPLITS_REPOSITORY = "blackwell-ita/helpsteer2-splits"
 ARTIFACTS_REPOSITORY = "blackwell-ita/artifacts"
 REWARD_MODELS_REPOSITORY = "blackwell-ita/reward-models"
-DATASET_REPOSITORIES = {SPLITS_REPOSITORY, ARTIFACTS_REPOSITORY}
-HUB_PREFIX = "helpsteer2-v2"
-PAIRS_FILENAME = "pairs.parquet"
+DATASET_REPOSITORIES = {ARTIFACTS_REPOSITORY}
 
 
 def repository_type(repository_id: str) -> str:
-    """Splits and artifacts live in dataset repositories, checkpoints in a model one."""
+    """Artifacts live in a dataset repository, checkpoints in a model one."""
     return "dataset" if repository_id in DATASET_REPOSITORIES else "model"
 
 
-def hub_file_exists(
-    repository_id: str, filename: str, prefix: str = HUB_PREFIX
-) -> bool:
+def hub_file_exists(repository_id: str, filename: str, prefix: str) -> bool:
     """Whether ``filename`` exists under ``prefix``."""
     return file_exists(
         repository_id,
@@ -29,9 +24,7 @@ def hub_file_exists(
     )
 
 
-def download_hub_file(
-    repository_id: str, filename: str, prefix: str = HUB_PREFIX
-) -> Path:
+def download_hub_file(repository_id: str, filename: str, prefix: str) -> Path:
     """Download ``filename`` from under ``prefix``, returning its cache path."""
     return Path(
         hf_hub_download(
@@ -42,9 +35,7 @@ def download_hub_file(
     )
 
 
-def upload_hub_file(
-    repository_id: str, local_path: Path, prefix: str = HUB_PREFIX
-) -> None:
+def upload_hub_file(repository_id: str, local_path: Path, prefix: str) -> None:
     """Upload ``local_path`` under ``prefix``, keeping its filename."""
     hub_api = HfApi()
     hub_api.create_repo(

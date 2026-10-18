@@ -118,6 +118,44 @@ def nash_target_winner(
     return result
 
 
+def reference_nash_winner(preference_tensor: np.ndarray) -> np.ndarray:
+    """Split-pool reference Best-of-Blackwell with the Nash-welfare target.
+
+    The first half of the pool are the rows to mix over and the second half the
+    columns that estimate each row's win rate against the reference policy. At
+    the empirical optimum level the target set is reached exactly by the row
+    mixture maximising the geometric mean of those win rates, so no level has
+    to be chosen in advance. Columns get zero weight.
+    """
+    candidate_count = preference_tensor.shape[1]
+    if (
+        preference_tensor.ndim != 3
+        or preference_tensor.shape[2] != candidate_count
+        or candidate_count < 2
+        or not np.isfinite(preference_tensor).all()
+        or np.any((preference_tensor < 0) | (preference_tensor > 1))
+    ):
+        raise ValueError("Invalid preference tensor for the split-pool reference")
+    row_count = candidate_count // 2
+    reference_win_rates = preference_tensor[:, :row_count, row_count:].mean(axis=2)
+    policy = cp.Variable(row_count, nonneg=True)
+    problem = cp.Problem(
+        cp.Maximize(cp.geo_mean(reference_win_rates @ policy)),  # pyright: ignore[reportArgumentType]
+        [cp.sum(policy) == 1],  # pyright: ignore[reportArgumentType]
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="geo_mean is being approximated")
+        problem.solve(solver=cp.CLARABEL)
+    if (
+        problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+        or policy.value is None
+    ):
+        raise RuntimeError(f"reference_nash_winner solve failed: {problem.status}")
+    return np.append(
+        clean_policy(np.asarray(policy.value)), np.zeros(candidate_count - row_count)
+    )
+
+
 def nash_shortfall(values: np.ndarray, threshold: float) -> np.ndarray:
     """Per column, the smallest t >= 0 with geometric mean of values + t >= threshold.
 
@@ -196,6 +234,7 @@ SELECTION_METHODS = {
     "scalarised_nash": scalarised_nash,
     "blackwell": blackwell_winner,
     "blackwell_nash": nash_target_winner,
+    "reference_nash": reference_nash_winner,
 }
 
 

@@ -3,155 +3,297 @@ import marimo as mo
 import numpy as np
 import pandas as pd
 
-from blackwell_ita.habermas import GENERATION_BACKBONES, selection_policies
+from blackwell_ita.habermas import bootstrap_summary, selection_policies
 
 MODEL_LABELS = {
     "qwen3_4b_pairwise": "Qwen PW",
     "qwen3_4b_bradley_terry": "Qwen BT",
-    "gemma4_12b_pairwise_lora": "Gemma",
-}
-BACKBONE_LABELS = {
-    backbone_name: backbone_name.split("/")[-1].split("-")[0]
-    for backbone_name in GENERATION_BACKBONES
 }
 METHOD_LABELS = {
-    "blackwell": "Blackwell (orthant)",
+    "uniform": "Uniform pool",
     "max_mean_win_rate": "Max mean win rate",
-    "maximin": "Maximin",
     "best_of_n": "Best-of-N",
+    "maximin": "Maximin",
     "scalarised_nash": "Scalarised Nash",
-    "blackwell_nash": "Blackwell (Nash target)",
+    "blackwell": "BoB (orthant)",
+    "blackwell_nash": "BoB (Nash target)",
+    "reference_nash": "Reference BoB (Nash)",
 }
-WELFARE_LABELS = {
-    "egalitarian_welfare": "Egalitarian",
-    "nash_welfare": "Nash",
-    "utilitarian_welfare": "Utilitarian",
+# Fixed categorical order, so each method keeps its colour in every chart
+METHOD_COLOURS = [
+    "#2a78d6",
+    "#eb6834",
+    "#1baf7a",
+    "#eda100",
+    "#e87ba4",
+    "#008300",
+    "#6250d6",
+    "#e34948",
+]
+NASH_METHODS = ["reference_nash", "best_of_n", "maximin", "scalarised_nash"]
+AXIS_TITLES = {
+    "average": "Average win rate",
+    "best": "Best-served win rate",
+    "worst": "Worst-served win rate",
 }
+NEUTRAL_COLOUR = "#8a8984"
 
 
-def method_matrix_heatmap(
-    summary: pd.DataFrame, centre: float, scale: float, title: str, legend_title: str
-) -> alt.HConcatChart:
-    """Methods by methods, one grid per welfare function, coloured around ``centre``.
+def method_colour_scale(method_names: list[str]) -> alt.Scale:
+    """The labels of ``method_names`` mapped to their fixed colours."""
+    return alt.Scale(
+        domain=[METHOD_LABELS[method_name] for method_name in method_names],
+        range=[
+            colour
+            for method_name, colour in zip(METHOD_LABELS, METHOD_COLOURS, strict=True)
+            if method_name in method_names
+        ],
+    )
 
-    Cells show ``scale`` times the value. Stars mark a 95% interval that
-    excludes ``centre``.
+
+def frontier_chart(
+    frontier: pd.DataFrame, welfare: pd.DataFrame, axis: str, title: str
+) -> alt.FacetChart:
+    """The gold frontier in grey with each method's mean point, one panel per selector.
+
+    The uniform pool sits at an average of 1/2, far from the frontier, so it is left out.
+
+    ``axis`` is "average" or "best" and is plotted against the worst-served
+    participant's win rate.
     """
-    method_order = list(METHOD_LABELS.values())
-    plotted = summary[
-        summary["row_method"].isin(METHOD_LABELS)
-        & summary["column_method"].isin(METHOD_LABELS)
+    plotted_methods = [
+        method_name
+        for method_name in METHOD_LABELS
+        if method_name != "uniform" and method_name in set(welfare["method"])
     ]
-    frame = plotted.assign(
-        row_label=plotted["row_method"].map(METHOD_LABELS),  # pyright: ignore[reportArgumentType, reportAttributeAccessIssue]
-        column_label=plotted["column_method"].map(METHOD_LABELS),  # pyright: ignore[reportArgumentType, reportAttributeAccessIssue]
-        welfare_label=plotted["welfare"].map(WELFARE_LABELS),  # pyright: ignore[reportArgumentType, reportAttributeAccessIssue]
-        shown=scale * plotted["value"],
-        significant=(plotted["interval_low"] > centre + 1e-9)
-        | (plotted["interval_high"] < centre - 1e-9),
+    method_points = (
+        welfare[welfare["method"].isin(plotted_methods)]
+        .groupby(["selector", "method"], sort=False)[[axis, "worst"]]
+        .mean()
+        .reset_index()  # pyright: ignore[reportAttributeAccessIssue]
+        .assign(kind="method")
     )
-    signed = centre == 0
-    frame["cell_text"] = [
-        f"{shown:{'+' if signed else ''}.2f}{'*' if significant else ''}"
-        for shown, significant in zip(frame["shown"], frame["significant"], strict=True)
-    ]
-    shown_centre = scale * centre
-    colour_limit = float((frame["shown"] - shown_centre).abs().max())  # pyright: ignore[reportArgumentType]
-    x = alt.X(
-        "column_label:N",
-        sort=method_order,
-        title=None,
-        axis=alt.Axis(orient="top", labelAngle=-40),
+    frontier_lines = pd.concat(
+        [
+            frontier.assign(selector=selector_name, kind="frontier")
+            for selector_name in method_points["selector"].unique()
+        ],
+        ignore_index=True,
+    )
+    frame = pd.concat([frontier_lines, method_points], ignore_index=True)
+    frame = frame.assign(
+        selector_label=frame["selector"].map(MODEL_LABELS),  # pyright: ignore[reportArgumentType]
+        method_label=frame["method"].map(METHOD_LABELS),  # pyright: ignore[reportArgumentType]
+    )
+    x = alt.X(f"{axis}:Q", scale=alt.Scale(zero=False), title=AXIS_TITLES[axis])
+    y = alt.Y("worst:Q", scale=alt.Scale(zero=False), title=AXIS_TITLES["worst"])
+    line = (
+        alt.Chart()
+        .transform_filter(alt.datum.kind == "frontier")
+        .mark_line(color=NEUTRAL_COLOUR, strokeWidth=2)
+        .encode(x=x, y=y, order="worst_weight:Q")
+    )
+    points = (
+        alt.Chart()
+        .transform_filter(alt.datum.kind == "method")
+        .mark_point(filled=True, size=90, opacity=1)
+        .encode(
+            x=x,
+            y=y,
+            color=alt.Color(
+                "method_label:N",
+                scale=method_colour_scale(plotted_methods),
+                title="Method",
+            ),
+            shape=alt.Shape(
+                "method_label:N",
+                scale=alt.Scale(
+                    domain=[
+                        METHOD_LABELS[method_name] for method_name in plotted_methods
+                    ]
+                ),
+                title="Method",
+            ),
+            tooltip=[
+                alt.Tooltip("method_label:N", title="Method"),
+                alt.Tooltip(f"{axis}:Q", title=AXIS_TITLES[axis], format=".3f"),
+                alt.Tooltip("worst:Q", title=AXIS_TITLES["worst"], format=".3f"),
+            ],
+        )
+    )
+    return (
+        alt.layer(line, points, data=frame)
+        .properties(width=320, height=280)
+        .facet(column=alt.Column("selector_label:N", title=None))
+        .properties(title=title)
     )
 
-    def grid(welfare_label: str, show_rows: bool) -> alt.LayerChart:
-        y = alt.Y(
-            "row_label:N",
-            sort=method_order,
-            title=None,
-            axis=alt.Axis() if show_rows else None,
+
+def nash_chart(welfare: pd.DataFrame) -> alt.FacetChart:
+    """Mean Nash welfare with a 95% bootstrap interval, one row per selector."""
+    summary = bootstrap_summary(
+        welfare[welfare["method"].isin(NASH_METHODS)].rename(columns={"nash": "value"}),  # pyright: ignore[reportCallIssue]
+        ["selector", "method"],
+    )
+    frame = summary.assign(
+        selector_label=summary["selector"].map(MODEL_LABELS),  # pyright: ignore[reportArgumentType]
+        method_label=summary["method"].map(METHOD_LABELS),  # pyright: ignore[reportArgumentType]
+    )
+    y = alt.Y(
+        "method_label:N",
+        sort=[METHOD_LABELS[method_name] for method_name in NASH_METHODS],
+        title=None,
+    )
+    intervals = (
+        alt.Chart()
+        .mark_rule(color=METHOD_COLOURS[0], strokeWidth=2)
+        .encode(
+            x=alt.X(
+                "interval_low:Q", scale=alt.Scale(zero=False), title="Nash welfare"
+            ),
+            x2="interval_high:Q",
+            y=y,
         )
-        cells = (
-            alt.Chart()
-            .mark_rect()
-            .encode(
-                x=x,
-                y=y,
-                color=alt.Color(
-                    "shown:Q",
-                    scale=alt.Scale(
-                        domain=[
-                            shown_centre - colour_limit,
-                            shown_centre,
-                            shown_centre + colour_limit,
-                        ],
-                        range=["#e34948", "#f0efec", "#2a78d6"],
-                        interpolate="lab",
-                    ),
-                    title=legend_title,
-                ),
-                tooltip=[
-                    alt.Tooltip("row_label:N", title="Row"),
-                    alt.Tooltip("column_label:N", title="Column"),
-                    alt.Tooltip("welfare_label:N", title="Welfare"),
-                    alt.Tooltip("shown:Q", title=legend_title, format=".3f"),
-                    alt.Tooltip("instances:Q", title="Instances"),
-                ],
-            )
-        )
-        text = (
-            alt.Chart()
-            .mark_text(fontSize=10)
-            .encode(
-                x=x,
-                y=y,
-                text="cell_text:N",
-                color=alt.condition(
-                    f"abs(datum.shown - {shown_centre}) > {0.6 * colour_limit}",
-                    alt.value("#ffffff"),
-                    alt.value("#1a1a19"),
-                ),
-            )
-        )
-        return alt.layer(  # pyright: ignore[reportReturnType]
-            cells,
-            text,
-            data=frame.loc[
-                frame["welfare_label"] == welfare_label,
-                [
-                    "row_label",
-                    "column_label",
-                    "welfare_label",
-                    "shown",
-                    "cell_text",
-                    "instances",
-                ],
+    )
+    means = (
+        alt.Chart()
+        .mark_point(filled=True, size=90, opacity=1, color=METHOD_COLOURS[0])
+        .encode(
+            x="value:Q",
+            y=y,
+            tooltip=[
+                alt.Tooltip("method_label:N", title="Method"),
+                alt.Tooltip("value:Q", title="Nash welfare", format=".4f"),
+                alt.Tooltip("interval_low:Q", title="Interval low", format=".4f"),
+                alt.Tooltip("interval_high:Q", title="Interval high", format=".4f"),
+                alt.Tooltip("instances:Q", title="Instances"),
             ],
-        ).properties(title=welfare_label, width=alt.Step(40), height=alt.Step(26))
+        )
+    )
+    return (
+        alt.layer(intervals, means, data=frame)
+        .properties(width=360)
+        .facet(row=alt.Row("selector_label:N", title=None))
+        .properties(title="Nash welfare against the pool, whole group")
+    )
+
+
+def winner_chart(welfare: pd.DataFrame) -> alt.FacetChart:
+    """Win rate against the round's winner with a 95% bootstrap interval.
+
+    One column for the average participant and one for the worst served, one
+    row per selector. The uniform pool is the baseline of a random candidate.
+    """
+    long_welfare = welfare.melt(
+        id_vars=["selector", "method", "question_id"],
+        value_vars=["winner_average", "winner_worst"],
+        var_name="served",
+    ).dropna(subset=["value"])
+    summary = bootstrap_summary(long_welfare, ["selector", "method", "served"])
+    frame = summary.assign(
+        selector_label=summary["selector"].map(MODEL_LABELS),  # pyright: ignore[reportArgumentType]
+        method_label=summary["method"].map(METHOD_LABELS),  # pyright: ignore[reportArgumentType]
+        served_label=summary["served"].map(  # pyright: ignore[reportArgumentType, reportCallIssue]
+            {"winner_average": "Average", "winner_worst": "Worst served"}  # pyright: ignore[reportArgumentType]
+        ),
+    )
+    y = alt.Y("method_label:N", sort=list(METHOD_LABELS.values()), title=None)
+    x = alt.X(
+        "interval_low:Q",
+        scale=alt.Scale(zero=False),
+        title="Win rate against the Habermas winner",
+    )
+    intervals = (
+        alt.Chart()
+        .mark_rule(color=METHOD_COLOURS[0], strokeWidth=2)
+        .encode(x=x, x2="interval_high:Q", y=y)
+    )
+    means = (
+        alt.Chart()
+        .mark_point(filled=True, size=90, opacity=1, color=METHOD_COLOURS[0])
+        .encode(
+            x="value:Q",
+            y=y,
+            tooltip=[
+                alt.Tooltip("method_label:N", title="Method"),
+                alt.Tooltip("served_label:N", title="Participant"),
+                alt.Tooltip("value:Q", title="Win rate", format=".3f"),
+                alt.Tooltip("interval_low:Q", title="Interval low", format=".3f"),
+                alt.Tooltip("interval_high:Q", title="Interval high", format=".3f"),
+                alt.Tooltip("instances:Q", title="Instances"),
+            ],
+        )
+    )
+    return (
+        alt.layer(intervals, means, data=frame)
+        .properties(width=280)
+        .facet(
+            row=alt.Row("selector_label:N", title=None),
+            column=alt.Column("served_label:N", title=None),
+        )
+        .properties(title="Against the deliberation's final statement, whole group")
+    )
+
+
+def beaten_histogram(results: pd.DataFrame, pool_size: int) -> alt.HConcatChart:
+    """How many pool candidates each participant prefers less than the mixture.
+
+    One column of panels per selector, since Vega-Lite misplaces sorted facet
+    rows when a selector lacks a method.
+    """
+    beaten_bin = alt.Bin(extent=[0, pool_size + 1], step=2)
+
+    def selector_column(selector_name: str) -> alt.FacetChart:
+        selector_results = results[results["selector"] == selector_name]
+        frame = selector_results.assign(
+            method_label=selector_results["method"].map(METHOD_LABELS)  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
+        )
+        return (
+            alt.Chart(frame[["method_label", "candidates_beaten"]])
+            .mark_bar(color=METHOD_COLOURS[0], cornerRadiusEnd=4)
+            .encode(
+                x=alt.X(
+                    "candidates_beaten:Q",
+                    bin=beaten_bin,
+                    title=f"Candidates beaten, out of {pool_size}",
+                ),
+                y=alt.Y("count():Q", title="Participants"),
+                tooltip=[
+                    alt.Tooltip("method_label:N", title="Method"),
+                    alt.Tooltip("candidates_beaten:Q", bin=beaten_bin, title="Beaten"),
+                    alt.Tooltip("count():Q", title="Participants"),
+                ],
+            )
+            .properties(width=220, height=90)
+            .facet(
+                row=alt.Row(
+                    "method_label:N",
+                    sort=[
+                        method_label
+                        for method_name, method_label in METHOD_LABELS.items()
+                        if method_name in set(selector_results["method"])
+                    ],
+                    title=None,
+                ),
+            )
+            .properties(title=MODEL_LABELS[selector_name])
+        )
 
     return alt.hconcat(
         *[
-            grid(welfare_label, show_rows=position == 0)
-            for position, welfare_label in enumerate(WELFARE_LABELS.values())
+            selector_column(selector_name)
+            for selector_name in results["selector"].unique()
         ],
-        title=title,
+        title="Candidates each participant prefers less than the mixture",
     )
 
 
 def explorer_controls(
-    groups: pd.DataFrame, tensors_by_backbone: dict[str, dict[str, dict]]
-) -> tuple[mo.ui.dropdown, mo.ui.dropdown, mo.ui.dropdown]:
-    """Backbone, question and selector dropdowns for ``question_view``."""
-    model_names = list(next(iter(tensors_by_backbone.values())))
+    groups: pd.DataFrame, tensors_by_selector: dict[str, dict]
+) -> tuple[mo.ui.dropdown, mo.ui.dropdown]:
+    """Question and selector dropdowns for ``question_view``."""
+    selector_names = list(tensors_by_selector)
     return (
-        mo.ui.dropdown(
-            options={
-                BACKBONE_LABELS[backbone_name]: backbone_name
-                for backbone_name in tensors_by_backbone
-            },
-            value=BACKBONE_LABELS[next(iter(tensors_by_backbone))],
-            label="Backbone",
-        ),
         mo.ui.dropdown(
             options=dict(zip(groups["question"], groups["question_id"], strict=True)),
             value=groups["question"].iloc[0],
@@ -160,9 +302,10 @@ def explorer_controls(
         ),
         mo.ui.dropdown(
             options={
-                MODEL_LABELS[model_name]: model_name for model_name in model_names
+                MODEL_LABELS[selector_name]: selector_name
+                for selector_name in selector_names
             },
-            value=MODEL_LABELS[model_names[0]],
+            value=MODEL_LABELS[selector_names[0]],
             label="Selector",
         ),
     )
@@ -173,11 +316,11 @@ def mixture_table(
 ) -> pd.DataFrame:
     """Answers any method puts weight on, with each method's weight as a column.
 
-    ``pool_statements`` are the generated candidates in sample order, without
-    the anchor that ends every policy. Zero weights are NaN.
+    ``pool_statements`` are the generated candidates in sample order. Zero
+    weights are NaN.
     """
     weights = {
-        method_label: policies[method_name][: len(pool_statements)]
+        method_label: policies[method_name]
         for method_name, method_label in METHOD_LABELS.items()
         if method_name in policies
     }
@@ -206,22 +349,19 @@ def mixture_table(
 
 def question_view(
     groups: pd.DataFrame,
-    candidates_by_backbone: dict[str, pd.DataFrame],
-    tensors_by_backbone: dict[str, dict[str, dict]],
-    backbone_name: str,
+    candidates: pd.DataFrame,
+    tensors_by_selector: dict[str, dict],
     question_id: str,
     selector_name: str,
 ) -> mo.Html:
     """The question and its four participants, then every method's mixture."""
-    selector_tensor = tensors_by_backbone[backbone_name][selector_name].get(question_id)
+    selector_tensor = tensors_by_selector[selector_name].get(question_id)
     if selector_tensor is None:
         return mo.md("Not scored yet for this selector.")
     group_row = groups.set_index("question_id").loc[question_id]
-    pool_statements = (
-        candidates_by_backbone[backbone_name]
-        .loc[lambda candidates: candidates["question_id"] == question_id]
-        .sort_values("sample_index")
-    )
+    pool_statements = candidates.loc[
+        lambda frame: frame["question_id"] == question_id
+    ].sort_values("sample_index")
     weights_table = mixture_table(
         selection_policies(selector_tensor, selector_name), pool_statements
     )

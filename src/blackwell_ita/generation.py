@@ -1,59 +1,44 @@
-import pandas as pd
-import torch
-from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import time
+
+import anthropic
+from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+from anthropic.types.messages.batch_create_params import Request
+
+GENERATION_MODEL = "claude-haiku-5-5"
 
 
-def batch_sizes(total: int, batch_size: int) -> list[int]:
-    """Split a sample count into generate() batch sizes."""
-    return [min(batch_size, total - start) for start in range(0, total, batch_size)]
+def statement_request(prompt: str) -> MessageCreateParamsNonStreaming:
+    """One generation request, with thinking off and default sampling."""
+    return MessageCreateParamsNonStreaming(
+        model=GENERATION_MODEL,
+        max_tokens=1024,
+        thinking={"type": "disabled"},
+        messages=[{"role": "user", "content": prompt}],
+    )
 
 
-def generate_responses(
-    model_name: str,
-    prompts: list[str],
-    samples_per_prompt: int,
-    device: str,
-    max_new_tokens: int = 512,
-    temperature: float = 1.0,
-    batch_size: int = 32,
-    seed: int = 1810,
-) -> pd.DataFrame:
-    """Sample responses per prompt; one (prompt_index, sample_index, response) row each."""
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype="auto").to(device)  # pyright: ignore[reportArgumentType]
-    torch.manual_seed(seed)
-    response_rows = []
-    for prompt_index, prompt in enumerate(tqdm(prompts, desc=model_name)):
-        chat_inputs = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
-        ).to(device)
-        prompt_length = chat_inputs["input_ids"].shape[1]
-        sample_index = 0
-        for sample_count in batch_sizes(samples_per_prompt, batch_size):
-            generated_outputs = model.generate(  # pyright: ignore[reportAttributeAccessIssue]
-                **chat_inputs,
-                do_sample=True,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-                num_return_sequences=sample_count,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-            for generated_output in generated_outputs:
-                response_rows.append(
-                    {
-                        "prompt_index": prompt_index,
-                        "sample_index": sample_index,
-                        "response": tokenizer.decode(
-                            generated_output[prompt_length:], skip_special_tokens=True
-                        ).strip(),
-                    }
-                )
-                sample_index += 1
-    model.to("cpu")  # pyright: ignore[reportArgumentType]
-    if device.startswith("cuda"):
-        torch.cuda.empty_cache()
-    return pd.DataFrame(response_rows)
+def response_text(message: anthropic.types.Message) -> str:
+    """The text blocks of a response, joined and stripped."""
+    return "".join(
+        block.text for block in message.content if block.type == "text"
+    ).strip()
+
+
+def generate_responses(prompts: list[str], poll_seconds: int = 30) -> list[str]:
+    """One response per prompt through the Message Batches API, in prompt order."""
+    client = anthropic.Anthropic()
+    batch = client.messages.batches.create(
+        requests=[
+            Request(custom_id=str(index), params=statement_request(prompt))
+            for index, prompt in enumerate(prompts)
+        ]
+    )
+    while batch.processing_status != "ended":
+        time.sleep(poll_seconds)
+        batch = client.messages.batches.retrieve(batch.id)
+    responses: dict[int, str] = {}
+    for result in client.messages.batches.results(batch.id):
+        if result.result.type != "succeeded":
+            raise RuntimeError(f"Request {result.custom_id} {result.result.type}")
+        responses[int(result.custom_id)] = response_text(result.result.message)
+    return [responses[index] for index in range(len(prompts))]

@@ -34,15 +34,37 @@ def pairwise_preference_tensor(
         for second_index in range(response_count)
         if first_index != second_index
     ]
+    probabilities = pair_probabilities(
+        model,
+        [
+            (prompt, responses[first_index], responses[second_index])
+            for first_index, second_index in index_pairs
+        ],
+        device,
+        batch_size,
+    )
+    preference_tensor = np.full(
+        (probabilities.shape[1], response_count, response_count), 0.5
+    )
+    for (first_index, second_index), head_probabilities in zip(
+        index_pairs, probabilities, strict=True
+    ):
+        preference_tensor[:, first_index, second_index] = head_probabilities
+    return (preference_tensor + 1.0 - preference_tensor.transpose(0, 2, 1)) / 2.0
+
+
+def pair_probabilities(
+    model: RewardModel,
+    pairs: list[tuple[str, str, str]],
+    device: str,
+    batch_size: int = 64,
+) -> np.ndarray:
+    """Probability the first response wins, shape (pair, head), for (prompt, first, second) pairs."""
     pair_texts = [
         truncated_pairwise_text(
-            prompt,
-            responses[first_index],
-            responses[second_index],
-            model.tokenizer,
-            model.max_tokens,
+            prompt, first_response, second_response, model.tokenizer, model.max_tokens
         )
-        for first_index, second_index in index_pairs
+        for prompt, first_response, second_response in pairs
     ]
     # Length-sorted batches pad to their own longest member
     length_order = sorted(
@@ -59,17 +81,36 @@ def pairwise_preference_tensor(
                 device,
             )
             probability_batches.append(torch.sigmoid(logits).cpu())
-    probabilities = (
-        torch.cat(probability_batches).float().numpy()[np.argsort(length_order)]
+    return torch.cat(probability_batches).float().numpy()[np.argsort(length_order)]
+
+
+def win_rates_against(
+    model: RewardModel,
+    prompt: str,
+    responses: list[str],
+    opponent: str,
+    device: str,
+    batch_size: int = 64,
+) -> np.ndarray:
+    """Each response's probability of beating ``opponent``, shape (head, response).
+
+    Both presentation orders are scored and averaged as in
+    ``pairwise_preference_tensor``. A Bradley-Terry model scores each text once.
+    """
+    if model.model_type == "bradley_terry":
+        return bradley_terry_preference_tensor(
+            model, prompt, [*responses, opponent], device, batch_size
+        )[:, :-1, -1]
+    probabilities = pair_probabilities(
+        model,
+        [(prompt, response, opponent) for response in responses]
+        + [(prompt, opponent, response) for response in responses],
+        device,
+        batch_size,
     )
-    preference_tensor = np.full(
-        (probabilities.shape[1], response_count, response_count), 0.5
-    )
-    for (first_index, second_index), pair_probabilities in zip(
-        index_pairs, probabilities, strict=True
-    ):
-        preference_tensor[:, first_index, second_index] = pair_probabilities
-    return (preference_tensor + 1.0 - preference_tensor.transpose(0, 2, 1)) / 2.0
+    return (
+        (probabilities[: len(responses)] + 1.0 - probabilities[len(responses) :]) / 2.0
+    ).T
 
 
 def bradley_terry_preference_tensor(
