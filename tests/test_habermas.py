@@ -10,6 +10,7 @@ from blackwell_ita.habermas import (
     PLACEHOLDER_OPINION,
     PROXY_CONFIGURATIONS,
     WHOLE_GROUP,
+    assign_habermas_splits,
     candidate_prompts,
     candidate_sets,
     complete_groups,
@@ -51,6 +52,22 @@ def comparison_row(**overrides) -> dict:
         "metadata.provenance": "HUMAN_CITIZEN",
         "rankings.metadata.status": "COMPLETED",
     } | overrides
+
+
+def test_assign_habermas_splits_withholds_whole_paper_questions():
+    rankings = pd.DataFrame(
+        {"question_id": [f"q{index // 2}" for index in range(1000)], "row": range(1000)}
+    )
+    split_rankings = assign_habermas_splits(rankings)
+    assert split_rankings["row"].tolist() == list(range(1000))
+    assert (split_rankings.groupby("question_id")["split"].nunique() == 1).all()
+    question_splits = split_rankings.drop_duplicates("question_id")["split"]
+    assert question_splits.value_counts().to_dict() == {
+        "train": 210,
+        "paper": 200,
+        "validation": 45,
+        "test": 45,
+    }
 
 
 def test_usable_rankings_keeps_only_complete_human_rankings():
@@ -207,10 +224,12 @@ def test_candidate_prompts_cover_every_slot_once_per_draw():
         plan, candidate_prompts(proposal_groups(), examples())
     )
     pool_sizes = plan.groupby("question_id")["sample_index"].apply(sorted).to_dict()
-    assert pool_sizes == {"q1": list(range(16)), "q2": list(range(32))}
+    assert pool_sizes == {"q1": list(range(16)), "q2": list(range(64))}
     test_plan = plan[plan["question_id"] == "q2"].sort_values("sample_index")  # pyright: ignore[reportCallIssue]
-    for half in (test_plan.iloc[:16], test_plan.iloc[16:]):
-        assert half["candidate_kind"].tolist() == [kind for kind, _ in CANDIDATE_SLOTS]
+    for start in range(0, 64, 16):
+        assert test_plan.iloc[start : start + 16]["candidate_kind"].tolist() == [
+            kind for kind, _ in CANDIDATE_SLOTS
+        ]
     pairs = plan[plan["candidate_kind"] == "pair"]["target_participants"]
     assert {tuple(pair) for pair in pairs} == {
         (1, 2),

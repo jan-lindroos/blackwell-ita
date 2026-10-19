@@ -1,3 +1,5 @@
+import math
+
 import pandas as pd
 import pytest
 import torch
@@ -13,26 +15,33 @@ from blackwell_ita.training import (
 
 
 class ScriptedModel(torch.nn.Module):
-    """Validation losses follow a script; the weight counts training steps."""
+    """Validation accuracies follow a script; the weight counts training steps."""
 
     criteria = ("x", "y")
 
-    def __init__(self, validation_losses: list[float]) -> None:
+    def __init__(self, validation_accuracies: list[float]) -> None:
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(()))
         self.frozen_weight = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
-        self.validation_losses = iter(validation_losses)
+        self.validation_accuracies = iter(validation_accuracies)
 
     def compute_loss(self, batch, device):
         # The gradient is -1, so every AdamW step raises the weight
         return -self.weight
 
     def batch_logits(self, batch, device):
-        return batch["target"] * 0.0 + next(self.validation_losses)
+        accuracy = next(self.validation_accuracies)
+        if math.isnan(accuracy):
+            return batch["target"] * float("nan")
+        correct_count = round(accuracy * len(batch["target"]))
+        signs = torch.tensor(
+            [1.0] * correct_count + [-1.0] * (len(batch["target"]) - correct_count)
+        )
+        return signs[:, None].expand_as(batch["target"])
 
 
 def validation_batch() -> dict:
-    return {"target": torch.tensor([[1.0, 0.0]]), "mask": torch.tensor([[1.0, 1.0]])}
+    return {"target": torch.ones(10, 2), "mask": torch.ones(10, 2)}
 
 
 def tiny_train_dataset() -> PreferencePairDataset:
@@ -68,7 +77,7 @@ def run_training(model: ScriptedModel, **overrides) -> float:
 
 def test_train_until_no_improvement_restores_the_best_trainable_weights():
     # Round 3 regresses and round 4 recovers; rounds 5 and 6 exhaust patience
-    model = ScriptedModel([3.0, 2.0, 2.5, 1.5, 1.6, 1.7])
+    model = ScriptedModel([0.3, 0.5, 0.4, 0.7, 0.7, 0.6])
     weights_after_each_round = []
     logged_rows = []
 
@@ -85,17 +94,6 @@ def test_train_until_no_improvement_restores_the_best_trainable_weights():
     )
 
 
-def test_train_until_no_improvement_stops_after_max_steps():
-    # Validation keeps improving, so only the step cap ends training
-    model = ScriptedModel([3.0, 2.0, 1.0])
-    logged_rows = []
-    run_training(model, max_steps=5, log_metrics=logged_rows.append)
-    assert [row["step"] for row in logged_rows if "train/loss" in row] == list(
-        range(1, 6)
-    )
-    assert sum("early_stopping/loss" in row for row in logged_rows) == 3
-
-
 def test_train_until_no_improvement_raises_when_validation_is_never_finite():
     with pytest.raises(RuntimeError):
         run_training(ScriptedModel([float("nan")] * 2))
@@ -106,9 +104,9 @@ class Interrupted(Exception):
 
 
 def test_resuming_from_saved_state_matches_an_uninterrupted_run():
-    validation_losses = [3.0, 2.0, 2.5, 1.5, 1.6, 1.7]
-    uninterrupted_model = ScriptedModel(validation_losses)
-    uninterrupted_loss = run_training(uninterrupted_model)
+    validation_accuracies = [0.3, 0.5, 0.4, 0.7, 0.7, 0.6]
+    uninterrupted_model = ScriptedModel(validation_accuracies)
+    uninterrupted_accuracy = run_training(uninterrupted_model)
     saved_states = []
 
     def save_then_die_after_two_rounds(training_state: dict) -> None:
@@ -118,16 +116,17 @@ def test_resuming_from_saved_state_matches_an_uninterrupted_run():
 
     with pytest.raises(Interrupted):
         run_training(
-            ScriptedModel(validation_losses), save_state=save_then_die_after_two_rounds
+            ScriptedModel(validation_accuracies),
+            save_state=save_then_die_after_two_rounds,
         )
-    resumed_model = ScriptedModel(validation_losses[2:])
+    resumed_model = ScriptedModel(validation_accuracies[2:])
     resumed_steps = []
-    resumed_loss = run_training(
+    resumed_accuracy = run_training(
         resumed_model,
         saved_state=saved_states[-1],
         log_metrics=lambda row: resumed_steps.append(row["step"]),
     )
-    assert resumed_loss == uninterrupted_loss
+    assert resumed_accuracy == uninterrupted_accuracy
     assert resumed_model.weight.item() == pytest.approx(
         uninterrupted_model.weight.item()
     )

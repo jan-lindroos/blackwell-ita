@@ -52,6 +52,15 @@ GOLD_CONFIGURATION = RewardModelConfiguration(
 )
 PROXY_CONFIGURATIONS = [
     RewardModelConfiguration(
+        name="qwen3_4b_pairwise",
+        model_type="pairwise",
+        encoder_name="Qwen/Qwen3-4B-Instruct-2507",
+        lora_rank=None,
+        learning_rate=5e-6,
+        evaluation_interval_steps=2500,
+        max_tokens=2048,
+    ),
+    RewardModelConfiguration(
         name="qwen3_4b_bradley_terry",
         model_type="bradley_terry",
         encoder_name="Qwen/Qwen3-4B-Instruct-2507",
@@ -59,11 +68,12 @@ PROXY_CONFIGURATIONS = [
         learning_rate=5e-6,
         evaluation_interval_steps=2500,
         max_tokens=2048,
-        max_epochs=1,
     ),
 ]
+# The paper's questions are withheld from every split, test included
+PAPER_QUESTION_COUNT = 200
 GROUP_COUNTS = {"train": 300, "validation": 60, "test": 100}
-DRAWS_PER_SLOT = {"train": 1, "validation": 1, "test": 2}
+DRAWS_PER_SLOT = {"train": 1, "validation": 1, "test": 4}
 CANDIDATE_SLOTS = (
     [("consensus", ())] * 4
     + [("participant", (participant,)) for participant in range(1, 5)]
@@ -223,13 +233,29 @@ def deliberation_groups(
     return pd.DataFrame(group_rows)
 
 
+def assign_habermas_splits(rankings: pd.DataFrame, seed: int = 1810) -> pd.DataFrame:
+    """Label the paper's questions "paper", then split the rest 70/15/15 by question."""
+    paper_question_ids = (
+        rankings["question_id"]
+        .drop_duplicates()
+        .sample(n=PAPER_QUESTION_COUNT, random_state=seed)
+    )
+    is_paper = rankings["question_id"].isin(paper_question_ids)
+    return pd.concat(
+        [
+            assign_prompt_splits(rankings[~is_paper], "question_id"),  # pyright: ignore[reportArgumentType]
+            rankings[is_paper].assign(split="paper"),
+        ]
+    ).sort_index()
+
+
 def ensure_rankings() -> pd.DataFrame:
     """Human rankings split by question, built and uploaded unless the hub has them."""
     return ensure_hub_dataframe(
         ARTIFACTS_REPOSITORY,
         "rankings.parquet",
         HABERMAS_PREFIX,
-        lambda: assign_prompt_splits(load_habermas_rankings(), "question_id"),
+        lambda: assign_habermas_splits(load_habermas_rankings()),
     )
 
 
@@ -307,9 +333,8 @@ def candidate_prompts(
     """The generation prompts for every group's pool.
 
     Each draw covers the 16 slots once (four consensus, four single
-    participant, six pair, one common ground and one compromise), so a
-    test pool's first half holds one statement per slot and so does its
-    second. The order opinions are shown in rotates. Every prompt shows
+    participant, six pair, one common ground and one compromise), so each
+    quarter of a test pool holds one statement per slot. The order opinions are shown in rotates. Every prompt shows
     three statements from other questions as style examples.
     """
     random_generator = np.random.default_rng(seed)

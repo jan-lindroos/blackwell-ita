@@ -52,7 +52,6 @@ class RewardModelConfiguration:
     warmup_steps: int = 100
     early_stopping_pair_count: int = 4000
     patience: int = 2
-    max_epochs: int | None = None
     seed: int = 1810
     gradient_checkpointing: bool = True
 
@@ -139,11 +138,10 @@ def train_until_no_improvement(
     log_metrics: Callable[[dict], None],
     saved_state: dict | None = None,
     save_state: Callable[[dict], None] | None = None,
-    max_steps: int | None = None,
 ) -> float:
     """Train in rounds, validating after each, until ``patience`` rounds pass
-    without a new best validation loss or ``max_steps`` steps are taken.
-    Restores the best trainable weights and returns the best validation loss.
+    without a new best validation decisive accuracy, pooled over criteria.
+    Restores the best trainable weights and returns the best accuracy.
 
     ``save_state`` receives everything needed to resume after every round;
     passing that back as ``saved_state`` continues exactly where it stopped.
@@ -163,7 +161,7 @@ def train_until_no_improvement(
     model.train()
     model.compute_loss(longest_batch(train_dataset, batch_size), device).backward()
     optimizer.zero_grad(set_to_none=True)
-    best_validation_loss = float("inf")
+    best_validation_accuracy = float("-inf")
     best_trainable_state: dict[str, torch.Tensor] | None = None
     rounds_without_improvement = 0
     step = 0
@@ -171,24 +169,17 @@ def train_until_no_improvement(
         model.load_state_dict(saved_state["trainable_state"], strict=False)
         optimizer.load_state_dict(saved_state["optimizer"])
         scheduler.load_state_dict(saved_state["scheduler"])
-        best_validation_loss = saved_state["best_validation_loss"]
+        best_validation_accuracy = saved_state["best_validation_accuracy"]
         best_trainable_state = saved_state["best_trainable_state"]
         rounds_without_improvement = saved_state["rounds_without_improvement"]
         step = saved_state["step"]
     batches = training_batches(train_dataset, batch_size, seed, start_step=step)
-    while rounds_without_improvement < patience and (
-        max_steps is None or step < max_steps
-    ):
-        round_steps = (
-            steps_per_round
-            if max_steps is None
-            else min(steps_per_round, max_steps - step)
-        )
+    while rounds_without_improvement < patience:
         model.train()
         for batch in tqdm(
-            islice(batches, round_steps),
-            total=round_steps,
-            desc=f"steps {step + 1} to {step + round_steps}",
+            islice(batches, steps_per_round),
+            total=steps_per_round,
+            desc=f"steps {step + 1} to {step + steps_per_round}",
         ):
             optimizer.zero_grad()
             loss = model.compute_loss(batch, device)
@@ -218,8 +209,15 @@ def train_until_no_improvement(
                 "early_stopping", validation_loss, validation_criterion_metrics
             )
         )
-        if validation_loss < best_validation_loss:
-            best_validation_loss = validation_loss
+        validation_accuracy = (
+            validation_criterion_metrics["decisive_accuracy"]
+            * validation_criterion_metrics["decisive_count"]
+        ).sum() / validation_criterion_metrics["decisive_count"].sum()
+        if (
+            math.isfinite(validation_loss)
+            and validation_accuracy > best_validation_accuracy
+        ):
+            best_validation_accuracy = validation_accuracy
             rounds_without_improvement = 0
             best_trainable_state = cpu_copy(trainable_parameters)
         else:
@@ -229,7 +227,7 @@ def train_until_no_improvement(
             save_state(
                 {
                     "step": step,
-                    "best_validation_loss": best_validation_loss,
+                    "best_validation_accuracy": best_validation_accuracy,
                     "rounds_without_improvement": rounds_without_improvement,
                     "trainable_state": cpu_copy(trainable_parameters),
                     "best_trainable_state": best_trainable_state,
@@ -240,7 +238,7 @@ def train_until_no_improvement(
     if best_trainable_state is None:
         raise RuntimeError(f"no finite validation loss, last was {validation_loss}")  # pyright: ignore[reportPossiblyUnboundVariable]
     model.load_state_dict(best_trainable_state, strict=False)
-    return best_validation_loss
+    return best_validation_accuracy
 
 
 def cpu_copy(parameters: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -306,10 +304,6 @@ def train_reward_model(
         log_metrics=log_metrics,
         saved_state=saved_state,
         save_state=save_state,
-        max_steps=None
-        if configuration.max_epochs is None
-        else configuration.max_epochs
-        * math.ceil(len(datasets_by_split["train"]) / configuration.batch_size),
     )
     split_metrics = []
     for split_name, split_loader in evaluation_loaders.items():

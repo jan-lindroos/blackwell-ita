@@ -111,7 +111,7 @@ def available_on_hub(repository_id: str, filename: str, prefix: str) -> bool:
 @app.cell
 def _():
     rankings = ensure_rankings()
-    human_pairs = habermas_pairs(rankings)
+    human_pairs = habermas_pairs(rankings[rankings["split"] != "paper"])
     split_summary(human_pairs, "question_id")
     return human_pairs, rankings
 
