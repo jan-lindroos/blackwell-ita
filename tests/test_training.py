@@ -85,6 +85,17 @@ def test_train_until_no_improvement_restores_the_best_trainable_weights():
     )
 
 
+def test_train_until_no_improvement_stops_after_max_steps():
+    # Validation keeps improving, so only the step cap ends training
+    model = ScriptedModel([3.0, 2.0, 1.0])
+    logged_rows = []
+    run_training(model, max_steps=5, log_metrics=logged_rows.append)
+    assert [row["step"] for row in logged_rows if "train/loss" in row] == list(
+        range(1, 6)
+    )
+    assert sum("early_stopping/loss" in row for row in logged_rows) == 3
+
+
 def test_train_until_no_improvement_raises_when_validation_is_never_finite():
     with pytest.raises(RuntimeError):
         run_training(ScriptedModel([float("nan")] * 2))

@@ -52,15 +52,6 @@ GOLD_CONFIGURATION = RewardModelConfiguration(
 )
 PROXY_CONFIGURATIONS = [
     RewardModelConfiguration(
-        name="qwen3_4b_pairwise",
-        model_type="pairwise",
-        encoder_name="Qwen/Qwen3-4B-Instruct-2507",
-        lora_rank=None,
-        learning_rate=5e-6,
-        evaluation_interval_steps=2500,
-        max_tokens=2048,
-    ),
-    RewardModelConfiguration(
         name="qwen3_4b_bradley_terry",
         model_type="bradley_terry",
         encoder_name="Qwen/Qwen3-4B-Instruct-2507",
@@ -68,6 +59,7 @@ PROXY_CONFIGURATIONS = [
         learning_rate=5e-6,
         evaluation_interval_steps=2500,
         max_tokens=2048,
+        max_epochs=1,
     ),
 ]
 GROUP_COUNTS = {"train": 300, "validation": 60, "test": 100}
