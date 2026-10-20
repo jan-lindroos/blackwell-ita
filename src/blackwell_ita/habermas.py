@@ -46,7 +46,7 @@ GOLD_CONFIGURATION = RewardModelConfiguration(
     encoder_name="google/gemma-4-31B-it",
     lora_rank=16,
     learning_rate=1e-4,
-    evaluation_interval_steps=2500,
+    evaluation_interval_steps=1000,
     max_tokens=2048,
     batch_size=8,
 )
@@ -57,7 +57,7 @@ PROXY_CONFIGURATIONS = [
         encoder_name="Qwen/Qwen3-4B-Instruct-2507",
         lora_rank=None,
         learning_rate=5e-6,
-        evaluation_interval_steps=2500,
+        evaluation_interval_steps=1000,
         max_tokens=2048,
     ),
     RewardModelConfiguration(
@@ -66,7 +66,7 @@ PROXY_CONFIGURATIONS = [
         encoder_name="Qwen/Qwen3-4B-Instruct-2507",
         lora_rank=None,
         learning_rate=5e-6,
-        evaluation_interval_steps=2500,
+        evaluation_interval_steps=1000,
         max_tokens=2048,
     ),
 ]

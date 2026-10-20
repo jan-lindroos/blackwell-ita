@@ -51,7 +51,7 @@ class RewardModelConfiguration:
     batch_size: int = 12
     warmup_steps: int = 100
     early_stopping_pair_count: int = 4000
-    patience: int = 2
+    patience: int = 1
     seed: int = 1810
     gradient_checkpointing: bool = True
 
