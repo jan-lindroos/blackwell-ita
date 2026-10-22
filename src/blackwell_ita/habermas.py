@@ -73,7 +73,6 @@ PROXY_CONFIGURATIONS = [
 # The paper's questions are withheld from every split, test included
 PAPER_QUESTION_COUNT = 200
 GROUP_COUNTS = {"train": 300, "validation": 60, "test": 100}
-DRAWS_PER_SLOT = {"train": 1, "validation": 1, "test": 4}
 CANDIDATE_SLOTS = (
     [("consensus", ())] * 4
     + [("participant", (participant,)) for participant in range(1, 5)]
@@ -332,10 +331,10 @@ def candidate_prompts(
 ) -> pd.DataFrame:
     """The generation prompts for every group's pool.
 
-    Each draw covers the 16 slots once (four consensus, four single
-    participant, six pair, one common ground and one compromise), so each
-    quarter of a test pool holds one statement per slot. The order opinions are shown in rotates. Every prompt shows
-    three statements from other questions as style examples.
+    Each pool covers the 16 slots once (four consensus, four single
+    participant, six pair, one common ground and one compromise). The order
+    opinions are shown in rotates. Every prompt shows three statements from
+    other questions as style examples.
     """
     random_generator = np.random.default_rng(seed)
     orders = np.array([[0, 1, 3, 2], [1, 2, 0, 3], [2, 3, 1, 0], [3, 0, 2, 1]])
@@ -347,40 +346,39 @@ def candidate_prompts(
         other_examples = examples[examples["question_id"] != group["question_id"]]
         example_lengths = examples["statement"].str.split().str.len().to_numpy()
         labels = random_generator.permutation(4)
-        for draw in range(DRAWS_PER_SLOT[group["split"]]):
-            for slot_index, (kind, targets) in enumerate(CANDIDATE_SLOTS):
-                order = [
-                    int(position) + 1
-                    for position in labels[orders[(slot_index + draw) % 4]]
-                    if not targets or int(position) + 1 in targets
-                ]
-                shown_examples = other_examples.iloc[
-                    random_generator.choice(
-                        len(other_examples), size=EXAMPLES_PER_PROMPT, replace=False
-                    )
-                ]
-                example_text = "\n\n".join(
-                    f"Question: {example['question']}\nStatement: {example['statement']}"
-                    for example in shown_examples.to_dict("records")
+        for slot_index, (kind, targets) in enumerate(CANDIDATE_SLOTS):
+            order = [
+                int(position) + 1
+                for position in labels[orders[slot_index % 4]]
+                if not targets or int(position) + 1 in targets
+            ]
+            shown_examples = other_examples.iloc[
+                random_generator.choice(
+                    len(other_examples), size=EXAMPLES_PER_PROMPT, replace=False
                 )
-                rows.append(
-                    {
-                        "question_id": group["question_id"],
-                        "split": group["split"],
-                        "sample_index": draw * len(CANDIDATE_SLOTS) + slot_index,
-                        "candidate_kind": kind,
-                        "target_participants": list(targets),
-                        "opinion_order": order,
-                        "prompt": statement_prompt(
-                            group["question"],
-                            [opinions[participant - 1] for participant in order],
-                            SLOT_INSTRUCTIONS[kind],
-                            example_text,
-                            # Lengths follow the Habermas statements
-                            int(round(random_generator.choice(example_lengths), -1)),
-                        ),
-                    }
-                )
+            ]
+            example_text = "\n\n".join(
+                f"Question: {example['question']}\nStatement: {example['statement']}"
+                for example in shown_examples.to_dict("records")
+            )
+            rows.append(
+                {
+                    "question_id": group["question_id"],
+                    "split": group["split"],
+                    "sample_index": slot_index,
+                    "candidate_kind": kind,
+                    "target_participants": list(targets),
+                    "opinion_order": order,
+                    "prompt": statement_prompt(
+                        group["question"],
+                        [opinions[participant - 1] for participant in order],
+                        SLOT_INSTRUCTIONS[kind],
+                        example_text,
+                        # Lengths follow the Habermas statements
+                        int(round(random_generator.choice(example_lengths), -1)),
+                    ),
+                }
+            )
     return pd.DataFrame(rows)
 
 

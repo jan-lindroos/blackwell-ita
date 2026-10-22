@@ -25,7 +25,6 @@ with app.setup:
     from blackwell_ita.data import split_summary
     from blackwell_ita.habermas import (
         CANDIDATE_SLOTS,
-        DRAWS_PER_SLOT,
         GOLD_CONFIGURATION,
         HABERMAS_CRITERIA,
         HABERMAS_PREFIX,
@@ -64,7 +63,6 @@ with app.setup:
     from blackwell_ita.training import ensure_trained, load_trained
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    TEST_POOL_SIZE = DRAWS_PER_SLOT["test"] * len(CANDIDATE_SLOTS)
 
 
 @app.function
@@ -338,7 +336,7 @@ def _(welfare):
 
 @app.cell
 def _(results):
-    beaten_histogram(results[results["group_size"] == 4], TEST_POOL_SIZE)
+    beaten_histogram(results[results["group_size"] == 4], len(CANDIDATE_SLOTS))
     return
 
 

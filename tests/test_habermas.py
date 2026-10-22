@@ -218,18 +218,15 @@ def examples() -> pd.DataFrame:
     )
 
 
-def test_candidate_prompts_cover_every_slot_once_per_draw():
+def test_candidate_prompts_cover_every_slot_once():
     plan = candidate_prompts(proposal_groups(), examples())
     pd.testing.assert_frame_equal(
         plan, candidate_prompts(proposal_groups(), examples())
     )
     pool_sizes = plan.groupby("question_id")["sample_index"].apply(sorted).to_dict()
-    assert pool_sizes == {"q1": list(range(16)), "q2": list(range(64))}
+    assert pool_sizes == {"q1": list(range(16)), "q2": list(range(16))}
     test_plan = plan[plan["question_id"] == "q2"].sort_values("sample_index")  # pyright: ignore[reportCallIssue]
-    for start in range(0, 64, 16):
-        assert test_plan.iloc[start : start + 16]["candidate_kind"].tolist() == [
-            kind for kind, _ in CANDIDATE_SLOTS
-        ]
+    assert test_plan["candidate_kind"].tolist() == [kind for kind, _ in CANDIDATE_SLOTS]
     pairs = plan[plan["candidate_kind"] == "pair"]["target_participants"]
     assert {tuple(pair) for pair in pairs} == {
         (1, 2),
