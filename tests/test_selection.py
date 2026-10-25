@@ -1,24 +1,22 @@
 import warnings
 
+import cvxpy as cp
 import numpy as np
-import pandas as pd
 import pytest
 
 from blackwell_ita.selection import (
     blackwell_winner,
+    budgeted_nash_winner,
     clean_policy,
     max_mean_win_rate,
     maximin,
     nash_shortfall,
     nash_target_winner,
     paired_bootstrap_interval,
-    reference_nash_winner,
+    robust_nash_winner,
     scalarised_nash,
-    summarise_methods,
     target_set_winner,
     von_neumann_winner,
-    welfare,
-    win_rates,
 )
 
 
@@ -81,10 +79,10 @@ def test_blackwell_protects_the_minority_head_that_averaging_overrides():
     blackwell_policy = blackwell_winner(preference_tensor)
     assert blackwell_policy.argmax() == 1
     assert (
-        win_rates(blackwell_policy, preference_tensor, np.full(3, 1 / 3)).min()
-        > win_rates(
-            scalarised_nash(preference_tensor), preference_tensor, np.full(3, 1 / 3)
-        ).min()
+        column_values(blackwell_policy, preference_tensor).mean(axis=1).min()
+        > column_values(scalarised_nash(preference_tensor), preference_tensor)
+        .mean(axis=1)
+        .min()
     )
 
 
@@ -105,44 +103,11 @@ def test_clean_policy_drops_dust_and_renormalises():
     ]
 
 
-def test_win_rates_against_a_pure_opponent_read_one_column():
-    preference_tensor = np.stack(
-        [skew_symmetric({(0, 1): 0.7}, 2), skew_symmetric({(0, 1): 0.2}, 2)]
-    )
-    assert win_rates(
-        np.array([1.0, 0.0]), preference_tensor, np.array([0.0, 1.0])
-    ) == pytest.approx([0.7, 0.2])
-
-
-def test_welfare_minimum_geometric_and_arithmetic_means():
-    assert welfare(np.array([0.25, 1.0])) == pytest.approx(
-        {"egalitarian_welfare": 0.25, "nash_welfare": 0.5, "utilitarian_welfare": 0.625}
-    )
-    assert welfare(np.array([0.0, 1.0]))["nash_welfare"] == 0.0
-
-
 def test_paired_bootstrap_interval_brackets_the_mean():
     differences = np.random.default_rng(0).normal(0.1, 0.05, size=200)
     low, high = paired_bootstrap_interval(differences)
     assert low < differences.mean() < high
     assert low > 0
-
-
-def test_summarise_methods_pairs_blackwell_and_nash_per_instance():
-    results = pd.DataFrame(
-        {
-            "selector": "model",
-            "instance": [0, 0, 0, 1, 1, 1],
-            "method": ["uniform", "scalarised_nash", "blackwell"] * 2,
-            "score": [0.5, 0.6, 0.7, 0.5, 0.4, 0.6],
-        }
-    )
-    summary_row = summarise_methods(results, ["selector"], "instance", ["score"]).iloc[
-        0
-    ]
-    assert summary_row["instances"] == 2
-    assert summary_row["blackwell"] == pytest.approx(0.65)
-    assert summary_row["blackwell_minus_nash"] == pytest.approx(0.15)
 
 
 def test_nash_shortfall_matches_closed_forms():
@@ -310,46 +275,111 @@ def reference_geometric_mean(
     return float(np.exp(np.log(reference_win_rates @ policy[:row_count]).mean()))
 
 
-@pytest.mark.parametrize(("seed", "head_count", "size"), [(0, 2, 6), (1, 4, 16)])
-def test_reference_nash_winner_mixes_rows_to_the_best_geometric_mean(
-    seed, head_count, size
-):
-    preference_tensor = random_preference_tensor(seed, head_count, size)
-    policy = reference_nash_winner(preference_tensor)
-    assert policy.sum() == pytest.approx(1.0)
-    assert (policy[size // 2 :] == 0).all()
-    optimum = reference_geometric_mean(policy, preference_tensor)
-    rivals = [
-        *np.eye(size // 2),
-        *np.random.default_rng(seed).dirichlet(np.ones(size // 2), size=2000),
-    ]
-    assert (
-        optimum
-        >= max(
-            reference_geometric_mean(
-                np.append(rival, np.zeros(size - size // 2)), preference_tensor
-            )
-            for rival in rivals
-        )
-        - 1e-6
+def nash_welfare_floor(policy: np.ndarray, preference_tensor: np.ndarray) -> float:
+    """The worst pure opponent's geometric mean of head win rates."""
+    return float(
+        np.exp(np.log(column_values(policy, preference_tensor)).mean(axis=0)).min()
     )
 
 
-def test_reference_nash_winner_splits_evenly_between_opposed_rows():
-    # Each row wins every column for one participant and loses for the other
-    preference_tensor = np.full((2, 4, 4), 0.5)
-    preference_tensor[0, 0, 2:] = preference_tensor[1, 1, 2:] = 1.0
-    preference_tensor[1, 0, 2:] = preference_tensor[0, 1, 2:] = 0.0
-    preference_tensor[:, 2:, :2] = 1.0 - preference_tensor[:, :2, 2:].transpose(0, 2, 1)
-    assert reference_nash_winner(preference_tensor) == pytest.approx(
-        [0.5, 0.5, 0.0, 0.0], abs=1e-4
+def test_robust_nash_winner_with_one_head_guarantees_the_game_value():
+    preference_tensor = random_preference_tensor(3, 1, 5)
+    policy = robust_nash_winner(preference_tensor)
+    assert column_values(policy, preference_tensor).min() == pytest.approx(
+        0.5, abs=1e-5
     )
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_robust_nash_winner_beats_every_other_policy_on_its_objective(seed):
+    preference_tensor = random_preference_tensor(seed, 4, 6)
+    policy = robust_nash_winner(preference_tensor)
+    floor = nash_welfare_floor(policy, preference_tensor)
+    random_generator = np.random.default_rng(seed)
+    for _ in range(50):
+        other = random_generator.dirichlet(np.ones(6))
+        assert nash_welfare_floor(other, preference_tensor) <= floor + 1e-5
+    # The Nash target at this level is reached, so the target winner has no shortfall
+    target_policy = nash_target_winner(preference_tensor, floor)
+    assert nash_shortfall(
+        column_values(target_policy, preference_tensor), floor
+    ).max() == pytest.approx(0.0, abs=1e-5)
 
 
 @pytest.mark.parametrize(
     "preference_tensor",
-    [np.full((3, 3), 0.5), np.full((2, 1, 1), 0.5), np.full((2, 4, 4), 1.5)],
+    [np.zeros((2, 3)), np.full((2, 3, 3), 1.5), np.full((2, 2, 3), 0.5)],
 )
-def test_reference_nash_winner_rejects_invalid_inputs(preference_tensor):
+def test_robust_nash_winner_rejects_invalid_inputs(preference_tensor):
     with pytest.raises(ValueError):
-        reference_nash_winner(preference_tensor)
+        robust_nash_winner(preference_tensor)
+
+
+def budgeted_nash_value(
+    policy: np.ndarray, preference_tensor: np.ndarray, error_budget: float
+) -> float:
+    """The paper's robust objective by its primal column problems, uniform reference weights."""
+    head_count, size, _ = preference_tensor.shape
+    worst = np.inf
+    for opponent in range(size):
+        others = [candidate for candidate in range(size) if candidate != opponent]
+        floors = []
+        for head in range(head_count):
+            moved = cp.Variable(size - 1)
+            problem = cp.Problem(
+                cp.Minimize(policy[others] @ moved),
+                [
+                    moved >= 0,
+                    moved <= 1,
+                    cp.sum_squares(moved - preference_tensor[head, others, opponent])
+                    * 2
+                    / size**2
+                    <= 2.25 * error_budget**2,
+                ],
+            )
+            problem.solve(solver=cp.CLARABEL)
+            floors.append(policy[opponent] / 2 + float(problem.value))  # pyright: ignore[reportArgumentType]
+        worst = min(worst, float(np.prod(floors) ** (1 / head_count)))
+    return worst
+
+
+def test_budgeted_nash_winner_with_no_budget_is_the_level_free_winner():
+    preference_tensor = random_preference_tensor(4, 3, 5)
+    assert nash_welfare_floor(
+        budgeted_nash_winner(preference_tensor, 0.0), preference_tensor
+    ) == pytest.approx(
+        nash_welfare_floor(robust_nash_winner(preference_tensor), preference_tensor),
+        abs=1e-5,
+    )
+
+
+@pytest.mark.parametrize("seed", range(2))
+def test_budgeted_nash_winner_maximises_the_primal_robust_objective(seed):
+    preference_tensor = random_preference_tensor(seed, 2, 5)
+    policy = budgeted_nash_winner(preference_tensor, 0.05)
+    value = budgeted_nash_value(policy, preference_tensor, 0.05)
+    assert value < nash_welfare_floor(policy, preference_tensor)
+    random_generator = np.random.default_rng(seed)
+    for _ in range(10):
+        other = random_generator.dirichlet(np.ones(5))
+        assert budgeted_nash_value(other, preference_tensor, 0.05) <= value + 1e-4
+
+
+def test_budgeted_nash_winner_hedges_towards_uniform_as_the_budget_grows():
+    preference_tensor = random_preference_tensor(5, 3, 6)
+    assert budgeted_nash_winner(preference_tensor, 10.0) == pytest.approx(
+        np.full(6, 1 / 6), abs=1e-3
+    )
+
+
+@pytest.mark.parametrize(
+    "preference_tensor, error_budget",
+    [
+        (np.zeros((2, 3)), 0.1),
+        (np.full((2, 3, 3), 0.5), -0.1),
+        (np.full((2, 3, 3), 0.5), np.inf),
+    ],
+)
+def test_budgeted_nash_winner_rejects_invalid_inputs(preference_tensor, error_budget):
+    with pytest.raises(ValueError):
+        budgeted_nash_winner(preference_tensor, error_budget)

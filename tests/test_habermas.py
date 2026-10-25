@@ -6,24 +6,19 @@ from blackwell_ita import training
 from blackwell_ita.habermas import (
     CANDIDATE_SLOTS,
     GOLD_CONFIGURATION,
-    PARTICIPANT_PAIRS,
     PLACEHOLDER_OPINION,
     PROXY_CONFIGURATIONS,
-    WHOLE_GROUP,
     assign_habermas_splits,
     candidate_prompts,
     candidate_sets,
     complete_groups,
     deliberation_groups,
-    evaluation_results,
     generate_candidates,
     gold_pairs,
     habermas_pairs,
     habermas_prompt,
-    instance_welfare,
     rank_preference,
-    round_winners,
-    selection_policies,
+    scoring_inputs,
     style_examples,
     usable_rankings,
 )
@@ -173,6 +168,11 @@ def test_deliberation_groups_pick_four_participants_per_question():
     assert set(groups["split"]) == {"test"}
 
 
+def test_deliberation_groups_without_a_count_take_every_eligible_question():
+    groups = deliberation_groups(opening_rankings("test", 3), "test", group_count=None)
+    assert groups["question_id"].tolist() == ["q0", "q1", "q2"]
+
+
 def test_style_examples_keep_train_statements_of_habermas_length():
     rankings = pd.concat(
         [opening_rankings("train", 2), opening_rankings("test", 2)],
@@ -224,18 +224,24 @@ def test_candidate_prompts_cover_every_slot_once():
         plan, candidate_prompts(proposal_groups(), examples())
     )
     pool_sizes = plan.groupby("question_id")["sample_index"].apply(sorted).to_dict()
-    assert pool_sizes == {"q1": list(range(16)), "q2": list(range(16))}
+    assert pool_sizes == {"q1": list(range(24)), "q2": list(range(24))}
     test_plan = plan[plan["question_id"] == "q2"].sort_values("sample_index")  # pyright: ignore[reportCallIssue]
     assert test_plan["candidate_kind"].tolist() == [kind for kind, _ in CANDIDATE_SLOTS]
-    pairs = plan[plan["candidate_kind"] == "pair"]["target_participants"]
-    assert {tuple(pair) for pair in pairs} == {
-        (1, 2),
-        (1, 3),
-        (1, 4),
-        (2, 3),
-        (2, 4),
-        (3, 4),
-    }
+    targets = test_plan[test_plan["candidate_kind"] == "participant"][
+        "target_participants"
+    ]
+    assert sorted(tuple(target) for target in targets) == [
+        (participant,) for participant in range(1, 5) for _ in range(3)
+    ]
+
+
+def test_consensus_orders_show_each_participant_in_each_position_three_times():
+    plan = candidate_prompts(proposal_groups().iloc[:1], examples())
+    orders = plan[plan["candidate_kind"] == "consensus"]["opinion_order"].tolist()
+    assert len({tuple(order) for order in orders}) == 12
+    for position in range(4):
+        counts = pd.Series([order[position] for order in orders]).value_counts()
+        assert counts.to_dict() == {1: 3, 2: 3, 3: 3, 4: 3}
 
 
 def test_candidate_prompts_show_only_the_targeted_opinions():
@@ -297,100 +303,41 @@ def test_gold_pairs_label_every_pool_pair_per_participant_with_the_gold():
     assert set(pairs["split"]) == {"train"}
 
 
-def test_selection_policies_add_best_of_n_only_for_bradley_terry_selectors():
-    tensor = rewards_to_preferences(
-        np.array([[2.0, 1.0, 0.0, 3.0], [1.0, 2.0, 0.0, 3.0]])
-    )
-    policies = selection_policies(tensor, "qwen3_4b_bradley_terry")
-    assert "best_of_n" in policies
-    assert "best_of_n" not in selection_policies(tensor, "qwen3_4b_pairwise")
-    for policy in policies.values():
-        assert policy.shape == (4,)
-        assert policy.sum() == pytest.approx(1.0)
-    assert policies["reference_nash"][2:].tolist() == [0.0, 0.0]
-
-
-def evaluation_inputs() -> tuple[pd.DataFrame, dict, dict]:
-    random_generator = np.random.default_rng(1)
-    selector_tensors, gold_tensors = (
+def test_gold_pairs_skip_the_pairs_the_gold_did_not_score():
+    groups = proposal_groups().iloc[:1]
+    candidates = pd.DataFrame(
         {
-            question_id: rewards_to_preferences(random_generator.normal(size=(4, 6)))
-            for question_id in ["q1", "q2"]
-        }
-        for _ in range(2)
-    )
-    return pd.DataFrame({"question_id": ["q1", "q2"]}), selector_tensors, gold_tensors
-
-
-def test_evaluation_results_grade_each_subgroup_with_the_gold():
-    groups, selector_tensors, gold_tensors = evaluation_inputs()
-    results = evaluation_results(
-        groups,
-        selector_tensors,
-        gold_tensors,
-        "qwen3_4b_bradley_terry",
-        WHOLE_GROUP + PARTICIPANT_PAIRS,
-    )
-    whole = results[results["subgroup"] == "1,2,3,4"]
-    pair = results[results["subgroup"] == "2,4"]
-    assert set(whole["participant"]) == {1, 2, 3, 4}
-    assert set(pair["participant"]) == {2, 4}
-    assert set(results["group_size"]) == {2, 4}
-    assert len(results) == 2 * 8 * (4 + 6 * 2)
-    # Best-of-N picks one candidate, so its win rate is a gold pool average
-    best_of_n_row = whole[
-        (whole["method"] == "best_of_n") & (whole["question_id"] == "q1")
-    ].iloc[0]  # pyright: ignore[reportAttributeAccessIssue]
-    chosen = int(
-        np.argmax(
-            np.log(selector_tensors["q1"] / (1 - selector_tensors["q1"]))
-            .mean(axis=2)
-            .mean(axis=0)
-        )
-    )
-    participant_wins = gold_tensors["q1"][best_of_n_row["participant"] - 1, chosen]
-    assert best_of_n_row["win_rate"] == pytest.approx(participant_wins.mean())
-    # Against itself the pick ties, which counts half
-    assert best_of_n_row["candidates_beaten"] == pytest.approx(
-        (participant_wins > 0.5).sum() + 0.5
-    )
-
-
-def test_evaluation_results_pair_selection_ignores_the_other_participants():
-    groups, selector_tensors, gold_tensors = evaluation_inputs()
-    pair_only = evaluation_results(
-        groups, selector_tensors, gold_tensors, "qwen3_4b_pairwise", [(0, 2)]
-    )
-    changed = {
-        question_id: tensor.copy() for question_id, tensor in selector_tensors.items()
-    }
-    for tensor in changed.values():
-        tensor[[1, 3]] = 0.5
-    pd.testing.assert_frame_equal(
-        pair_only,
-        evaluation_results(
-            groups, changed, gold_tensors, "qwen3_4b_pairwise", [(0, 2)]
-        ),
-    )
-
-
-def test_instance_welfare_summarises_each_instance():
-    results = pd.DataFrame(
-        {
-            "selector": "s",
-            "group_size": 2,
-            "subgroup": "1,2",
-            "question_id": "q",
-            "method": "m",
-            "participant": [1, 2],
-            "win_rate": [0.25, 1.0],
-            "winner_win_rate": [0.5, 0.75],
+            "question_id": ["q1"] * 3,
+            "sample_index": [0, 1, 2],
+            "response": ["a", "b", "c"],
         }
     )
-    welfare = instance_welfare(results).iloc[0]
-    assert welfare[
-        ["average", "best", "worst", "nash", "winner_average", "winner_worst"]
-    ].tolist() == pytest.approx([0.625, 1.0, 0.25, 0.5, 0.625, 0.5])
+    gold_tensor = np.full((4, 3, 3), np.nan)
+    gold_tensor[:, [0, 1], [1, 0]] = [0.8, 0.2]
+    pairs = gold_pairs(groups, candidates, {"q1": gold_tensor})
+    assert pairs[["response_a", "response_b"]].drop_duplicates().values.tolist() == [  # pyright: ignore[reportAttributeAccessIssue]
+        ["a", "b"]
+    ]
+    assert len(pairs) == 4
+
+
+def test_scoring_inputs_sample_pairs_only_in_the_training_splits(monkeypatch):
+    monkeypatch.setattr("blackwell_ita.habermas.SCORED_PAIR_COUNTS", {"train": 2})
+    groups = proposal_groups()
+    candidates = pd.DataFrame(
+        {
+            "question_id": ["q1"] * 4 + ["q2"] * 4,
+            "sample_index": [0, 1, 2, 3] * 2,
+            "response": list("abcd") * 2,
+        }
+    )
+    inputs = scoring_inputs(groups, candidates)
+    assert inputs == scoring_inputs(groups, candidates)
+    assert "scored_pairs" not in inputs["test"]["q2"]
+    train_pairs = inputs["train"]["q1"]["scored_pairs"]
+    assert len(train_pairs) == 4
+    assert all(len(set(pairs)) == 2 for pairs in train_pairs)
+    assert all(first < second for pairs in train_pairs for first, second in pairs)
 
 
 def test_complete_groups_drop_groups_with_a_placeholder_opinion():
@@ -401,57 +348,3 @@ def test_complete_groups_drop_groups_with_a_placeholder_opinion():
         }
     )
     assert complete_groups(groups)["question_id"].tolist() == ["q1"]
-
-
-def test_round_winners_find_the_round_holding_every_opinion():
-    rankings = pd.concat(
-        [
-            opening_rankings("test", 1),
-            opening_rankings("test", 1).assign(
-                round_id="r_other",
-                participant_id=lambda frame: frame["participant_id"] + "_other",
-                opinion=lambda frame: frame["opinion"] + " elsewhere",
-            ),
-        ],
-        ignore_index=True,
-    )
-    final_statements = pd.DataFrame(
-        {
-            "question_id": "q0",
-            "participant_id": ["p0", "p1", "p2", "p0_other"],
-            "winner": ["won", "won", "lost", "other round"],
-        }
-    )
-    groups = pd.DataFrame(
-        {
-            "question_id": ["q0", "q0"],
-            "opinions": [
-                [f"opinion 0 {participant}" for participant in range(4)],
-                ["unknown"],
-            ],
-        }
-    )
-    winners = round_winners(groups, rankings, final_statements)
-    assert winners.to_dict("records") == [
-        {"question_id": "q0", "round_id": "r0", "winner": "won"}
-    ]
-
-
-def test_evaluation_results_grade_against_the_winner_where_there_is_one():
-    groups, selector_tensors, gold_tensors = evaluation_inputs()
-    winner_rates = {"q1": np.linspace(0, 1, 24).reshape(4, 6)}
-    results = evaluation_results(
-        groups,
-        selector_tensors,
-        gold_tensors,
-        "qwen3_4b_pairwise",
-        WHOLE_GROUP,
-        winner_rates,
-    )
-    uniform_row = results[
-        (results["method"] == "uniform")
-        & (results["question_id"] == "q1")
-        & (results["participant"] == 3)
-    ].iloc[0]  # pyright: ignore[reportAttributeAccessIssue]
-    assert uniform_row["winner_win_rate"] == pytest.approx(winner_rates["q1"][2].mean())
-    assert results[results["question_id"] == "q2"]["winner_win_rate"].isna().all()  # pyright: ignore[reportAttributeAccessIssue, reportGeneralTypeIssues]

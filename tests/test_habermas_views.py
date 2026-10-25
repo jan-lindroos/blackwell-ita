@@ -1,27 +1,34 @@
+from itertools import combinations
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from blackwell_ita.habermas import (
-    PARTICIPANT_PAIRS,
-    WHOLE_GROUP,
-    evaluation_results,
-    gold_frontier,
-    instance_welfare,
+from blackwell_ita.evaluation import (
+    METHOD_WELFARES,
+    budget_sweep,
+    error_sweep,
+    method_results,
+    pool_size_results,
+    sampling_results,
+    selection_policies,
 )
+from blackwell_ita.habermas import WHOLE_GROUP
 from blackwell_ita.habermas_views import (
     METHOD_LABELS,
-    beaten_histogram,
+    budget_chart,
+    error_chart,
     explorer_controls,
-    frontier_chart,
     mixture_table,
-    nash_chart,
     question_view,
-    winner_chart,
+    regret_chart,
+    sampling_chart,
+    welfare_row_chart,
 )
 from blackwell_ita.scoring import rewards_to_preferences
 
-MODELS = ["qwen3_4b_bradley_terry", "qwen3_4b_pairwise"]
+MODELS = ["qwen3_4b_bradley_terry", "gold"]
+PARTICIPANT_PAIRS = list(combinations(range(4), 2))
 
 
 def groups() -> pd.DataFrame:
@@ -69,12 +76,13 @@ def candidates() -> pd.DataFrame:
 def results() -> pd.DataFrame:
     return pd.concat(
         [
-            evaluation_results(
+            method_results(
                 groups(),
                 selector_tensors,
                 gold_tensors(),
                 selector_name,
                 WHOLE_GROUP + PARTICIPANT_PAIRS,
+                selector_name.endswith("bradley_terry"),
             )
             for selector_name, selector_tensors in tensors_by_selector().items()
         ],
@@ -86,73 +94,84 @@ def chart_rows(chart) -> list[dict]:
     return [row for rows in chart.to_dict()["datasets"].values() for row in rows]
 
 
-def test_frontier_chart_draws_the_frontier_once_per_selector_and_every_method():
-    welfare = instance_welfare(results())
-    whole_group: pd.DataFrame = welfare[welfare["group_size"] == 4]  # pyright: ignore[reportAssignmentType]
-    rows = chart_rows(
-        frontier_chart(
-            gold_frontier(groups(), gold_tensors(), WHOLE_GROUP, "best"),
-            whole_group,
-            "best",
-            "Title",
-        )
-    )
-    frontier_rows = [row for row in rows if row["kind"] == "frontier"]
-    method_rows = [row for row in rows if row["kind"] == "method"]
-    assert {row["selector_label"] for row in frontier_rows} == {"Qwen BT", "Qwen PW"}
-    assert len(frontier_rows) == 2 * 21
-    assert {row["method_label"] for row in method_rows} == set(
-        METHOD_LABELS.values()
-    ) - {"Uniform pool"}
-    blackwell_row = next(
-        row
-        for row in method_rows
-        if row["method_label"] == "BoB (orthant)" and row["selector_label"] == "Qwen PW"
-    )
-    expected = whole_group[
-        (whole_group["method"] == "blackwell")
-        & (whole_group["selector"] == "qwen3_4b_pairwise")
-    ]["worst"].mean()
-    assert blackwell_row["worst"] == expected
-
-
-def test_nash_chart_compares_the_reference_algorithm_with_its_baselines():
-    welfare = instance_welfare(results())
-    rows = chart_rows(nash_chart(welfare[welfare["group_size"] == 4]))  # pyright: ignore[reportArgumentType]
-    assert {row["method_label"] for row in rows} == {
-        "Reference BoB (Nash)",
-        "Best-of-N",
-        "Maximin",
-        "Scalarised Nash",
+def test_regret_chart_summarises_every_selector_method_and_welfare():
+    rows = chart_rows(regret_chart(results(), "Whole group"))
+    assert {row["selector_label"] for row in rows} == {"Qwen3 4B", "Gold"}
+    assert {row["welfare_label"] for row in rows} == {
+        "Egalitarian",
+        "Utilitarian",
+        "Nash",
     }
+    # Best-of-N runs for the Bradley-Terry selector only, and the uniform pool is left out
+    assert len(rows) == 3 * (8 + 7)
+    assert "Uniform pool" not in {row["method_label"] for row in rows}
     assert all(
         row["interval_low"] <= row["value"] <= row["interval_high"] for row in rows
     )
 
 
-def test_beaten_histogram_counts_every_whole_group_participant_per_selector():
-    whole_group: pd.DataFrame = results()[results()["group_size"] == 4]  # pyright: ignore[reportAssignmentType]
-    chart = beaten_histogram(whole_group, 4)
-    assert [column.title for column in chart.hconcat] == ["Qwen BT", "Qwen PW"]
-    assert len(chart_rows(chart)) == len(whole_group)
+def test_welfare_row_chart_summarises_each_method_welfare_and_pool_size():
+    kinds = np.array(["consensus", "participant"] * 2)
+    pool_sizes = pool_size_results(
+        groups(),
+        tensors_by_selector()[MODELS[0]],
+        gold_tensors(),
+        {"q1": kinds, "q2": kinds},
+        [2, 4],
+        3,
+    )
+    rows = chart_rows(welfare_row_chart(pool_sizes, "pool_size", "Pool size"))
+    assert len(rows) == 3 * 2 * 7
+    assert {row["welfare_label"] for row in rows} == {
+        "Egalitarian",
+        "Utilitarian",
+        "Nash",
+    }
+    assert all(
+        row["interval_low"] <= row["value"] <= row["optimum"] + 1e-6 for row in rows
+    )
+
+
+def test_sampling_chart_draws_each_target_and_the_sampling_bound():
+    sampling = sampling_results(groups(), gold_tensors(), [1, 2, 4], draw_count=3)
+    rows = chart_rows(sampling_chart(sampling, 4))
+    bound_rows = [row for row in rows if "target_label" not in row]
+    assert len(rows) == 3 * 3 + 3
+    assert [row["value"] for row in bound_rows] == pytest.approx(
+        [2 * 0.75**size for size in (1, 2, 4)]
+    )
+
+
+def test_error_chart_plots_each_target_method_against_its_model_error():
+    sweep = error_sweep(
+        groups(), tensors_by_selector()[MODELS[1]], gold_tensors(), [0.0, 1.0]
+    )
+    rows = chart_rows(error_chart(sweep))
+    assert len(rows) == 2 * len(METHOD_WELFARES)
+    assert max(row["model_error"] for row in rows if row["factor"] == 0.0) < 1e-12
+    assert {row["method_label"] for row in rows} == {
+        METHOD_LABELS[name] for name in METHOD_WELFARES
+    }
+
+
+def test_budget_chart_summarises_each_budget_factor():
+    sweep = budget_sweep(
+        groups(), tensors_by_selector()[MODELS[1]], gold_tensors(), [0.0, 1.0]
+    )
+    rows = chart_rows(budget_chart(sweep))
+    assert [row["budget_factor"] for row in rows] == [0.0, 1.0]
+    assert all(
+        row["interval_low"] <= row["value"] <= row["interval_high"] for row in rows
+    )
 
 
 def test_mixture_table_lists_answers_any_method_uses_with_weight_columns():
-    pool_statements = candidates().query("question_id == 'q1'")
-    pool_statements = pool_statements.sort_values("sample_index")
     policies = {
         "uniform": np.full(4, 0.25),
-        "blackwell": np.array([0.25, 0.0, 0.75, 0.0]),
-        "scalarised_nash": np.array([1.0, 0.0, 0.0, 0.0]),
+        "blackwell": np.array([0.0, 1.0, 0.0, 0.0]),
     }
-    table = mixture_table(policies, pool_statements)
-    assert table.columns.tolist() == [
-        "answer",
-        "originating_kind",
-        "Uniform pool",
-        "Scalarised Nash",
-        "BoB (orthant)",
-    ]
+    pool = candidates()[candidates()["question_id"] == "q1"].sort_values("sample_index")  # pyright: ignore[reportCallIssue]
+    table = mixture_table(policies, pool)
     assert table["answer"].tolist() == ["first", "second", "third", "fourth"]
     assert table["originating_kind"].tolist() == [
         "consensus",
@@ -160,48 +179,22 @@ def test_mixture_table_lists_answers_any_method_uses_with_weight_columns():
         "pair (1, 3)",
         "compromise",
     ]
-    assert table["BoB (orthant)"].tolist()[0] == 0.25
-    assert np.isnan(table["Scalarised Nash"].iloc[1])
+    assert table.columns.tolist()[2:] == ["Uniform pool", "BoB (orthant)"]
+    assert table["BoB (orthant)"].tolist()[1] == 1.0
+    assert np.isnan(table["BoB (orthant)"].tolist()[0])
 
 
 def test_question_view_shows_participants_and_the_mixture_table():
-    view = question_view(groups(), candidates(), tensors_by_selector(), "q1", MODELS[0])
-    for text in ["Should we?", "Participant 4:"]:
-        assert text in view.text
-
-
-def test_question_view_reports_unscored_questions():
-    tensors = tensors_by_selector()
-    del tensors[MODELS[0]]["q1"]
-    view = question_view(groups(), candidates(), tensors, "q1", MODELS[0])
-    assert "Not scored yet" in view.text
+    policies = selection_policies(
+        tensors_by_selector()[MODELS[0]]["q1"], True, 0.3, 0.05
+    )
+    view = question_view(groups(), candidates(), policies, "q1")
+    text = view.text
+    assert "Should we?" in text
+    assert "Participant 4" in text
 
 
 def test_explorer_controls_offer_questions_and_selectors():
-    question, selector = explorer_controls(groups(), tensors_by_selector())
+    question, selector = explorer_controls(groups(), ["gold"] + MODELS)
     assert question.value == "q1"
-    assert sorted(selector.options.values()) == sorted(MODELS)
-
-
-def test_winner_chart_summarises_average_and_worst_served_per_method():
-    winner_rates = {"q1": np.full((4, 4), 0.25), "q2": np.full((4, 4), 0.75)}
-    welfare = instance_welfare(
-        pd.concat(
-            [
-                evaluation_results(
-                    groups(),
-                    selector_tensors,
-                    gold_tensors(),
-                    selector_name,
-                    WHOLE_GROUP,
-                    winner_rates,
-                )
-                for selector_name, selector_tensors in tensors_by_selector().items()
-            ],
-            ignore_index=True,
-        )
-    )
-    rows = chart_rows(winner_chart(welfare))
-    assert {row["served_label"] for row in rows} == {"Average", "Worst served"}
-    assert all(row["value"] == pytest.approx(0.5) for row in rows)
-    assert {row["method_label"] for row in rows} == set(METHOD_LABELS.values())
+    assert selector.value == "gold"

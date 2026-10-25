@@ -52,6 +52,7 @@ class RewardModelConfiguration:
     warmup_steps: int = 100
     early_stopping_pair_count: int = 4000
     patience: int = 1
+    max_epochs: int | None = None
     seed: int = 1810
     gradient_checkpointing: bool = True
 
@@ -138,10 +139,12 @@ def train_until_no_improvement(
     log_metrics: Callable[[dict], None],
     saved_state: dict | None = None,
     save_state: Callable[[dict], None] | None = None,
+    max_steps: int | None = None,
 ) -> float:
     """Train in rounds, validating after each, until ``patience`` rounds pass
-    without a new best validation decisive accuracy, pooled over criteria.
-    Restores the best trainable weights and returns the best accuracy.
+    without a new best validation decisive accuracy, pooled over criteria, or
+    ``max_steps`` steps are taken. Restores the best trainable weights and
+    returns the best accuracy.
 
     ``save_state`` receives everything needed to resume after every round;
     passing that back as ``saved_state`` continues exactly where it stopped.
@@ -174,12 +177,19 @@ def train_until_no_improvement(
         rounds_without_improvement = saved_state["rounds_without_improvement"]
         step = saved_state["step"]
     batches = training_batches(train_dataset, batch_size, seed, start_step=step)
-    while rounds_without_improvement < patience:
+    while rounds_without_improvement < patience and (
+        max_steps is None or step < max_steps
+    ):
+        round_steps = (
+            steps_per_round
+            if max_steps is None
+            else min(steps_per_round, max_steps - step)
+        )
         model.train()
         for batch in tqdm(
-            islice(batches, steps_per_round),
-            total=steps_per_round,
-            desc=f"steps {step + 1} to {step + steps_per_round}",
+            islice(batches, round_steps),
+            total=round_steps,
+            desc=f"steps {step + 1} to {step + round_steps}",
         ):
             optimizer.zero_grad()
             loss = model.compute_loss(batch, device)
@@ -304,6 +314,10 @@ def train_reward_model(
         log_metrics=log_metrics,
         saved_state=saved_state,
         save_state=save_state,
+        max_steps=None
+        if configuration.max_epochs is None
+        else configuration.max_epochs
+        * math.ceil(len(datasets_by_split["train"]) / configuration.batch_size),
     )
     split_metrics = []
     for split_name, split_loader in evaluation_loaders.items():

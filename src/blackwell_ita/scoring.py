@@ -1,5 +1,6 @@
 import tempfile
 from collections.abc import Callable
+from itertools import combinations
 from pathlib import Path
 
 import numpy as np
@@ -16,23 +17,26 @@ def pairwise_preference_tensor(
     responses: list[str],
     device: str,
     batch_size: int = 64,
+    scored_pairs: list[tuple[int, int]] | None = None,
 ) -> np.ndarray:
     """Skew-symmetrised win probabilities, shape (head, response, response).
 
     Both presentation orders of every pair are scored, then
-    P <- (P + 1 - P^T) / 2 with 1/2 on the diagonal. A Bradley-Terry model
-    scores each response once instead.
+    P <- (P + 1 - P^T) / 2 with 1/2 on the diagonal. ``scored_pairs`` limits
+    scoring to those unordered pairs and leaves every other entry NaN. A
+    Bradley-Terry model scores each response once instead.
     """
     if model.model_type == "bradley_terry":
         return bradley_terry_preference_tensor(
             model, prompt, responses, device, batch_size
         )
     response_count = len(responses)
+    if scored_pairs is None:
+        scored_pairs = list(combinations(range(response_count), 2))
     index_pairs = [
-        (first_index, second_index)
-        for first_index in range(response_count)
-        for second_index in range(response_count)
-        if first_index != second_index
+        ordered_pair
+        for first_index, second_index in scored_pairs
+        for ordered_pair in [(first_index, second_index), (second_index, first_index)]
     ]
     probabilities = pair_probabilities(
         model,
@@ -44,8 +48,9 @@ def pairwise_preference_tensor(
         batch_size,
     )
     preference_tensor = np.full(
-        (probabilities.shape[1], response_count, response_count), 0.5
+        (probabilities.shape[1], response_count, response_count), np.nan
     )
+    preference_tensor[:, np.arange(response_count), np.arange(response_count)] = 0.5
     for (first_index, second_index), head_probabilities in zip(
         index_pairs, probabilities, strict=True
     ):
@@ -82,35 +87,6 @@ def pair_probabilities(
             )
             probability_batches.append(torch.sigmoid(logits).cpu())
     return torch.cat(probability_batches).float().numpy()[np.argsort(length_order)]
-
-
-def win_rates_against(
-    model: RewardModel,
-    prompt: str,
-    responses: list[str],
-    opponent: str,
-    device: str,
-    batch_size: int = 64,
-) -> np.ndarray:
-    """Each response's probability of beating ``opponent``, shape (head, response).
-
-    Both presentation orders are scored and averaged as in
-    ``pairwise_preference_tensor``. A Bradley-Terry model scores each text once.
-    """
-    if model.model_type == "bradley_terry":
-        return bradley_terry_preference_tensor(
-            model, prompt, [*responses, opponent], device, batch_size
-        )[:, :-1, -1]
-    probabilities = pair_probabilities(
-        model,
-        [(prompt, response, opponent) for response in responses]
-        + [(prompt, opponent, response) for response in responses],
-        device,
-        batch_size,
-    )
-    return (
-        (probabilities[: len(responses)] + 1.0 - probabilities[len(responses) :]) / 2.0
-    ).T
 
 
 def bradley_terry_preference_tensor(

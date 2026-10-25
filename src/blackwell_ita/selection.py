@@ -2,7 +2,6 @@ import warnings
 
 import cvxpy as cp
 import numpy as np
-import pandas as pd
 
 
 def blackwell_winner(
@@ -118,31 +117,28 @@ def nash_target_winner(
     return result
 
 
-def reference_nash_winner(preference_tensor: np.ndarray) -> np.ndarray:
-    """Split-pool reference Best-of-Blackwell with the Nash-welfare target.
+def robust_nash_winner(preference_tensor: np.ndarray) -> np.ndarray:
+    """Policy maximising the worst comparator's geometric mean of head win rates.
 
-    The first half of the pool are the rows to mix over and the second half the
-    columns that estimate each row's win rate against the reference policy. At
-    the empirical optimum level the target set is reached exactly by the row
-    mixture maximising the geometric mean of those win rates, so no level has
-    to be chosen in advance. Columns get zero weight.
+    The level-free Nash target: at its own optimum level the target set is
+    reached exactly, so no level has to be chosen in advance.
     """
-    candidate_count = preference_tensor.shape[1]
     if (
         preference_tensor.ndim != 3
-        or preference_tensor.shape[2] != candidate_count
-        or candidate_count < 2
+        or preference_tensor.shape[1] != preference_tensor.shape[2]
+        or preference_tensor.shape[1] == 0
         or not np.isfinite(preference_tensor).all()
         or np.any((preference_tensor < 0) | (preference_tensor > 1))
     ):
-        raise ValueError("Invalid preference tensor for the split-pool reference")
-    row_count = candidate_count // 2
-    reference_win_rates = preference_tensor[:, :row_count, row_count:].mean(axis=2)
-    policy = cp.Variable(row_count, nonneg=True)
-    problem = cp.Problem(
-        cp.Maximize(cp.geo_mean(reference_win_rates @ policy)),  # pyright: ignore[reportArgumentType]
-        [cp.sum(policy) == 1],  # pyright: ignore[reportArgumentType]
-    )
+        raise ValueError("Invalid preference tensor for the robust Nash winner")
+    candidate_count = preference_tensor.shape[1]
+    policy = cp.Variable(candidate_count, nonneg=True)
+    level = cp.Variable()
+    constraints = [cp.sum(policy) == 1] + [
+        cp.geo_mean(preference_tensor[:, :, opponent] @ policy) >= level
+        for opponent in range(candidate_count)
+    ]
+    problem = cp.Problem(cp.Maximize(level), constraints)  # pyright: ignore[reportArgumentType]
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="geo_mean is being approximated")
         problem.solve(solver=cp.CLARABEL)
@@ -150,10 +146,63 @@ def reference_nash_winner(preference_tensor: np.ndarray) -> np.ndarray:
         problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
         or policy.value is None
     ):
-        raise RuntimeError(f"reference_nash_winner solve failed: {problem.status}")
-    return np.append(
-        clean_policy(np.asarray(policy.value)), np.zeros(candidate_count - row_count)
+        raise RuntimeError(f"robust_nash_winner solve failed: {problem.status}")
+    return clean_policy(np.asarray(policy.value))
+
+
+def budgeted_nash_winner(
+    preference_tensor: np.ndarray, error_budget: float
+) -> np.ndarray:
+    """Robust Nash alignment with an error budget, on a pool of distinct candidates.
+
+    Maximises the worst Nash welfare over every skew-symmetric kernel whose root
+    mean square deviation from the tensor, under uniform reference weights, is
+    at most 3/2 of the budget in every head. Each head's win rate against a
+    pure opponent is its dual column problem: the opponent's own half plus the
+    largest penalised score of the remaining mass.
+    """
+    if (
+        preference_tensor.ndim != 3
+        or preference_tensor.shape[1] != preference_tensor.shape[2]
+        or preference_tensor.shape[1] == 0
+        or not np.isfinite(preference_tensor).all()
+        or np.any((preference_tensor < 0) | (preference_tensor > 1))
+        or not np.isfinite(error_budget)
+        or error_budget < 0
+    ):
+        raise ValueError("Invalid preference tensor or error budget")
+    head_count, candidate_count = preference_tensor.shape[:2]
+    policy = cp.Variable(candidate_count, nonneg=True)
+    level = cp.Variable()
+    floors = cp.Variable((head_count, candidate_count), nonneg=True)
+    mass_by_row = cp.reshape(policy, (candidate_count, 1), order="F") @ np.ones(
+        (1, candidate_count)
     )
+    # Every ordered pair has reference weight 1 / n^2 and its reverse moves with it
+    penalty = 1.5 * error_budget * candidate_count / np.sqrt(2)
+    constraints = [cp.sum(policy) == 1]
+    for head in range(head_count):
+        scores = cp.Variable((candidate_count, candidate_count), nonneg=True)
+        constraints += [
+            scores <= mass_by_row,
+            cp.diag(scores) == 0,
+            floors[head] + penalty * cp.norm(scores, 2, axis=0)
+            <= policy / 2
+            + cp.sum(cp.multiply(preference_tensor[head], scores), axis=0),
+        ]
+    constraints += [
+        cp.geo_mean(floors[:, opponent]) >= level for opponent in range(candidate_count)
+    ]
+    problem = cp.Problem(cp.Maximize(level), constraints)  # pyright: ignore[reportArgumentType]
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="geo_mean is being approximated")
+        problem.solve(solver=cp.CLARABEL)
+    if (
+        problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+        or policy.value is None
+    ):
+        raise RuntimeError(f"budgeted_nash_winner solve failed: {problem.status}")
+    return clean_policy(np.asarray(policy.value))
 
 
 def nash_shortfall(values: np.ndarray, threshold: float) -> np.ndarray:
@@ -227,35 +276,6 @@ def maximin(preference_tensor: np.ndarray) -> np.ndarray:
     return np.eye(len(scores))[scores.argmax()]
 
 
-SELECTION_METHODS = {
-    "uniform": lambda preference_tensor: uniform_policy(preference_tensor.shape[1]),
-    "max_mean_win_rate": max_mean_win_rate,
-    "maximin": maximin,
-    "scalarised_nash": scalarised_nash,
-    "blackwell": blackwell_winner,
-    "blackwell_nash": nash_target_winner,
-    "reference_nash": reference_nash_winner,
-}
-
-
-def win_rates(
-    policy: np.ndarray, preference_tensor: np.ndarray, opponent: np.ndarray
-) -> np.ndarray:
-    """Per-head probability that ``policy`` beats the ``opponent`` distribution."""
-    return np.einsum("i,kij,j->k", policy, preference_tensor, opponent)
-
-
-def welfare(per_head_values: np.ndarray) -> dict[str, float]:
-    """Egalitarian (minimum), Nash (geometric mean) and utilitarian (mean) welfare."""
-    with np.errstate(divide="ignore"):
-        log_values = np.log(per_head_values)
-    return {
-        "egalitarian_welfare": float(per_head_values.min()),
-        "nash_welfare": float(np.exp(log_values.mean())),
-        "utilitarian_welfare": float(per_head_values.mean()),
-    }
-
-
 def paired_bootstrap_interval(
     differences: np.ndarray, sample_count: int = 10000, seed: int = 1810
 ) -> tuple[float, float]:
@@ -269,36 +289,3 @@ def paired_bootstrap_interval(
     resampled_means = resampling_weights @ differences / len(differences)
     low, high = np.quantile(resampled_means, [0.025, 0.975])
     return float(low), float(high)
-
-
-def summarise_methods(
-    results: pd.DataFrame,
-    group_columns: list[str],
-    instance_column: str,
-    metric_columns: list[str],
-) -> pd.DataFrame:
-    """Mean of each metric per method, plus Blackwell minus scalarised Nash.
-
-    The difference is paired over instances with a bootstrap 95% interval.
-    """
-    summary_rows = []
-    for group_values, group_results in results.groupby(group_columns, sort=False):
-        for metric_column in metric_columns:
-            metric_by_method = group_results.pivot_table(
-                index=instance_column, columns="method", values=metric_column
-            ).dropna()
-            differences = (
-                metric_by_method["blackwell"] - metric_by_method["scalarised_nash"]
-            ).to_numpy()
-            low, high = paired_bootstrap_interval(differences)
-            summary_rows.append(
-                dict(zip(group_columns, group_values, strict=True))  # pyright: ignore[reportCallIssue, reportArgumentType]
-                | {"metric": metric_column, "instances": len(metric_by_method)}
-                | metric_by_method.mean().to_dict()
-                | {
-                    "blackwell_minus_nash": differences.mean(),
-                    "interval_low": low,
-                    "interval_high": high,
-                }
-            )
-    return pd.DataFrame(summary_rows)

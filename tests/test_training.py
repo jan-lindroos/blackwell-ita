@@ -189,3 +189,14 @@ def test_ensure_trained_skips_training_when_the_checkpoint_is_on_the_hub(monkeyp
     assert training.ensure_trained(
         GOLD_CONFIGURATION, pd.DataFrame(), ["x"], "prefix", "cpu"
     ).equals(saved_metrics)
+
+
+def test_train_until_no_improvement_stops_at_the_step_cap():
+    # Accuracy keeps improving, so only the cap ends training, midway through a round
+    model = ScriptedModel([0.1, 0.2, 0.3])
+    logged_rows = []
+    run_training(model, max_steps=5, log_metrics=logged_rows.append)
+    assert [row["step"] for row in logged_rows if "train/loss" in row] == list(
+        range(1, 6)
+    )
+    assert sum("early_stopping/loss" in row for row in logged_rows) == 3

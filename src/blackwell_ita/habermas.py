@@ -1,27 +1,16 @@
-from itertools import combinations
+from itertools import combinations, permutations
 
 import numpy as np
 import pandas as pd
 
 from blackwell_ita.data import assign_prompt_splits
-from blackwell_ita.frontier import averaged_frontier, pool_win_rates
 from blackwell_ita.generation import generate_responses
 from blackwell_ita.hub import ARTIFACTS_REPOSITORY, ensure_hub_dataframe
 from blackwell_ita.models import RewardModel
-from blackwell_ita.scoring import (
-    pairwise_preference_tensor,
-    preferences_to_rewards,
-    win_rates_against,
-)
-from blackwell_ita.selection import (
-    SELECTION_METHODS,
-    best_of_n,
-    paired_bootstrap_interval,
-)
+from blackwell_ita.scoring import pairwise_preference_tensor
 from blackwell_ita.training import RewardModelConfiguration
 
 COMPARISONS_URL = "https://storage.googleapis.com/habermas_machine/datasets/hm_all_candidate_comparisons.parquet"
-SURVEY_URL = "https://storage.googleapis.com/habermas_machine/datasets/hm_all_round_survey_responses.parquet"
 # The data's stand-in for a participant who wrote nothing
 PLACEHOLDER_OPINION = "No opinion was provided."
 COMPARISON_COLUMNS = {
@@ -50,46 +39,47 @@ GOLD_CONFIGURATION = RewardModelConfiguration(
     max_tokens=2048,
     batch_size=8,
 )
+PROXY_ENCODERS = {
+    "qwen3_0_6b": "Qwen/Qwen3-0.6B",
+    "qwen3_1_7b": "Qwen/Qwen3-1.7B",
+    "qwen3_4b": "Qwen/Qwen3-4B-Instruct-2507",
+}
 PROXY_CONFIGURATIONS = [
     RewardModelConfiguration(
-        name="qwen3_4b_pairwise",
-        model_type="pairwise",
-        encoder_name="Qwen/Qwen3-4B-Instruct-2507",
-        lora_rank=None,
-        learning_rate=5e-6,
-        evaluation_interval_steps=1000,
-        max_tokens=2048,
-    ),
-    RewardModelConfiguration(
-        name="qwen3_4b_bradley_terry",
+        name=f"{size_name}_bradley_terry",
         model_type="bradley_terry",
-        encoder_name="Qwen/Qwen3-4B-Instruct-2507",
+        encoder_name=encoder_name,
         lora_rank=None,
         learning_rate=5e-6,
         evaluation_interval_steps=1000,
         max_tokens=2048,
-    ),
+        max_epochs=1,
+    )
+    for size_name, encoder_name in PROXY_ENCODERS.items()
 ]
 # The paper's questions are withheld from every split, test included
 PAPER_QUESTION_COUNT = 200
-GROUP_COUNTS = {"train": 300, "validation": 60, "test": 100}
-CANDIDATE_SLOTS = (
-    [("consensus", ())] * 4
-    + [("participant", (participant,)) for participant in range(1, 5)]
-    + [("pair", pair) for pair in combinations(range(1, 5), 2)]
-    + [("common_ground", ()), ("compromise", ())]
-)
-# Single-participant and pair slots only see their targets' opinions
+# None takes every eligible question
+GROUP_COUNTS = {"train": None, "validation": 100, "test": 100, "paper": 100}
+# Pairs the gold scores per participant, every pair in the other splits
+SCORED_PAIR_COUNTS = {"train": 60, "validation": 120}
+# The even orderings of the four opinions show each participant in each
+# position three times
+CONSENSUS_ORDERS = [
+    order
+    for order in permutations(range(1, 5))
+    if sum(first > second for first, second in combinations(order, 2)) % 2 == 0
+]
+# Each slot is a kind and the participants whose opinions it shows, in order
+CANDIDATE_SLOTS = [("consensus", order) for order in CONSENSUS_ORDERS] + [
+    ("participant", (participant,)) for participant in range(1, 5) for _ in range(3)
+]
 SLOT_INSTRUCTIONS = {
     "consensus": "Write a statement the whole group could endorse.",
     "participant": "Write the statement as if the whole group shared this opinion.",
-    "pair": "Write a statement both could endorse, giving their views equal weight.",
-    "common_ground": "Keep to the points the participants share and leave their disagreements open.",
-    "compromise": "Resolve the main disagreement with a concrete condition, exception or compromise.",
 }
 EXAMPLES_PER_PROMPT = 8
 WHOLE_GROUP = [(0, 1, 2, 3)]
-PARTICIPANT_PAIRS = list(combinations(range(4), 2))
 
 
 def usable_rankings(comparisons: pd.DataFrame) -> pd.DataFrame:
@@ -188,14 +178,15 @@ def candidate_sets(rankings: pd.DataFrame, split_name: str) -> pd.DataFrame:
 def deliberation_groups(
     rankings: pd.DataFrame,
     split_name: str,
-    group_count: int,
+    group_count: int | None,
     participant_count: int = 4,
     seed: int = 1810,
 ) -> pd.DataFrame:
     """Four real participants per question in ``split_name``.
 
     Each question contributes its first opening candidate set that at least
-    ``participant_count`` participants ranked.
+    ``participant_count`` participants ranked. A ``group_count`` of None takes
+    every eligible question.
     """
     random_generator = np.random.default_rng(seed)
     opening_sets = candidate_sets(
@@ -207,8 +198,12 @@ def deliberation_groups(
         .drop_duplicates("question_id")
         .reset_index(drop=True)
     )
-    chosen_positions = sorted(
-        random_generator.choice(len(eligible_sets), size=group_count, replace=False)
+    chosen_positions = (
+        range(len(eligible_sets))
+        if group_count is None
+        else sorted(
+            random_generator.choice(len(eligible_sets), size=group_count, replace=False)
+        )
     )
     group_rows = []
     for set_row in eligible_sets.iloc[chosen_positions].to_dict("records"):
@@ -331,13 +326,12 @@ def candidate_prompts(
 ) -> pd.DataFrame:
     """The generation prompts for every group's pool.
 
-    Each pool covers the 16 slots once (four consensus, four single
-    participant, six pair, one common ground and one compromise). The order
-    opinions are shown in rotates. Every prompt shows three statements from
+    Each pool covers the 24 slots once, twelve consensus slots showing every
+    opinion in each even ordering and three single-participant slots per
+    participant showing only that opinion. Every prompt shows statements from
     other questions as style examples.
     """
     random_generator = np.random.default_rng(seed)
-    orders = np.array([[0, 1, 3, 2], [1, 2, 0, 3], [2, 3, 1, 0], [3, 0, 2, 1]])
     rows = []
     for group in groups.to_dict("records"):
         opinions = list(group["opinions"])
@@ -345,13 +339,7 @@ def candidate_prompts(
             raise ValueError("The candidate pool requires exactly four participants")
         other_examples = examples[examples["question_id"] != group["question_id"]]
         example_lengths = examples["statement"].str.split().str.len().to_numpy()
-        labels = random_generator.permutation(4)
-        for slot_index, (kind, targets) in enumerate(CANDIDATE_SLOTS):
-            order = [
-                int(position) + 1
-                for position in labels[orders[slot_index % 4]]
-                if not targets or int(position) + 1 in targets
-            ]
+        for slot_index, (kind, order) in enumerate(CANDIDATE_SLOTS):
             shown_examples = other_examples.iloc[
                 random_generator.choice(
                     len(other_examples), size=EXAMPLES_PER_PROMPT, replace=False
@@ -367,8 +355,8 @@ def candidate_prompts(
                     "split": group["split"],
                     "sample_index": slot_index,
                     "candidate_kind": kind,
-                    "target_participants": list(targets),
-                    "opinion_order": order,
+                    "target_participants": list(order) if kind == "participant" else [],
+                    "opinion_order": list(order),
                     "prompt": statement_prompt(
                         group["question"],
                         [opinions[participant - 1] for participant in order],
@@ -415,117 +403,73 @@ def complete_groups(groups: pd.DataFrame) -> pd.DataFrame:
     ]
 
 
-def load_final_statements() -> pd.DataFrame:
-    """The statement each human participant saw as their round's outcome."""
-    survey = pd.read_parquet(
-        SURVEY_URL,
-        columns=[
-            "question.id",
-            "metadata.participant_id",
-            "metadata.provenance",
-            "candidate.text",
-        ],
-    )
-    return survey[survey["metadata.provenance"] == "HUMAN_CITIZEN"].rename(  # pyright: ignore[reportCallIssue, reportReturnType]
-        columns={
-            "question.id": "question_id",
-            "metadata.participant_id": "participant_id",
-            "candidate.text": "winner",
-        }
-    )[["question_id", "participant_id", "winner"]]  # pyright: ignore[reportReturnType]
-
-
-def round_winners(
-    groups: pd.DataFrame, rankings: pd.DataFrame, final_statements: pd.DataFrame
-) -> pd.DataFrame:
-    """Each group's round and the statement that round finally chose.
-
-    The round is the one whose opening rankings hold all of the group's
-    opinions. Its winner is the final statement its participants were shown.
-    Groups whose round has no recorded winner are left out.
-    """
-    opening = rankings[rankings["iteration_index"] == 0]
-    winners_by_round = (
-        rankings[["round_id", "question_id", "participant_id"]]
-        .drop_duplicates()
-        .merge(final_statements, on=["question_id", "participant_id"])
-        .groupby("round_id")["winner"]
-        .agg(lambda statements: statements.mode().iloc[0])
-    )
-    winner_rows = []
-    for group in groups.to_dict("records"):
-        question_rankings = opening[opening["question_id"] == group["question_id"]]
-        round_ids = [
-            round_id
-            for round_id, round_rankings in question_rankings.groupby("round_id")  # pyright: ignore[reportAttributeAccessIssue]
-            if set(group["opinions"]) <= set(round_rankings["opinion"])
-        ]
-        if round_ids and round_ids[0] in winners_by_round.index:
-            winner_rows.append(
-                {
-                    "question_id": group["question_id"],
-                    "round_id": round_ids[0],
-                    "winner": winners_by_round[round_ids[0]],
-                }
-            )
-    return pd.DataFrame(winner_rows, columns=["question_id", "round_id", "winner"])
-
-
-def ensure_winners(groups: pd.DataFrame, rankings: pd.DataFrame) -> pd.DataFrame:
-    """Test groups' round winners, built and uploaded unless the hub has them."""
-    return ensure_hub_dataframe(
-        ARTIFACTS_REPOSITORY,
-        "winners.parquet",
-        HABERMAS_PREFIX,
-        lambda: round_winners(
-            groups[groups["split"] == "test"],  # pyright: ignore[reportArgumentType]
-            rankings,
-            load_final_statements(),
-        ),
-    )
-
-
 def participant_preference_tensor(
     model: RewardModel,
     question: str,
     opinions: list[str],
     statements: list[str],
     device: str,
+    scored_pairs: list[list[tuple[int, int]]] | None = None,
 ) -> np.ndarray:
-    """Predicted preferences, shape (participant, statement, statement)."""
+    """Predicted preferences, shape (participant, statement, statement).
+
+    ``scored_pairs`` gives each participant's pairs to score, leaving the rest NaN.
+    """
     return np.stack(
         [
             pairwise_preference_tensor(
-                model, habermas_prompt(question, opinion), statements, device
+                model,
+                habermas_prompt(question, opinion),
+                statements,
+                device,
+                scored_pairs=None if scored_pairs is None else scored_pairs[position],
             )[0]
-            for opinion in opinions
+            for position, opinion in enumerate(opinions)
         ]
     )
 
 
-def participant_winner_rates(
-    model: RewardModel,
-    question: str,
-    opinions: list[str],
-    statements: list[str],
-    winner: str,
-    device: str,
-) -> np.ndarray:
-    """Each statement's predicted win rate against the winner, shape (participant, statement)."""
-    return np.stack(
-        [
-            win_rates_against(
-                model, habermas_prompt(question, opinion), statements, winner, device
-            )[0]
-            for opinion in opinions
-        ]
-    )
+def scoring_inputs(
+    groups: pd.DataFrame, candidates: pd.DataFrame, seed: int = 1810
+) -> dict[str, dict[str, dict]]:
+    """``participant_preference_tensor`` inputs per split and question.
+
+    Splits in ``SCORED_PAIR_COUNTS`` score a random sample of pairs per participant.
+    """
+    random_generator = np.random.default_rng(seed)
+    split_inputs = {}
+    for split_name, split_groups in groups.groupby("split", sort=False):
+        split_inputs[split_name] = {}
+        for group in split_groups.to_dict("records"):
+            statements = pool_statements(candidates, group["question_id"])
+            inputs = {
+                "question": group["question"],
+                "opinions": list(group["opinions"]),
+                "statements": statements,
+            }
+            if split_name in SCORED_PAIR_COUNTS:
+                every_pair = list(combinations(range(len(statements)), 2))
+                inputs["scored_pairs"] = [
+                    [
+                        every_pair[index]
+                        for index in sorted(
+                            random_generator.choice(
+                                len(every_pair),
+                                size=SCORED_PAIR_COUNTS[split_name],  # pyright: ignore[reportArgumentType]
+                                replace=False,
+                            )
+                        )
+                    ]
+                    for _ in inputs["opinions"]
+                ]
+            split_inputs[split_name][group["question_id"]] = inputs
+    return split_inputs
 
 
 def gold_pairs(
     groups: pd.DataFrame, candidates: pd.DataFrame, gold_tensors: dict[str, np.ndarray]
 ) -> pd.DataFrame:
-    """Every unordered pool pair per participant, targeted at the gold preference."""
+    """Every gold-scored unordered pool pair per participant, targeted at the gold preference."""
     pair_rows = []
     for group in groups.to_dict("records"):
         statements = pool_statements(candidates, group["question_id"])
@@ -533,6 +477,8 @@ def gold_pairs(
         for participant, opinion in enumerate(group["opinions"]):
             prompt = habermas_prompt(group["question"], opinion)
             for first_index, second_index in combinations(range(len(statements)), 2):
+                if np.isnan(gold_tensor[participant, first_index, second_index]):
+                    continue
                 pair_rows.append(
                     {
                         "question_id": group["question_id"],
@@ -546,153 +492,3 @@ def gold_pairs(
                     }
                 )
     return pd.DataFrame(pair_rows)
-
-
-def selection_policies(
-    selector_tensor: np.ndarray, selector_name: str
-) -> dict[str, np.ndarray]:
-    """Each method's mixture over the pool.
-
-    A Bradley-Terry selector also runs best-of-N on the rewards its tensor
-    encodes, summed over participants.
-    """
-    selection_methods = SELECTION_METHODS | (
-        {"best_of_n": lambda tensor: best_of_n(preferences_to_rewards(tensor))}
-        if any(
-            configuration.name == selector_name
-            and configuration.model_type == "bradley_terry"
-            for configuration in PROXY_CONFIGURATIONS
-        )
-        else {}
-    )
-    return {
-        method_name: select(selector_tensor)
-        for method_name, select in selection_methods.items()
-    }
-
-
-def subgroup_label(subgroup: tuple[int, ...]) -> str:
-    """One-based participant positions, such as "1,3"."""
-    return ",".join(str(position + 1) for position in subgroup)
-
-
-def evaluation_results(
-    groups: pd.DataFrame,
-    selector_tensors: dict[str, np.ndarray],
-    gold_tensors: dict[str, np.ndarray],
-    selector_name: str,
-    subgroups: list[tuple[int, ...]],
-    winner_rates: dict[str, np.ndarray] | None = None,
-) -> pd.DataFrame:
-    """Gold-graded results per participant, selecting on the proxy's tensors.
-
-    Selection and grading only see each subgroup's participants. The win
-    rate is against a uniformly drawn pool member. A candidate counts as
-    beaten when the participant prefers the method's mixture to it with
-    probability above 1/2, and as half beaten on an exact tie. With
-    ``winner_rates`` the win rate against the round's winner is added, NaN
-    where the round has none.
-    """
-    winner_rates = winner_rates or {}
-    result_rows = []
-    for group in groups.to_dict("records"):
-        for subgroup in subgroups:
-            selector_tensor = selector_tensors[group["question_id"]][list(subgroup)]
-            gold_tensor = gold_tensors[group["question_id"]][list(subgroup)]
-            for method_name, policy in selection_policies(
-                selector_tensor, selector_name
-            ).items():
-                against_candidates = np.einsum("i,kij->kj", policy, gold_tensor)
-                candidates_beaten = (against_candidates > 0.5 + 1e-9).sum(
-                    axis=1
-                ) + 0.5 * (np.abs(against_candidates - 0.5) <= 1e-9).sum(axis=1)
-                for position, participant in enumerate(subgroup):
-                    result_rows.append(
-                        {
-                            "selector": selector_name,
-                            "subgroup": subgroup_label(subgroup),
-                            "group_size": len(subgroup),
-                            "question_id": group["question_id"],
-                            "method": method_name,
-                            "participant": participant + 1,
-                            "win_rate": float(against_candidates[position].mean()),
-                            "candidates_beaten": float(candidates_beaten[position]),
-                            "winner_win_rate": float(
-                                policy @ winner_rates[group["question_id"]][participant]
-                            )
-                            if group["question_id"] in winner_rates
-                            else np.nan,
-                        }
-                    )
-    return pd.DataFrame(result_rows)
-
-
-def instance_welfare(results: pd.DataFrame) -> pd.DataFrame:
-    """Average, best-served, worst-served and Nash welfare of each instance.
-
-    The same average and worst-served values against the round's winner come
-    as ``winner_average`` and ``winner_worst``.
-    """
-    return (
-        results.groupby(
-            ["selector", "group_size", "subgroup", "question_id", "method"],
-            sort=False,
-        )
-        .agg(
-            average=("win_rate", "mean"),
-            best=("win_rate", "max"),
-            worst=("win_rate", "min"),
-            nash=(
-                "win_rate",
-                lambda win_rates: float(np.exp(np.log(win_rates).mean())),
-            ),
-            winner_average=("winner_win_rate", "mean"),
-            winner_worst=("winner_win_rate", "min"),
-        )
-        .reset_index()
-    )
-
-
-def gold_frontier(
-    groups: pd.DataFrame,
-    gold_tensors: dict[str, np.ndarray],
-    subgroups: list[tuple[int, ...]],
-    axis: str,
-) -> pd.DataFrame:
-    """The achievable frontier under the gold model, averaged over instances."""
-    return averaged_frontier(
-        [
-            pool_win_rates(gold_tensors[question_id][list(subgroup)])
-            for question_id in groups["question_id"]
-            for subgroup in subgroups
-        ],
-        axis,
-    )
-
-
-def bootstrap_summary(
-    per_instance: pd.DataFrame, summary_columns: list[str]
-) -> pd.DataFrame:
-    """Mean ``value`` per group with a 95% bootstrap interval over instances."""
-    summary_rows = []
-    for group_values, group_results in per_instance.groupby(
-        summary_columns, sort=False
-    ):
-        values = group_results["value"].to_numpy()
-        low, high = paired_bootstrap_interval(values)
-        summary_rows.append(
-            dict(zip(summary_columns, group_values, strict=True))  # pyright: ignore[reportCallIssue, reportArgumentType]
-            | {
-                "value": values.mean(),
-                "interval_low": low,
-                "interval_high": high,
-                "instances": len(values),
-            }
-        )
-    return pd.DataFrame(summary_rows)
-
-
-if __name__ == "__main__":
-    # Pool generation calls the Claude API, so it runs locally, not on the GPU
-    habermas_rankings = ensure_rankings()
-    ensure_candidates(habermas_rankings, ensure_groups(habermas_rankings))

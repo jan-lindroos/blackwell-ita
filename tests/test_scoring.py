@@ -8,7 +8,6 @@ from blackwell_ita.scoring import (
     preferences_to_rewards,
     rewards_to_preferences,
     score_with_resume,
-    win_rates_against,
 )
 
 
@@ -41,6 +40,27 @@ def test_pairwise_preference_tensor_cancels_presentation_order_bias():
     # A constant first-position bonus cancels, leaving the longer response ahead
     assert tensor[0, 1, 0] > 0.5
     assert tensor[0, 1, 2] > 0.5
+
+
+def test_pairwise_preference_tensor_scores_only_the_sampled_pairs():
+    responses = ["a", "aaaa", "aa"]
+    full = pairwise_preference_tensor(
+        FirstResponseLengthModel(),  # pyright: ignore[reportArgumentType]
+        "p",
+        responses,
+        "cpu",
+    )
+    sampled = pairwise_preference_tensor(
+        FirstResponseLengthModel(),  # pyright: ignore[reportArgumentType]
+        "p",
+        responses,
+        "cpu",
+        scored_pairs=[(0, 2)],
+    )
+    scored = np.eye(3, dtype=bool)
+    scored[0, 2] = scored[2, 0] = True
+    assert np.allclose(sampled[0][scored], full[0][scored])
+    assert np.isnan(sampled[0][~scored]).all()
 
 
 class ResponseLengthRewardModel:
@@ -110,13 +130,3 @@ def test_score_with_resume_scores_only_missing_keys_and_checkpoints(monkeypatch)
     assert list(tensors) == ["done", "first", "second", "third"]
     assert tensors["done"].tolist() == [0.0]
     assert set(hub_storage["tensors.npz"]) == {"done", "first", "second", "third"}
-
-
-def test_win_rates_against_match_the_full_tensor_column():
-    for model in (FirstResponseLengthModel(), ResponseLengthRewardModel()):
-        responses = ["a", "aaaa", "aa"]
-        tensor = pairwise_preference_tensor(model, "p", [*responses, "aaa"], "cpu")  # pyright: ignore[reportArgumentType]
-        assert np.allclose(
-            win_rates_against(model, "p", responses, "aaa", "cpu", batch_size=2),  # pyright: ignore[reportArgumentType]
-            tensor[:, :3, 3],
-        )
