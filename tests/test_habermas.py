@@ -168,6 +168,20 @@ def test_deliberation_groups_pick_four_participants_per_question():
     assert set(groups["split"]) == {"test"}
 
 
+def test_deliberation_groups_choose_only_participants_who_wrote_an_opinion():
+    rankings = opening_rankings("test", 2)
+    rankings.loc[rankings["participant_id"] == "p0", "opinion"] = PLACEHOLDER_OPINION
+    rankings.loc[
+        (rankings["question_id"] == "q1") & (rankings["participant_id"] == "p1"),
+        "opinion",
+    ] = PLACEHOLDER_OPINION
+    groups = deliberation_groups(rankings, "test", group_count=None)
+    assert groups["question_id"].tolist() == ["q0"]
+    assert sorted(groups.iloc[0]["opinions"]) == [
+        f"opinion 0 {index}" for index in range(1, 5)
+    ]
+
+
 def test_deliberation_groups_without_a_count_take_every_eligible_question():
     groups = deliberation_groups(opening_rankings("test", 3), "test", group_count=None)
     assert groups["question_id"].tolist() == ["q0", "q1", "q2"]

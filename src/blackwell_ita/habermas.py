@@ -185,14 +185,19 @@ def deliberation_groups(
     """Four real participants per question in ``split_name``.
 
     Each question contributes its first opening candidate set that at least
-    ``participant_count`` participants ranked. A ``group_count`` of None takes
-    every eligible question.
+    ``participant_count`` participants with a written opinion ranked, and only
+    those participants are chosen. A ``group_count`` of None takes every
+    eligible question.
     """
     random_generator = np.random.default_rng(seed)
     opening_sets = candidate_sets(
         rankings[rankings["iteration_index"] == 0],  # pyright: ignore[reportArgumentType]
         split_name,
     )
+    opening_sets["opinions"] = [
+        [opinion for opinion in opinions if opinion != PLACEHOLDER_OPINION]
+        for opinions in opening_sets["opinions"]
+    ]
     eligible_sets = (
         opening_sets[opening_sets["opinions"].map(len) >= participant_count]  # pyright: ignore[reportCallIssue]
         .drop_duplicates("question_id")
