@@ -7,13 +7,14 @@ from blackwell_ita.evaluation import (
     MAIN_METHODS,
     METHOD_TARGETS,
     METHOD_WELFARES,
+    REGRET_SCALES,
     WELFARE_METHODS,
     WELFARES,
+    accuracy,
     amplified_error,
     blackwell_loss,
     bootstrap_summary,
     budget_sweep,
-    decisive_accuracy,
     deployed_policy,
     error_sweep,
     kind_subsets,
@@ -255,8 +256,9 @@ def test_method_results_record_welfare_optimum_and_regret_together():
     assert set(results["method"]) == set(MAIN_METHODS)
     for name in WELFARES:
         assert (
-            results[f"{name}_optimum"] - results[f"{name}_welfare"]
-        ).to_numpy() == pytest.approx(results[f"{name}_regret"].to_numpy())
+            REGRET_SCALES[name]
+            * (results[f"{name}_optimum"] - results[f"{name}_welfare"])
+        ).to_numpy() == pytest.approx(results[f"{name}_regret"].to_numpy())  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_kind_subsets_hold_the_requested_count_of_each_kind():
@@ -329,7 +331,11 @@ def test_paired_gaps_are_never_negative_with_the_gold_selecting():
     assert (gaps["instances"] == 2).all()
 
 
-def test_decisive_accuracy_counts_agreement_on_the_gold_decisive_pairs():
-    gold = rewards_to_preferences(np.array([[0.0, 2.0, 4.0]]))
-    assert decisive_accuracy(gold, gold) == 1.0
-    assert decisive_accuracy(1.0 - gold, gold) == 0.0
+def test_accuracy_counts_agreement_on_every_pair_with_a_preference():
+    gold = rewards_to_preferences(np.array([[0.0, 0.1, 4.0]]))
+    assert accuracy(gold, gold) == 1.0
+    assert accuracy(1.0 - gold, gold) == 0.0
+    # Ties on the diagonal are left out, and a near tie still counts
+    flipped = gold.copy()
+    flipped[0, 0, 1], flipped[0, 1, 0] = gold[0, 1, 0], gold[0, 0, 1]
+    assert accuracy(flipped, gold) == pytest.approx(4 / 6)

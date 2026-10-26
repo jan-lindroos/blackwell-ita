@@ -26,7 +26,9 @@ from blackwell_ita.selection import (
     uniform_policy,
 )
 
-WELFARES = ["egalitarian", "utilitarian", "nash"]
+WELFARES = ["egalitarian", "nash", "utilitarian"]
+# The paper's utilitarian regret is the duality gap of the mixture game, twice the shortfall from 1/2
+REGRET_SCALES = {"egalitarian": 1.0, "utilitarian": 2.0, "nash": 1.0}
 # Each Blackwell target and the welfare index whose upper contour set it is
 TARGET_WELFARES = {
     "orthant": "egalitarian",
@@ -42,14 +44,14 @@ METHOD_WELFARES = {
     method_name: TARGET_WELFARES[target]
     for method_name, target in METHOD_TARGETS.items()
 } | {"robust_nash": "nash", "budgeted_nash": "nash"}
-# The Blackwell method whose target is each welfare's upper contour set
+# The method that targets each welfare. Nash uses the paper's direct programme, which needs no level
 WELFARE_METHODS = {
-    welfare: method_name
-    for method_name, welfare in METHOD_WELFARES.items()
-    if method_name in METHOD_TARGETS
+    "egalitarian": "blackwell",
+    "nash": "robust_nash",
+    "utilitarian": "scalarised_nash",
 }
 BASELINES = ["uniform", "max_mean_win_rate", "maximin", "best_of_n"]
-MAIN_METHODS = BASELINES + list(METHOD_TARGETS)
+MAIN_METHODS = BASELINES + list(WELFARE_METHODS.values())
 TARGET_SELECTORS: dict[str, Callable[[np.ndarray], np.ndarray]] = {
     "orthant": blackwell_winner,
     "half_space": scalarised_nash,
@@ -164,7 +166,10 @@ def welfare_columns(
     return (
         {f"{name}_welfare": achieved[name] for name in WELFARES}
         | {f"{name}_optimum": optima[name] for name in WELFARES}
-        | {f"{name}_regret": optima[name] - achieved[name] for name in WELFARES}
+        | {
+            f"{name}_regret": REGRET_SCALES[name] * (optima[name] - achieved[name])
+            for name in WELFARES
+        }
     )
 
 
@@ -498,10 +503,10 @@ def targeting_results(
     return pd.DataFrame(result_rows)
 
 
-def decisive_accuracy(selector_tensor: np.ndarray, gold_tensor: np.ndarray) -> float:
-    """Share of the gold's decisive ordered pairs, at most 0.25 or at least 0.75, the selector orders the same way."""
-    decisive = (gold_tensor <= 0.25) | (gold_tensor >= 0.75)
-    return float(((selector_tensor > 0.5) == (gold_tensor > 0.5))[decisive].mean())
+def accuracy(selector_tensor: np.ndarray, gold_tensor: np.ndarray) -> float:
+    """Share of the gold's ordered pairs with a preference that the selector orders the same way."""
+    preferred = gold_tensor != 0.5
+    return float(((selector_tensor > 0.5) == (gold_tensor > 0.5))[preferred].mean())
 
 
 def paired_gaps(results: pd.DataFrame, group_columns: list[str]) -> pd.DataFrame:

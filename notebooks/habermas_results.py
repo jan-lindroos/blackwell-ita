@@ -22,8 +22,8 @@ with app.setup:
     from blackwell_ita.evaluation import (
         MAIN_METHODS,
         WELFARES,
+        accuracy,
         bootstrap_summary,
-        decisive_accuracy,
         method_results,
         model_error,
         paired_gaps,
@@ -69,11 +69,7 @@ with app.setup:
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(rf"""
-    # Results
-
-    Every result selects a mixture over a pool of 24 generated candidates with a Bradley-Terry proxy, or with the gold model itself as the exact reference, and grades it with the gold model. Twelve candidates address the whole group and twelve address a single participant. Welfare is robust in the sense of the paper. The participants' win rates for a mixture against one shared comparator are aggregated by an index, and the comparator is the candidate in the response space that minimises the index. The three indices are the minimum over participants, the mean and the geometric mean. Each index has an optimum per group, attained by the Blackwell winner of its upper contour set, and welfare regret is that optimum minus what a method achieves. Every result here is on the {EVALUATION_SPLIT} split.
-    """)
+    mo.md(f"# Results on the {EVALUATION_SPLIT} split")
     return
 
 
@@ -159,27 +155,32 @@ def _(evaluation_groups, gold_tensors, proxy_tensors):
                 "model_error": model_error(
                     tensors[question_id], gold_tensors[question_id]
                 ).max(),
-                "decisive_accuracy": decisive_accuracy(
-                    tensors[question_id], gold_tensors[question_id]
-                ),
+                "accuracy": accuracy(tensors[question_id], gold_tensors[question_id]),
             }
             for proxy_name, tensors in proxy_tensors.items()
             for question_id in evaluation_groups["question_id"]
         ],
-        columns=["proxy", "question_id", "model_error", "decisive_accuracy"],
+        columns=["proxy", "question_id", "model_error", "accuracy"],
     )
     mo.vstack(
         [
-            mo.md(
-                "The gold model's decisive accuracy on human rankings per split. The paper split's questions stayed out of its training and early stopping."
+            mo.md("## The gold model against held-out human preferences"),
+            # Human labels are 1, 0 or a tie, so decisive pairs are every pair with a preference
+            gold_metrics[
+                ["split", "loss", "decisive_accuracy", "decisive_count"]
+            ].rename(  # pyright: ignore[reportCallIssue]
+                columns={
+                    "decisive_accuracy": "accuracy",
+                    "decisive_count": "pairs_with_a_preference",
+                }
             ),
-            gold_metrics[["split", "decisive_accuracy", "decisive_count"]],
-            mo.md(
-                "Each proxy against the gold model, averaged over groups: model error is the root mean square deviation over uniformly drawn ordered pairs of candidates for the worst participant, and decisive accuracy is the share of the gold's decisive ordered pairs the proxy orders the same way."
-            ),
+            mo.md("## Each proxy against the gold model"),
             proxy_quality.groupby("proxy", sort=False)[
-                ["model_error", "decisive_accuracy"]
+                ["model_error", "accuracy"]
             ].mean(),
+            mo.md(
+                "Accuracy is the share of pairs where the model predicts the right preference, giving the preferred statement a probability above one half. Pairs with no preference are left out."
+            ),
         ]
     )
     return
@@ -213,18 +214,14 @@ def _(bradley_terry, evaluation_groups, gold_tensors, selector_tensors):
     )
     mo.vstack(
         [
-            mo.md(
-                "Table 1. Welfare regret under the gold model on the full pool, mean over groups with a 95 percent bootstrap interval over groups, per selector, method and welfare."
-            ),
+            mo.md("## Welfare regret on the full pool"),
             regret_summary.pivot_table(
                 index=["selector", "method"],
                 columns="welfare",
                 values=["value", "interval_low", "interval_high"],
                 sort=False,
             ),
-            mo.md(
-                "Paired gaps. Each welfare's Best-of-Blackwell method minus each baseline in robust welfare, per group, then the mean over groups with a 95 percent bootstrap interval over groups. Positive gaps favour Best-of-Blackwell."
-            ),
+            mo.md("## Each welfare's own method minus each baseline"),
             paired_gaps(results, ["selector"]),
         ]
     )
@@ -256,10 +253,8 @@ def _(
     )
     mo.vstack(
         [
+            mo.md(f"## Pool size, {MODEL_LABELS[grid_selector]} selecting"),
             welfare_row_chart(pool_sizes, "pool_size", "Pool size"),
-            mo.md(
-                f"Pool size row, {MODEL_LABELS[grid_selector]} selecting. Horizontal axis: the number of distinct candidates in a pool, half whole-group and half single-participant, drawn without replacement from the 24. Vertical axis: robust welfare under the gold model of the deployed policy, the method's mixture averaged over {SUBSET_COUNT} pools, against the worst of all 24 candidates. Dot: mean over groups. Vertical line: 95 percent bootstrap interval over groups. Solid line: joins one method's dots. Dashed grey line: the mean gold optimum over the 24 candidates."
-            ),
         ]
     )
     return
@@ -289,26 +284,14 @@ def _(
         ),
     )
     targeting = targeting.assign(level_label=targeting["level"].map(LEVEL_LABELS))  # pyright: ignore[reportArgumentType]
-    orthant_losses = (
-        targeting[targeting["method"] == "uniform"]
-        .groupby("level_label", sort=False)["orthant_optimal_loss"]
-        .mean()
-    )
     mo.vstack(
         [
+            mo.md(f"## Candidate targeting, {MODEL_LABELS[grid_selector]} selecting"),
             welfare_row_chart(
                 targeting,
                 "level_label",
                 "Candidate targeting",
                 [LEVEL_LABELS[level] for level in TARGETING_LEVELS],
-            ),
-            mo.md(
-                f"Candidate targeting row, {MODEL_LABELS[grid_selector]} selecting. Horizontal axis: the response space, twelve whole-group candidates, six of each kind, or twelve single-participant candidates. Vertical axis: robust welfare under the gold model against the worst candidate in that response space, averaged over {SUBSET_COUNT} draws for the mixed level. Dot: mean over groups. Vertical line: 95 percent bootstrap interval over groups. Solid line: joins one method's dots. Dashed grey line: the mean gold optimum of the response space. The orthant's optimal loss, one half minus the egalitarian optimum, averages "
-                + ", ".join(
-                    f"{loss:.4f} for {label.lower()}"  # pyright: ignore[reportAttributeAccessIssue]
-                    for label, loss in orthant_losses.items()  # pyright: ignore[reportAttributeAccessIssue]
-                )
-                + "."
             ),
         ]
     )
@@ -335,16 +318,9 @@ def _(evaluation_groups, gold_tensors, proxy_tensors, results):
     )
     mo.vstack(
         [
+            mo.md("## Proxy quality"),
             welfare_row_chart(
                 proxy_results, "model_error", "Proxy model error, worst participant"
-            ),
-            mo.md(
-                "Proxy quality row, on the full pool. Horizontal axis: each proxy's model error for the worst participant, the root mean square deviation from the gold over uniformly drawn ordered pairs, averaged over groups, one position per proxy ("
-                + ", ".join(
-                    f"{MODEL_LABELS[name]} at {error:.4f}"
-                    for name, error in proxy_errors.items()
-                )
-                + "). Vertical axis: robust welfare under the gold model against the worst of the 24 candidates. Dot: mean over groups. Vertical line: 95 percent bootstrap interval over groups. Solid line: joins one method's dots. Dashed grey line: the mean gold optimum."
             ),
         ]
     )

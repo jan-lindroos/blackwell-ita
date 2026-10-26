@@ -3,7 +3,12 @@ import marimo as mo
 import numpy as np
 import pandas as pd
 
-from blackwell_ita.evaluation import METHOD_WELFARES, WELFARES, bootstrap_summary
+from blackwell_ita.evaluation import (
+    METHOD_WELFARES,
+    WELFARE_METHODS,
+    WELFARES,
+    bootstrap_summary,
+)
 
 MODEL_LABELS = {
     "gold": "Gold",
@@ -16,10 +21,10 @@ METHOD_LABELS = {
     "max_mean_win_rate": "Max mean win rate",
     "best_of_n": "Best-of-N",
     "maximin": "Maximin",
-    "scalarised_nash": "BoB (half-space)",
+    "scalarised_nash": "Best-of-Nash",
     "blackwell": "BoB (orthant)",
     "blackwell_nash": "BoB (Nash target)",
-    "robust_nash": "BoB (level-free Nash)",
+    "robust_nash": "Direct Nash",
     "budgeted_nash": "Robust Nash (error budget)",
 }
 # Fixed categorical order, so each method keeps its colour in every chart
@@ -58,6 +63,12 @@ def method_colour_scale(method_names: list[str]) -> alt.Scale:
             if method_name in method_names
         ],
     )
+
+
+def panel_methods(welfare: str) -> list[str]:
+    """The baselines and Best-of-Nash, then the method that targets ``welfare``."""
+    shown = ["max_mean_win_rate", "best_of_n", "maximin", "scalarised_nash"]
+    return shown + [WELFARE_METHODS[welfare]] * (WELFARE_METHODS[welfare] not in shown)
 
 
 def present_methods(frame: pd.DataFrame) -> list[str]:
@@ -155,20 +166,21 @@ def welfare_row_chart(
 ) -> alt.FacetChart:
     """Mean robust welfare of each method against ``x_column``, one column per welfare index.
 
-    Points are means over groups with 95% bootstrap intervals, and the dashed
-    line is the mean gold optimum. ``x_sort`` makes the axis an ordered category.
+    Each panel shows the baselines, Best-of-Nash and the method that targets
+    that welfare. Points are means over groups with 95% bootstrap intervals.
+    ``x_sort`` makes the axis an ordered category.
     """
-    summaries = []
-    for welfare in WELFARES:
-        summary = bootstrap_summary(results, [x_column, "method"], f"{welfare}_welfare")
-        optima = results.groupby(x_column)[f"{welfare}_optimum"].mean()
-        summaries.append(
-            summary.assign(
-                welfare=welfare,
-                optimum=summary[x_column].map(optima),  # pyright: ignore[reportArgumentType]
-            )
-        )
-    summary = pd.concat(summaries, ignore_index=True)
+    summary = pd.concat(
+        [
+            bootstrap_summary(
+                results[results["method"].isin(panel_methods(welfare))],  # pyright: ignore[reportArgumentType]
+                [x_column, "method"],
+                f"{welfare}_welfare",
+            ).assign(welfare=welfare)
+            for welfare in WELFARES
+        ],
+        ignore_index=True,
+    )
     methods = present_methods(summary)
     frame = summary.assign(
         method_label=summary["method"].map(METHOD_LABELS),  # pyright: ignore[reportArgumentType]
@@ -185,29 +197,31 @@ def welfare_row_chart(
     tooltip = [
         alt.Tooltip("method_label:N", title="Method"),
         alt.Tooltip(f"{x_column}:{'Q' if x_sort is None else 'N'}", title=x_title),
-        alt.Tooltip("value:Q", title="Robust welfare", format=".4f"),
+        alt.Tooltip("value:Q", title="Welfare", format=".4f"),
         alt.Tooltip("interval_low:Q", title="Interval low", format=".4f"),
         alt.Tooltip("interval_high:Q", title="Interval high", format=".4f"),
-        alt.Tooltip("optimum:Q", title="Gold optimum", format=".4f"),
     ]
-    optimum_line = (
-        alt.Chart()
-        .mark_line(color=NEUTRAL_COLOUR, strokeDash=[6, 4])
-        .encode(x=x, y=alt.Y("mean(optimum):Q", title="Robust welfare"))
-    )
     intervals = (
         alt.Chart()
         .mark_rule()
         .encode(x=x, y=alt.Y("interval_low:Q"), y2="interval_high:Q", color=colour)
     )
-    lines = alt.Chart().mark_line().encode(x=x, y="value:Q", color=colour)
+    lines = (
+        alt.Chart()
+        .mark_line()
+        .encode(
+            x=x,
+            y=alt.Y("value:Q", title="Welfare", scale=alt.Scale(zero=False)),
+            color=colour,
+        )
+    )
     points = (
         alt.Chart()
         .mark_point(filled=True, size=60)
         .encode(x=x, y="value:Q", color=colour, tooltip=tooltip)
     )
     return (
-        alt.layer(optimum_line, intervals, lines, points, data=frame)
+        alt.layer(intervals, lines, points, data=frame)
         .properties(width=240, height=220)
         .facet(
             column=alt.Column(

@@ -121,14 +121,17 @@ def test_welfare_row_chart_summarises_each_method_welfare_and_pool_size():
         3,
     )
     rows = chart_rows(welfare_row_chart(pool_sizes, "pool_size", "Pool size"))
-    assert len(rows) == 3 * 2 * 7
-    assert {row["welfare_label"] for row in rows} == {
-        "Egalitarian",
-        "Utilitarian",
-        "Nash",
+    # Two pool sizes, the four shared methods in every panel, plus each panel's own target
+    assert len(rows) == 2 * (5 + 5 + 4)
+    shown = {
+        welfare: {row["method"] for row in rows if row["welfare_label"] == welfare}
+        for welfare in ["Egalitarian", "Nash", "Utilitarian"]
     }
+    assert shown["Egalitarian"] - shown["Utilitarian"] == {"blackwell"}
+    assert shown["Nash"] - shown["Utilitarian"] == {"robust_nash"}
+    assert "uniform" not in shown["Utilitarian"]
     assert all(
-        row["interval_low"] <= row["value"] <= row["optimum"] + 1e-6 for row in rows
+        row["interval_low"] <= row["value"] <= row["interval_high"] for row in rows
     )
 
 
