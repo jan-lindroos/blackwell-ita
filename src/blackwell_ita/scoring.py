@@ -89,6 +89,35 @@ def pair_probabilities(
     return torch.cat(probability_batches).float().numpy()[np.argsort(length_order)]
 
 
+def win_rates_against(
+    model: RewardModel,
+    prompt: str,
+    responses: list[str],
+    opponent: str,
+    device: str,
+    batch_size: int = 64,
+) -> np.ndarray:
+    """Each response's probability of beating ``opponent``, shape (head, response).
+
+    Both presentation orders are scored and averaged as in
+    ``pairwise_preference_tensor``. A Bradley-Terry model scores each text once.
+    """
+    if model.model_type == "bradley_terry":
+        return bradley_terry_preference_tensor(
+            model, prompt, [*responses, opponent], device, batch_size
+        )[:, :-1, -1]
+    probabilities = pair_probabilities(
+        model,
+        [(prompt, response, opponent) for response in responses]
+        + [(prompt, opponent, response) for response in responses],
+        device,
+        batch_size,
+    )
+    return (
+        (probabilities[: len(responses)] + 1.0 - probabilities[len(responses) :]) / 2.0
+    ).T
+
+
 def bradley_terry_preference_tensor(
     model: RewardModel,
     prompt: str,

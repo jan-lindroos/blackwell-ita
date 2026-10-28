@@ -12,9 +12,8 @@ from blackwell_ita.evaluation import (
 
 MODEL_LABELS = {
     "gold": "Gold",
-    "qwen3_0_6b_bradley_terry": "Qwen3 0.6B",
-    "qwen3_1_7b_bradley_terry": "Qwen3 1.7B",
-    "qwen3_4b_bradley_terry": "Qwen3 4B",
+    "qwen3_4b_bradley_terry": "Qwen3 4B Bradley-Terry",
+    "qwen3_4b_pairwise": "Qwen3 4B pairwise",
 }
 METHOD_LABELS = {
     "uniform": "Uniform pool",

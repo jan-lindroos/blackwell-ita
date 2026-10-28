@@ -33,9 +33,11 @@ with app.setup:
         HABERMAS_PREFIX,
         PROXY_CONFIGURATIONS,
         SELECTOR_PREFIX,
+        ensure_winners,
         gold_pairs,
         habermas_pairs,
         participant_preference_tensor,
+        participant_winner_rates,
         scoring_inputs,
     )
     from blackwell_ita.hub import (
@@ -184,6 +186,11 @@ def _():
 @app.cell
 def _(candidates, groups):
     pool_inputs = scoring_inputs(groups, candidates)
+    return (pool_inputs,)
+
+
+@app.cell
+def _(pool_inputs):
     # Test first, so its results can be checked while the other splits score
     gold_tensors = {
         split_name: score_participant_tensors(
@@ -202,7 +209,7 @@ def _(candidates, groups):
             },
         }
     )
-    return gold_tensors, pool_inputs
+    return (gold_tensors,)
 
 
 @app.cell
@@ -266,6 +273,44 @@ def _(pool_inputs, trained_proxies):
     pd.Series(
         {key: len(tensors) for key, tensors in proxy_tensors.items()},
         name="scored_pools",
+    )
+    return
+
+
+@app.cell
+def _(groups, pool_inputs, rankings):
+    # Only the gold model sees the deliberation winners, as a fixed opponent in grading
+    winners = ensure_winners(groups, rankings)
+    winner_inputs = {
+        split_name: {
+            winner_row["question_id"]: pool_inputs[split_name][
+                winner_row["question_id"]
+            ]
+            | {"winner": winner_row["winner"]}
+            for winner_row in winners.to_dict("records")
+            if winner_row["question_id"] in pool_inputs[split_name]
+        }
+        for split_name in ["test", "paper"]
+    }
+    gold_winner_rates = {
+        split_name: score_participant_tensors(
+            GOLD_CONFIGURATION,
+            HABERMAS_PREFIX,
+            f"gold_{split_name}_winner.npz",
+            split_inputs,
+            score_one=participant_winner_rates,
+        )
+        for split_name, split_inputs in winner_inputs.items()
+    }
+    pd.DataFrame(
+        {
+            "groups_with_a_winner": {
+                name: len(inputs) for name, inputs in winner_inputs.items()
+            },
+            "gold_scored": {
+                name: len(rates) for name, rates in gold_winner_rates.items()
+            },
+        }
     )
     return
 

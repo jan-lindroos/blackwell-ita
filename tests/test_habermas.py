@@ -18,6 +18,7 @@ from blackwell_ita.habermas import (
     habermas_pairs,
     habermas_prompt,
     rank_preference,
+    round_winners,
     scoring_inputs,
     style_examples,
     usable_rankings,
@@ -158,6 +159,40 @@ def opening_rankings(split_name: str, question_count: int) -> pd.DataFrame:
             for participant in range(5)
         ]
     )
+
+
+def test_round_winners_find_the_round_holding_every_opinion():
+    rankings = pd.concat(
+        [
+            opening_rankings("test", 1),
+            opening_rankings("test", 1).assign(
+                round_id="r_other",
+                participant_id=lambda frame: frame["participant_id"] + "_other",
+                opinion=lambda frame: frame["opinion"] + " elsewhere",
+            ),
+        ],
+        ignore_index=True,
+    )
+    final_statements = pd.DataFrame(
+        {
+            "question_id": "q0",
+            "participant_id": ["p0", "p1", "p2", "p0_other"],
+            "winner": ["won", "won", "lost", "other round"],
+        }
+    )
+    groups = pd.DataFrame(
+        {
+            "question_id": ["q0", "q0"],
+            "opinions": [
+                [f"opinion 0 {participant}" for participant in range(4)],
+                ["unknown"],
+            ],
+        }
+    )
+    winners = round_winners(groups, rankings, final_statements)
+    assert winners.to_dict("records") == [
+        {"question_id": "q0", "round_id": "r0", "winner": "won"}
+    ]
 
 
 def test_deliberation_groups_pick_four_participants_per_question():

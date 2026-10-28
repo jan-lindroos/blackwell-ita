@@ -96,7 +96,7 @@ def chart_rows(chart) -> list[dict]:
 
 def test_regret_chart_summarises_every_selector_method_and_welfare():
     rows = chart_rows(regret_chart(results(), "Whole group"))
-    assert {row["selector_label"] for row in rows} == {"Qwen3 4B", "Gold"}
+    assert {row["selector_label"] for row in rows} == {"Qwen3 4B Bradley-Terry", "Gold"}
     assert {row["welfare_label"] for row in rows} == {
         "Egalitarian",
         "Utilitarian",

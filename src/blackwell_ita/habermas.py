@@ -7,10 +7,11 @@ from blackwell_ita.data import assign_prompt_splits
 from blackwell_ita.generation import generate_responses
 from blackwell_ita.hub import ARTIFACTS_REPOSITORY, ensure_hub_dataframe
 from blackwell_ita.models import RewardModel
-from blackwell_ita.scoring import pairwise_preference_tensor
+from blackwell_ita.scoring import pairwise_preference_tensor, win_rates_against
 from blackwell_ita.training import RewardModelConfiguration
 
 COMPARISONS_URL = "https://storage.googleapis.com/habermas_machine/datasets/hm_all_candidate_comparisons.parquet"
+SURVEY_URL = "https://storage.googleapis.com/habermas_machine/datasets/hm_all_round_survey_responses.parquet"
 # The data's stand-in for a participant who wrote nothing
 PLACEHOLDER_OPINION = "No opinion was provided."
 COMPARISON_COLUMNS = {
@@ -39,23 +40,18 @@ GOLD_CONFIGURATION = RewardModelConfiguration(
     max_tokens=2048,
     batch_size=8,
 )
-PROXY_ENCODERS = {
-    "qwen3_0_6b": "Qwen/Qwen3-0.6B",
-    "qwen3_1_7b": "Qwen/Qwen3-1.7B",
-    "qwen3_4b": "Qwen/Qwen3-4B-Instruct-2507",
-}
 PROXY_CONFIGURATIONS = [
     RewardModelConfiguration(
-        name=f"{size_name}_bradley_terry",
-        model_type="bradley_terry",
-        encoder_name=encoder_name,
+        name=f"qwen3_4b_{model_type}",
+        model_type=model_type,
+        encoder_name="Qwen/Qwen3-4B-Instruct-2507",
         lora_rank=None,
         learning_rate=5e-6,
         evaluation_interval_steps=1000,
         max_tokens=2048,
         max_epochs=1,
     )
-    for size_name, encoder_name in PROXY_ENCODERS.items()
+    for model_type in ["bradley_terry", "pairwise"]
 ]
 # The paper's questions are withheld from every split, test included
 PAPER_QUESTION_COUNT = 200
@@ -408,6 +404,76 @@ def complete_groups(groups: pd.DataFrame) -> pd.DataFrame:
     ]
 
 
+def load_final_statements() -> pd.DataFrame:
+    """The statement each human participant saw as their round's outcome."""
+    survey = pd.read_parquet(
+        SURVEY_URL,
+        columns=[
+            "question.id",
+            "metadata.participant_id",
+            "metadata.provenance",
+            "candidate.text",
+        ],
+    )
+    return survey[survey["metadata.provenance"] == "HUMAN_CITIZEN"].rename(  # pyright: ignore[reportCallIssue, reportReturnType]
+        columns={
+            "question.id": "question_id",
+            "metadata.participant_id": "participant_id",
+            "candidate.text": "winner",
+        }
+    )[["question_id", "participant_id", "winner"]]  # pyright: ignore[reportReturnType]
+
+
+def round_winners(
+    groups: pd.DataFrame, rankings: pd.DataFrame, final_statements: pd.DataFrame
+) -> pd.DataFrame:
+    """Each group's round and the statement that round finally chose.
+
+    The round is the one whose opening rankings hold all of the group's
+    opinions. Its winner is the final statement its participants were shown.
+    Groups whose round has no recorded winner are left out.
+    """
+    opening = rankings[rankings["iteration_index"] == 0]
+    winners_by_round = (
+        rankings[["round_id", "question_id", "participant_id"]]
+        .drop_duplicates()
+        .merge(final_statements, on=["question_id", "participant_id"])
+        .groupby("round_id")["winner"]
+        .agg(lambda statements: statements.mode().iloc[0])
+    )
+    winner_rows = []
+    for group in groups.to_dict("records"):
+        question_rankings = opening[opening["question_id"] == group["question_id"]]
+        round_ids = [
+            round_id
+            for round_id, round_rankings in question_rankings.groupby("round_id")  # pyright: ignore[reportAttributeAccessIssue]
+            if set(group["opinions"]) <= set(round_rankings["opinion"])
+        ]
+        if round_ids and round_ids[0] in winners_by_round.index:
+            winner_rows.append(
+                {
+                    "question_id": group["question_id"],
+                    "round_id": round_ids[0],
+                    "winner": winners_by_round[round_ids[0]],
+                }
+            )
+    return pd.DataFrame(winner_rows, columns=["question_id", "round_id", "winner"])
+
+
+def ensure_winners(groups: pd.DataFrame, rankings: pd.DataFrame) -> pd.DataFrame:
+    """Test and paper groups' round winners, built and uploaded unless the hub has them."""
+    return ensure_hub_dataframe(
+        ARTIFACTS_REPOSITORY,
+        "winners.parquet",
+        HABERMAS_PREFIX,
+        lambda: round_winners(
+            groups[groups["split"].isin(["test", "paper"])],  # pyright: ignore[reportArgumentType]
+            rankings,
+            load_final_statements(),
+        ),
+    )
+
+
 def participant_preference_tensor(
     model: RewardModel,
     question: str,
@@ -430,6 +496,25 @@ def participant_preference_tensor(
                 scored_pairs=None if scored_pairs is None else scored_pairs[position],
             )[0]
             for position, opinion in enumerate(opinions)
+        ]
+    )
+
+
+def participant_winner_rates(
+    model: RewardModel,
+    question: str,
+    opinions: list[str],
+    statements: list[str],
+    winner: str,
+    device: str,
+) -> np.ndarray:
+    """Each statement's predicted win rate against the winner, shape (participant, statement)."""
+    return np.stack(
+        [
+            win_rates_against(
+                model, habermas_prompt(question, opinion), statements, winner, device
+            )[0]
+            for opinion in opinions
         ]
     )
 

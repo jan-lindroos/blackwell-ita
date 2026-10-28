@@ -101,7 +101,11 @@ def _():
         evaluation_groups["question_id"].isin(list(scored))
     ]
     selector_tensors = {"gold": gold_tensors} | proxy_tensors
-    bradley_terry = {"gold": False} | dict.fromkeys(proxy_tensors, True)
+    bradley_terry = {"gold": False} | {
+        configuration.name: configuration.model_type == "bradley_terry"
+        for configuration in PROXY_CONFIGURATIONS
+        if configuration.name in proxy_tensors
+    }
     candidate_kinds = {
         question_id: pool["candidate_kind"].to_numpy()
         for question_id, pool in candidates.sort_values("sample_index").groupby(
